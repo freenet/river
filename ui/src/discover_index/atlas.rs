@@ -542,8 +542,9 @@ pub fn search(state: &IndexState, filter: &RoomFilter) -> Vec<RoomHit> {
     hits.into_iter().map(|(_, h)| h).collect()
 }
 
-/// Builders for tests that need a state signed with keys of their own.
-#[cfg(test)]
+/// Builders for tests that need a state signed with keys of their own, and for
+/// the example build's Discover fixtures.
+#[cfg(any(test, all(feature = "example-data", feature = "no-sync")))]
 pub(crate) mod fixtures {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
@@ -562,6 +563,14 @@ pub(crate) mod fixtures {
 
     pub fn sid_str(s: &str) -> SubjectId {
         SubjectId(s.to_string())
+    }
+
+    pub fn audience(s: &str) -> Audience {
+        Audience(s.to_string())
+    }
+
+    pub fn verify_status(s: &str) -> VerifyStatus {
+        VerifyStatus(s.to_string())
     }
 
     pub fn sign<T: Serialize>(v: &T, k: &SigningKey) -> Signature {

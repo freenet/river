@@ -30,6 +30,8 @@ use river_core::room_state::privacy::PrivacyMode;
 use river_core::room_state::ChatRoomStateV1;
 use std::sync::Mutex;
 
+use crate::discover_view::DISCOVER_OPEN;
+
 /// The URL query parameter that carries the address.
 pub const ROOM_PARAM: &str = "room";
 
@@ -390,6 +392,15 @@ pub fn view_for_test(raw: &str) {
     *VIEWED_ROOM.write() = Some(viewed);
 }
 
+/// Open a room read-only from Discover, as following its `?room=` link would
+/// (freenet/river#975). A room the user already belongs to is switched to by
+/// the viewer pane's own effect. Call from a deferred context.
+pub fn open_from_discover(owner_key_b58: &str) {
+    crate::public_join::reset();
+    let viewed = viewed_from_param(owner_key_b58);
+    *VIEWED_ROOM.write() = Some(viewed);
+}
+
 /// What a `?room=` value opens: the room (waiting for the network) or the
 /// reason it was refused. Records what the response handlers match on.
 fn viewed_from_param(raw: &str) -> ViewedRoom {
@@ -457,6 +468,10 @@ pub fn close() {
         let showing = VIEWED_ROOM.try_read().ok().is_some_and(|v| v.is_some());
         if showing {
             *VIEWED_ROOM.write() = None;
+        }
+        // Choosing a room from the rail, or closing the viewer, closes Discover too.
+        if DISCOVER_OPEN.try_read().is_ok_and(|open| *open) {
+            *DISCOVER_OPEN.write() = false;
         }
         #[cfg(target_arch = "wasm32")]
         strip_room_param_from_url();

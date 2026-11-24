@@ -37,6 +37,12 @@ type RiverTestHooks = {
   // View another example room in place (as a link followed inside the page would), without closing the viewer.
   viewRoom(kind: "public" | "private" | "open" | "hard" | "full"): void;
   // The current room's own nickname; "" when none.
+  // Base58 owner key of the current room; "" when none.
+  currentRoomOwnerKey(): string;
+  // One real chat delegate request through the production send path (this build has no node, so it never completes). A positive control for delegateRequestsSent.
+  probeDelegateRequest(): void;
+  // Everything in ROOMS as one string: keys, order, current room, and a hash of each room's serialised state.
+  roomsFingerprint(): string;
   currentRoomSelfNickname(): string;
   // Base58 key of whoever authored the first message with this exact text in the current room; "" when unknown.
   messageAuthorKey(text: string): string;
@@ -54,6 +60,10 @@ type RiverTestHooks = {
   releaseMessageSign(index: number): number;
   // Release every held request and stop holding.
   releaseMessageSigning(): void;
+  // Requests handed to the chat delegate since the page loaded, counted at every site that builds a DelegateOp.
+  delegateRequestsSent(): number;
+  // What the Discover index is served as, through the real session: "ready", "hidden", "empty", "unavailable" (fails verification); any other value is never answered ("Loading").
+  setDiscoverFixture(kind: "ready" | "hidden" | "empty" | "unavailable" | "loading"): void;
   // Own-message signing results (signature or failure) recorded since the page loaded.
   messageSignsRecorded(): number;
   // The next own-message signing fails with no local key to fall back on.

@@ -17,6 +17,7 @@ use crate::components::app::{MobileView, CREATE_ROOM_MODAL, CURRENT_ROOM, MOBILE
 use crate::components::back_to_chat::BackToChatButton;
 use crate::components::icons::{
     line_icon, IMPORT_ICON_PATH, JOIN_ICON_PATH, LOCK_ICON_PATH, PLUS_ICON_PATH, REORDER_ICON_PATH,
+    SEARCH_ICON_PATH,
 };
 use crate::components::loading_dots::{SmallDots, WaveDots};
 use crate::components::members::{ConnectionStatusIndicator, ImportIdentityModal};
@@ -477,6 +478,15 @@ pub fn RoomList() -> Element {
                         }
                     }
                     button {
+                        r#type: "button",
+                        "data-testid": "discover-rooms-button",
+                        class: "flex items-center gap-1 px-2 min-h-10 rounded-md text-xs text-link hover:bg-surface transition-colors",
+                        title: "Discover public rooms",
+                        onclick: move |_| crate::components::discover::open_discover(),
+                        {line_icon(SEARCH_ICON_PATH, 13)}
+                        span { "Discover rooms" }
+                    }
+                    button {
                         "data-testid": "create-room-button",
                         class: "p-1 rounded-md text-text-muted hover:text-text hover:bg-surface transition-colors",
                         title: "Create Room",
@@ -540,6 +550,14 @@ pub fn RoomList() -> Element {
                             class: "flex flex-col items-center justify-center gap-1 py-10 px-4 text-center",
                             span { class: "text-sm text-text-muted", "No rooms yet" }
                             span { class: "text-xs text-text-muted opacity-70", "Create a room or join one with an invite code." }
+                            button {
+                                r#type: "button",
+                                "data-testid": "room-list-empty-discover",
+                                class: "mt-2 flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm bg-accent text-white hover:opacity-90 transition-opacity",
+                                onclick: move |_| crate::components::discover::open_discover(),
+                                {line_icon(SEARCH_ICON_PATH, 14)}
+                                span { "Discover rooms" }
+                            }
                         }
                     },
                     RoomListDisplay::LoadFailed => rsx! {
