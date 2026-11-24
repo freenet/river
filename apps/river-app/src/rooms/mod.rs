@@ -76,6 +76,7 @@ pub mod leave;
 mod link_tests;
 pub mod modes;
 pub mod outbox;
+pub mod purge_record;
 pub mod rekey;
 mod resync;
 pub mod room;
@@ -379,6 +380,10 @@ impl Link {
                 let token_dir = inner.config_dir.as_deref().map(|d| {
                     token::node_dir(d, &authority, inner.explicit.load(Ordering::Acquire))
                 });
+                // This device's record of the deletions it sent lives in the app's config
+                // directory, whatever node River follows: a record kept per node would split
+                // when the node changes.
+                outbox.keep_purge_record_in(inner.config_dir.as_deref());
                 session::run(
                     &authority,
                     token_dir.as_deref(),

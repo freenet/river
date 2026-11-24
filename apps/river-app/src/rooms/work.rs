@@ -1325,6 +1325,23 @@ impl Work {
         out
     }
 
+    /// The rooms whose leave finished since the last call, each once. A leave that failed is
+    /// not here, and a leave tried again is reported again when it ends well.
+    pub fn take_done_leaves(&mut self) -> Vec<VerifyingKey> {
+        let mut out = Vec::new();
+        for t in &mut self.tasks {
+            if !t.is_leave() || t.settled || t.step != Step::Done || t.failed.is_some() {
+                continue;
+            }
+            let Some(room) = t.owner() else {
+                continue;
+            };
+            t.settled = true;
+            out.push(room);
+        }
+        out
+    }
+
     /// Try a failed task again from the step it failed at.
     pub fn retry(&mut self, id: u64) -> bool {
         let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) else {

@@ -30,18 +30,15 @@
 //!   queued only if the copy afterwards holds this very envelope and none of the messages
 //!   ([`applied`]), as a sent message must land ([`super::dm_send::landed`]).
 //!
-//! **The limit.** One envelope per recipient means an envelope built from a copy of the room that
-//! lags the node can be outranked. When the node answers Ok this app applies the delta to its own
-//! copy, so if another device signed in as the user has signed a higher-version envelope that
-//! this copy has not seen yet, the node drops this one, the thread shows the messages gone, and
-//! they come back when the other envelope arrives (also when two devices sign at the same
-//! version and the other has the greater signature digest). The window is however long this copy
-//! lags the node, not only a single moment. The web UI and `riverctl` repair this for what they themselves deleted,
-//! from a record kept with the room. This app does not: it has no storage for such a record (the
-//! web UI's is a field of the stored room this app does not read or write, and a new key in the
-//! chat delegate would change how the delegate is migrated), and a record kept only for the
-//! session would be lost at a restart and could report "deleted" for what later reverts. The
-//! confirmation says so. Persistent repair needs its own design.
+//! **A race with another device.** One envelope per recipient means an envelope built from a copy
+//! of the room that lags the node can be outranked: a device signed in as the user may have signed
+//! a higher-version envelope this copy has not seen, or signed at the same version with the greater
+//! signature digest. The envelope that wins may omit this device's tokens, and the messages then
+//! come back. This app keeps a record of every deletion it sends ([`super::purge_record`], a file
+//! per device) and, when the room's winning envelope for the user omits a recorded token, signs
+//! the union again at the next version ([`heal`], at most once per winning version, from
+//! river-core's `OwnPurges::heal`). That envelope is a [`Work`] with `heal` set and goes through
+//! the outbox like any deletion.
 //!
 //! Nothing here logs, and no error text carries a token, a key or a message. `Debug` of
 //! everything here shows counts.
@@ -62,8 +59,8 @@ use super::room::LiveRoom;
 /// of the user may have deleted recently (the room keeps one list per person, and this copy may
 /// lag the node), or the user may no longer be listed as a member.
 pub const NOT_KEPT: &str = "The room didn't keep this deletion. Another device of yours may have \
-     deleted messages recently, or you may no longer be listed as a member. Retry to \
-     delete again.";
+     deleted messages at the same moment, or you may no longer be listed as a member. If \
+     another device won, River signs this deletion again by itself; Retry tries it now.";
 
 /// Why a deletion was refused before anything was queued. The words never name a message.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -115,8 +112,19 @@ pub struct Work {
     pub envelope: AuthorizedRecipientPurges,
     /// The tokens this deletion is for (what it adds to the room's envelope), sorted.
     pub tokens: Vec<PurgeToken>,
-    /// Whose messages.
+    /// Whose messages. For a re-signed envelope ([`Work::heal`]) the user: it is not for one
+    /// person's thread.
     pub peer: MemberId,
+    /// A re-signed envelope that restores tokens a higher-ranked envelope omitted (see
+    /// [`heal`]), not a deletion the user just asked for. `tokens` are the ones it restores,
+    /// whose messages may be gone from this copy already.
+    pub heal: bool,
+    /// Whether this deletion is in the record of deletions ([`super::purge_record`]): set as it
+    /// first goes out, cleared when the record is taken back.
+    pub recorded: bool,
+    /// The tokens its recording newly added; a refusal takes back only these, since the others
+    /// were recorded by an earlier deletion that the node may have taken.
+    pub added: Vec<PurgeToken>,
 }
 
 impl std::fmt::Debug for Work {
@@ -124,6 +132,7 @@ impl std::fmt::Debug for Work {
         f.debug_struct("Work")
             .field("version", &self.envelope.state.version)
             .field("tokens", &self.tokens.len())
+            .field("heal", &self.heal)
             .finish()
     }
 }
@@ -327,6 +336,9 @@ pub fn prepare(room: &LiveRoom, peer: MemberId, wanted: &[PurgeToken]) -> Result
         envelope,
         tokens,
         peer,
+        heal: false,
+        recorded: false,
+        added: Vec::new(),
     })
 }
 
@@ -336,6 +348,9 @@ pub fn prepare(room: &LiveRoom, peer: MemberId, wanted: &[PurgeToken]) -> Result
 /// tokens that still need deleting: a message that went meanwhile, or whose token the room's
 /// envelope lists already, is left out. Nothing left to delete is [`Refusal::Nothing`].
 pub fn refresh(room: &LiveRoom, work: &Work) -> Result<Option<Work>, Refusal> {
+    if work.heal {
+        return refresh_heal(room, work);
+    }
     // Already deleted (the room took this envelope from the network, or another device's lists
     // these tokens): nothing to build or send, and no failure. The caller leaves the entry for
     // `Outbox::reconcile` to settle as done.
@@ -368,6 +383,89 @@ pub fn refresh(room: &LiveRoom, work: &Work) -> Result<Option<Work>, Refusal> {
         envelope,
         tokens,
         peer: work.peer,
+        heal: false,
+        recorded: work.recorded,
+        added: work.added.clone(),
+    }))
+}
+
+/// The envelope that restores the recorded tokens `own` holds for the user and the room's winning
+/// envelope omits, signed at the next version, or `None` when nothing is missing or this device
+/// already re-signed against the winning version in this run (`own` carries that guard and
+/// records it; it is [`river_core::own_purges::OwnPurges::heal`]). Not for a room whose copy has
+/// not taken the network's state: the caller checks that.
+pub fn heal(
+    room: &LiveRoom,
+    own: &mut river_core::own_purges::OwnPurges,
+) -> Option<Result<Work, Refusal>> {
+    let sk = room.stored.self_sk.as_ref()?;
+    let me = MemberId::from(&sk.verifying_key());
+    let held: HashSet<PurgeToken> = held_envelope(room, me)
+        .map(|h| h.state.purged.iter().copied().collect())
+        .unwrap_or_default();
+    let envelope = match own.heal(sk, &room.stored.owner_vk, &room.stored.room_state)? {
+        Ok(envelope) => envelope,
+        Err(e) => return Some(Err(Refusal::Compose(e))),
+    };
+    let tokens: Vec<PurgeToken> = envelope
+        .state
+        .purged
+        .iter()
+        .copied()
+        .filter(|t| !held.contains(t))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let work = Work {
+        envelope,
+        tokens,
+        peer: me,
+        heal: true,
+        recorded: false,
+        added: Vec::new(),
+    };
+    Some(applied(room, &work.envelope, &work.tokens).map(|_| work))
+}
+
+/// [`refresh`] for a re-signed envelope. It is for tokens whose messages may be gone, so the
+/// "nothing left to delete" checks do not apply; it is done when the room lists every token.
+fn refresh_heal(room: &LiveRoom, work: &Work) -> Result<Option<Work>, Refusal> {
+    let Some(me) = me(room) else {
+        return Err(Refusal::Blocked(Blocked::NoKey));
+    };
+    if covers(room, me, &work.tokens) {
+        return Ok(None);
+    }
+    match applied(room, &work.envelope, &work.tokens) {
+        Ok(_) => return Ok(None),
+        Err(Refusal::Stale) => {}
+        Err(other) => return Err(other),
+    }
+    // The room's envelope changed since this was signed: sign again from it, for the tokens it
+    // still omits, as many as it has room for.
+    let held: HashSet<PurgeToken> = held_envelope(room, me)
+        .map(|h| h.state.purged.iter().copied().collect())
+        .unwrap_or_default();
+    let room_left = MAX_PURGED_TOMBSTONES_PER_RECIPIENT.saturating_sub(held.len());
+    let tokens: Vec<PurgeToken> = work
+        .tokens
+        .iter()
+        .copied()
+        .filter(|t| !held.contains(t))
+        .take(room_left)
+        .collect();
+    if tokens.is_empty() {
+        return Err(Refusal::Nothing);
+    }
+    let envelope = build(room, &tokens)?;
+    applied(room, &envelope, &tokens)?;
+    Ok(Some(Work {
+        envelope,
+        tokens,
+        peer: work.peer,
+        heal: true,
+        recorded: false,
+        added: Vec::new(),
     }))
 }
 

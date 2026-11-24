@@ -2327,6 +2327,12 @@ mod purging {
         assert!(shows(&rt, "cannot be undone"));
         assert!(shows(&rt, "Messages you sent Priya are not deleted"));
         assert!(shows(&rt, "at most 1000 deleted messages"));
+        assert!(shows(
+            &rt,
+            "some messages may reappear until River is opened here again"
+        ));
+        assert!(!shows(&rt, "some messages can come back"));
+        assert!(!shows(&rt, "can return if you go past that"));
         assert!(shows(&rt, "Delete 2 messages"));
 
         press(&mut rt, "dm-purge-cancel");
@@ -2349,7 +2355,7 @@ mod purging {
         let (mut rt, _f) = open_thread();
         press(&mut rt, "dm-purge");
         assert!(rt.find("dm-purge-confirm").is_some());
-        assert!(shows(&rt, "some messages can come back"));
+        assert!(shows(&rt, "cannot be undone"));
         for key in [Key::Enter, Key::Text(" ".into())] {
             rt.key(KeyEvent {
                 key,

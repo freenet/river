@@ -1038,6 +1038,7 @@ fn follow_on(
         subs.keep_only(&rooms.contract_ids());
         rooms.archive_revival(unix_secs());
         rooms.dm_save_tick(writes, Instant::now());
+        rooms.own_purges_tick();
         if writes {
             match rooms.send_updates(socket) {
                 Ok(failed) => changed |= failed,
@@ -2063,6 +2064,19 @@ struct Rooms {
     dm_invite_results: Vec<DmInviteResult>,
     /// What [`Rooms::prune_purged_texts`] last ran on.
     purge_pruned: Option<u64>,
+    /// For each room, the winning purge-envelope version this run already re-signed against, per
+    /// recipient (`OwnPurges::healed_at`): at most one re-sign per winning version
+    /// ([`Rooms::own_purges_tick`]). Not kept on disk, see [`super::purge_record`].
+    healed_run: HashMap<VerifyingKey, Vec<(MemberId, u64)>>,
+    /// What [`Rooms::own_purges_tick`] last read for each room.
+    purge_tick_seen: HashMap<VerifyingKey, u64>,
+    /// Rooms whose record is to be removed (the user left): retried until it is.
+    purge_forget_owed: HashSet<VerifyingKey>,
+    /// Rooms where the user could not write when the tick last looked, so a re-sign waits (it is
+    /// looked at again every tick; pruning is not held up by it).
+    purge_heal_blocked: HashSet<VerifyingKey>,
+    /// Failed storage work on the record of deletions waits until then to be tried again.
+    purge_retry_at: Option<Instant>,
     /// A message was sent into a thread this copy of the archive list does not hold: the stored
     /// rooms are read again once at the next tick, and at most once in [`REREAD_EVERY`].
     reread_after_send: bool,
@@ -3017,6 +3031,146 @@ impl Rooms {
         }
     }
 
+    /// Keep this device's record of its deletions in step with the rooms, and sign again a
+    /// deletion the room lost to another device ([`super::purge_record`]).
+    ///
+    /// A room whose leave finished loses its record. For each room read from the network (a
+    /// copy that only the store has read may lack what the room holds, and the union built from
+    /// it would be wrong), with nothing of its own deletions waiting in the outbox, the record
+    /// loses recipients that are no longer members, and when the room's winning envelope for
+    /// the user omits a recorded token, the union is queued at the next version
+    /// ([`super::dm_purge::heal`]): at most once per winning version, so two devices that both
+    /// hold records trade a bounded number of envelopes. The queued envelope is an ordinary
+    /// outbox entry, so it waits for the write gate ([`super::generation`]) like every write.
+    fn own_purges_tick(&mut self) {
+        // A leave that finished: its record goes. Storage work that failed (this, and taking
+        // back the record of a refused deletion) is tried again every few seconds until it works.
+        self.purge_forget_owed
+            .extend(self.outbox.work.take_done_leaves());
+        let now = Instant::now();
+        if self.purge_retry_at.is_none_or(|at| now >= at) {
+            let mut failed = false;
+            let owed: Vec<VerifyingKey> = self.purge_forget_owed.iter().copied().collect();
+            for vk in owed {
+                self.healed_run.remove(&vk);
+                self.purge_tick_seen.remove(&vk);
+                match self.outbox.purge_record_mut().forget(&vk) {
+                    Ok(()) => {
+                        self.purge_forget_owed.remove(&vk);
+                    }
+                    Err(e) => {
+                        failed = true;
+                        crate::diag!(
+                            "River: the record of a left room's deletions stays for now: {}",
+                            crate::diag::scrub(&e)
+                        );
+                    }
+                }
+            }
+            failed |= self.outbox.retry_takebacks();
+            self.purge_retry_at = failed.then(|| now + PURGE_STORAGE_RETRY);
+        }
+        // Re-signed envelopes that failed are background work and are never shown.
+        let dropped = self.outbox.drop_failed_heals();
+        if dropped > 0 {
+            crate::diag!("River: {dropped} re-signed deletion(s) were not kept and were dropped");
+        }
+        if self.update_required {
+            return;
+        }
+        for i in 0..self.list.len() {
+            let room = &self.list[i];
+            let vk = room.stored.owner_vk;
+            if !self.network_seen.contains(&vk)
+                || self.outbox.purge_record().for_room(&vk).is_none()
+                || self.outbox.purge_pending(&vk)
+                || self.outbox.heal_in_progress(&vk)
+            {
+                continue;
+            }
+            // Only when what it depends on changed: the held envelope, who the user is, the
+            // members, the room's configuration, the record. Pruning needs no permission to
+            // write (it reads what the room holds); re-signing does, and a room the user cannot
+            // write in is looked at again every tick, since what unblocks it (a key arriving)
+            // is not one of those inputs.
+            let seen = self.own_purges_fingerprint(room);
+            let same = self.purge_tick_seen.get(&vk) == Some(&seen);
+            if same && !self.purge_heal_blocked.contains(&vk) {
+                continue;
+            }
+            if !same {
+                self.purge_tick_seen.insert(vk, seen);
+                if let Err(e) = self
+                    .outbox
+                    .purge_record_mut()
+                    .prune(&vk, &room.stored.room_state)
+                {
+                    crate::diag!(
+                        "River: the record of your deletions was not pruned: {}",
+                        crate::diag::scrub(&e)
+                    );
+                }
+            }
+            if super::outbox::participation(room).is_err() {
+                self.purge_heal_blocked.insert(vk);
+                continue;
+            }
+            self.purge_heal_blocked.remove(&vk);
+            let Some(record) = self.outbox.purge_record().for_room(&vk) else {
+                continue;
+            };
+            let mut own = record.clone();
+            self.outbox.without_abandoned(&vk, &mut own);
+            own.healed_at = self.healed_run.get(&vk).cloned().unwrap_or_default();
+            let Some(result) = super::dm_purge::heal(room, &mut own) else {
+                continue;
+            };
+            match result {
+                Ok(work) => {
+                    // The winning version is used up only by an envelope that was queued: one
+                    // that could not be built is tried again when the room changes.
+                    self.healed_run.insert(vk, own.healed_at);
+                    crate::diag!(
+                        "River: signing your deleted messages again for a room: the room's \
+                         winning deletion omits {} that this computer recorded",
+                        work.tokens.len()
+                    );
+                    self.outbox.heal_purge(&self.list[i], work);
+                }
+                Err(refusal) => crate::diag!(
+                    "River: your deleted messages were not signed again: {}",
+                    crate::diag::scrub(refusal.text())
+                ),
+            }
+        }
+    }
+
+    /// What [`Rooms::own_purges_tick`] reads for one room: the envelope the room holds for the
+    /// user (its signature says which, and covers its version), who the user is, the members, the room's
+    /// configuration signature (what pruning checks) and the record's revision.
+    fn own_purges_fingerprint(&self, room: &LiveRoom) -> u64 {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        self.outbox.purge_record().rev().hash(&mut h);
+        let state = &room.stored.room_state;
+        if let Some(sk) = &room.stored.self_sk {
+            let me = MemberId::from(&sk.verifying_key());
+            me.0.0.hash(&mut h);
+            state
+                .direct_messages
+                .purges
+                .iter()
+                .find(|p| p.recipient_id == me)
+                .map(|p| p.recipient_signature.to_bytes())
+                .hash(&mut h);
+        }
+        for m in &state.members.members {
+            m.member.id().0.0.hash(&mut h);
+        }
+        state.configuration.signature.to_bytes().hash(&mut h);
+        h.finish()
+    }
+
     /// Drop the sent text of every message its recipient deleted, and owe the store its removal
     /// ([`OutboundCache::prune_named`]), as the web UI does when it sees the deletion
     /// (`prune_outbound_dms_for_purges`). It acts only on a token a purge envelope in a room
@@ -3888,9 +4042,16 @@ fn order(room_order: &[VerifyingKey], mut present: Vec<VerifyingKey>) -> Vec<Ver
     out
 }
 
+/// How long failed storage work on the record of deletions waits before it is tried again.
+const PURGE_STORAGE_RETRY: Duration = Duration::from_secs(5);
+
 #[cfg(test)]
 #[path = "session_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "own_purge_tests.rs"]
+mod own_purge_tests;
 
 #[cfg(test)]
 #[path = "dm_invite_session_tests.rs"]
