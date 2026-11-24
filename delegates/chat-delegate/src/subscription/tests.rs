@@ -29,16 +29,12 @@
 //!   makes, are `ensure_subscription_writes`, tested directly below with a
 //!   stored key; only the secret-store read itself is WASM-only.
 //!
-//! - **Cache-not-updated-when-signing-key-missing** (Fix 3): exercising
-//!   the cache-discipline rule needs `set_secret` to actually persist the
-//!   member-set bytes for a follow-up call to read back. Today's tests
-//!   cover the byte-shape of the rotation outputs and the version
-//!   arithmetic; the cache discipline is enforced by code review until a
-//!   harness lands.
-//!
-//! Filed as a follow-up in the PR description; the cleanest fix is a
-//! `MockDelegateCtx` trait wrapper but that requires changes upstream in
-//! `freenet-stdlib`.
+//! - **Notification handler with a store that can refuse writes**:
+//!   `handle_contract_notification` takes the `SecretStore` trait, so the
+//!   `RefusingStore` tests at the end of this file drive it end to end
+//!   (rotation stores the secret and member set; a refused write publishes
+//!   nothing and advances nothing; a retry succeeds). The host `DelegateCtx`
+//!   itself is still a stub.
 
 use super::*;
 use ed25519_dalek::SigningKey;
@@ -1044,9 +1040,9 @@ fn a_notification_whose_configuration_the_owner_did_not_sign_resolves_to_no_room
     );
 }
 
-/// `handle_contract_notification` reads the delegate's secret store, which
-/// the host `DelegateCtx` stubs out, so no host test can drive it. Its two
-/// routing checks are pinned by reading the source instead (the idiom of
+/// The host `DelegateCtx` stubs out the secret store, so the behavioural
+/// tests at the end of this file use `RefusingStore`. Its two routing checks
+/// are also pinned by reading the source (the idiom of
 /// `cli/src/commands/debug.rs`): it must resolve the room through
 /// `resolve_notified_room` (never a plain read of the reverse index), and
 /// must ignore a notification for a contract the room's subscription does
@@ -1194,14 +1190,16 @@ fn a_refused_member_set_write_publishes_no_update_and_a_retry_rotates() {
 
     // Not wedged: with the store back, the same notification rotates, and
     // the secret it re-stores is the same bytes.
-    let before = store.map.get(&secret_keys::secret(&room, 1)).cloned();
+    let before = store
+        .map
+        .get(&secret_keys::secret(&room, 1))
+        .cloned()
+        .expect("the secret was stored before the member-set write was refused");
     store.refuse_prefixes.clear();
     let out = handle_contract_notification(&mut store, n).unwrap();
     assert!(has_update(&out));
     assert!(store.map.contains_key(&secret_keys::member_set(&room)));
-    if let Some(b) = before {
-        assert_eq!(store.map.get(&secret_keys::secret(&room, 1)), Some(&b));
-    }
+    assert_eq!(store.map.get(&secret_keys::secret(&room, 1)), Some(&before));
 }
 
 #[test]
@@ -1225,7 +1223,18 @@ fn a_refused_member_set_write_for_a_public_room_is_not_an_error() {
         new_state: freenet_stdlib::prelude::WrappedState::new(cbor(&state)),
         ..n
     };
+    // Positive control: with the store healthy the public branch does run
+    // and stores the cache, so the refused case below reaches the same branch.
+    let mut healthy = RefusingStore {
+        map: store.map.clone(),
+        ..Default::default()
+    };
+    let out = handle_contract_notification(&mut healthy, n.clone()).unwrap();
+    assert!(out.is_empty());
+    assert!(healthy.map.contains_key(&secret_keys::member_set(&room)));
+
     store.refuse_prefixes = vec![secret_keys::member_set(&room)];
     let out = handle_contract_notification(&mut store, n).unwrap();
     assert!(out.is_empty());
+    assert!(!store.map.contains_key(&secret_keys::member_set(&room)));
 }

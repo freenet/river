@@ -360,8 +360,8 @@ pub(crate) fn handle_contract_notification(
     // costs nothing.
     if new_state.configuration.configuration.privacy_mode != PrivacyMode::Private {
         logging::info("Notification for non-private room — no rotation needed");
-        // Nothing depends on this cache for a public room, so a refused
-        // write is logged and not an error.
+        // A stale cache only causes one extra rotation if the room turns
+        // private, so a refused write is logged and not an error.
         if let Err(e) = update_member_set_cache(ctx, &room_b58, &new_state) {
             logging::info(&format!("Public room member-set cache not stored: {e:?}"));
         }
@@ -565,15 +565,15 @@ pub(crate) fn handle_contract_notification(
     );
     update_req.context = DelegateContext::default();
 
-    // Both writes happen BEFORE the update is handed back. The new secret
-    // must be held before a room update names its version: a rotation that
-    // is published while the delegate cannot store the secret locks the
-    // owner out of the version it just created. The member-set cache is
-    // what stops the next notification re-rotating, so it is advanced only
-    // once the rotation is certain to be emitted. A refusal returns an
-    // error, publishes nothing and leaves the cache as it was, so the next
-    // notification takes the same path again. The secret is deterministic
-    // for `(seed, owner, version)`, so a retried write stores the same bytes.
+    // Both writes happen BEFORE the update is handed back, so a refusal
+    // publishes nothing and advances nothing. The secret is a local copy
+    // (the owner can also recover it from the room's own blob), so this is
+    // a choice: a host that refuses writes pauses rotation, which resumes
+    // at the next notification (a room update), not on a timer. The
+    // member-set cache stops the next notification re-rotating, so it
+    // advances only once the rotation is certain to be emitted. The secret
+    // is deterministic for `(seed, owner, version)`: a retry stores the
+    // same bytes.
     put_secret(
         ctx,
         &secret_keys::secret(&room_b58, new_version),
