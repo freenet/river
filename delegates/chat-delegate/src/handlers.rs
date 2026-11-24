@@ -246,7 +246,7 @@ fn create_intent_key(origin: &Origin) -> Vec<u8> {
 }
 
 /// Write `value` under `key`, or fail.
-fn put_secret(
+pub(crate) fn put_secret(
     ctx: &mut impl SecretStore,
     key: &[u8],
     value: &[u8],
