@@ -413,7 +413,7 @@ mod tests {
         assert_eq!(parse_room_param("   "), Err(RoomLinkError::Empty));
         // 0, O, I and l are not in the alphabet.
         assert_eq!(parse_room_param("0OIl"), Err(RoomLinkError::NotBase58));
-        assert_eq!(parse_room_param("abc"), Err(RoomLinkError::BadLength(2)));
+        assert_eq!(parse_room_param("abc"), Err(RoomLinkError::BadLength(3)));
         // The 33-byte base58 of a key plus a byte.
         let mut long = key().as_bytes().to_vec();
         long.push(1);
