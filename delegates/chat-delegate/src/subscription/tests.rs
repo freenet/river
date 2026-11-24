@@ -1043,3 +1043,51 @@ fn a_notification_whose_configuration_the_owner_did_not_sign_resolves_to_no_room
         Some(owner.verifying_key().to_bytes())
     );
 }
+
+/// `handle_contract_notification` reads the delegate's secret store, which
+/// the host `DelegateCtx` stubs out, so no host test can drive it. Its two
+/// routing checks are pinned by reading the source instead (the idiom of
+/// `cli/src/commands/debug.rs`): it must resolve the room through
+/// `resolve_notified_room` (never a plain read of the reverse index), and
+/// must ignore a notification for a contract the room's subscription does
+/// not name, both before it acts on the notified state. Whitespace is
+/// removed before matching so a reformat does not break the pin; the source
+/// is cut at its test module so this test's own text cannot satisfy it.
+#[test]
+fn the_notification_handler_routes_through_the_owner_and_the_subscribed_contract() {
+    let src = include_str!("../subscription.rs");
+    let src = &src[..src.find("#[cfg(test)]\nmod tests").unwrap_or(src.len())];
+    let start = src
+        .find("pub(crate) fn handle_contract_notification(")
+        .expect("the notification handler exists");
+    let end = src[start + 1..]
+        .find("\nfn ")
+        .map(|i| start + 1 + i)
+        .unwrap_or(src.len());
+    let body: String = src[start..end].split_whitespace().collect();
+
+    let resolve = body
+        .find("resolve_notified_room(&cid_bytes,&new_state,")
+        .expect("the room is resolved through resolve_notified_room");
+    assert!(
+        !body.contains("contract_id_index_key("),
+        "the handler must not read the reverse index directly"
+    );
+    let check = body
+        .find("ifsub_ctx.contract_id!=cid_bytes{")
+        .expect("a notification for a contract the subscription does not name is ignored");
+    assert!(
+        body[check..].starts_with("ifsub_ctx.contract_id!=cid_bytes{")
+            && body[check..]
+                .split_once('}')
+                .is_some_and(|(arm, _)| arm.contains("returnOk(vec![]);")),
+        "the contract check must return without acting"
+    );
+    let acts = body
+        .find("privacy_mode")
+        .expect("the handler reads the notified room's privacy mode");
+    assert!(
+        resolve < check && check < acts,
+        "both checks run before the handler acts on the notified state"
+    );
+}
