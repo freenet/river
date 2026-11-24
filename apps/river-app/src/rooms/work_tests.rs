@@ -8,6 +8,7 @@ use freenet_stdlib::client_api::DelegateRequest;
 use freenet_stdlib::prelude::{InboundDelegateMsg, StateSummary, WrappedState};
 use river_core::chat_delegate::{ChatDelegateKey, ChatDelegateRequestMsg};
 use river_core::stored_rooms::{StoredRoomsMeta, decode_rooms_meta};
+use std::time::SystemTime;
 
 /// What the task asked the chat delegate, if it asked it something.
 fn delegate_msg(r: &ClientRequest<'_>) -> Option<ChatDelegateRequestMsg> {

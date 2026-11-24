@@ -130,6 +130,8 @@ const CHECK_EVERY: (Duration, Duration) = (
 );
 
 /// A time in `[lo, hi]`, spread by the clock and the process, which is all the spread needs.
+// A jitter source, not a signed time.
+#[allow(clippy::disallowed_methods)]
 fn jittered((lo, hi): (Duration, Duration)) -> Duration {
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| {
         d.subsec_nanos() as u64 ^ (d.as_secs().wrapping_mul(2654435761))

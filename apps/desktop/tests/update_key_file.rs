@@ -1,3 +1,5 @@
+// Test code stamps arbitrary times; the rule is for what production signs (freenet/river#971).
+#![allow(clippy::disallowed_methods)]
 //! The update key River's releases trust is committed in `update-pubkey.hex` and compiled in
 //! by the release workflow. These tests fail a pull request that breaks either half.
 

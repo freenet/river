@@ -11,7 +11,8 @@
 //! app's stderr goes to a log file instead (see `log`).
 //!
 //! Only one River runs per user: a second launch shows the first one's window and exits.
-
+// Test code stamps arbitrary times; the rule is for what production signs (freenet/river#971).
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 // No console window behind the app on Windows release builds.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 

@@ -1416,6 +1416,8 @@ fn prune_outbound_cache_for_room(
     })
 }
 
+// Unix seconds for a DM envelope, not a SystemTime that is signed.
+#[allow(clippy::disallowed_methods)]
 fn unix_now() -> Result<u64> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)

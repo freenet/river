@@ -216,6 +216,14 @@ jobs:
       # upgrade-chain cycle guards). No prior step ran or even compiled them.
       run: cargo test -p riverctl --lib
 
+    - name: Clippy riverctl (no unrounded clock in signed values)
+      env:
+        CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      # cli/clippy.toml bans SystemTime::now: a signed time must go through
+      # signed_time::now so Windows clients can verify it (freenet/river#971).
+      # Only that lint is denied here; nothing else in clippy gates this crate.
+      run: cargo clippy -p riverctl --all-targets --locked -- -A clippy::all -D clippy::disallowed_methods
+
     - name: Test river-core lib (room_state, crypto, CRDT unit tests)
       env:
         RUST_MIN_STACK: 8388608

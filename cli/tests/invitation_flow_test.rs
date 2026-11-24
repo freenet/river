@@ -1,3 +1,5 @@
+// Test code stamps arbitrary times; the rule is for what production signs (freenet/river#971).
+#![allow(clippy::disallowed_methods)]
 use anyhow::{anyhow, Result};
 use ed25519_dalek::SigningKey;
 use freenet_scaffold::ComposableState;

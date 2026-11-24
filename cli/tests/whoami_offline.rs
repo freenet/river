@@ -1,3 +1,5 @@
+// Test code stamps arbitrary times; the rule is for what production signs (freenet/river#971).
+#![allow(clippy::disallowed_methods)]
 //! Behavioural tests for `riverctl identity whoami` (freenet/river#438).
 //!
 //! These run the REAL binary with `--node-url` pointed at a closed port, which

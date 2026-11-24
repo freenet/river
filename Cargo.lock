@@ -4907,7 +4907,7 @@ dependencies = [
 
 [[package]]
 name = "riverctl"
-version = "0.2.27"
+version = "0.2.28"
 dependencies = [
  "aes-gcm",
  "anyhow",

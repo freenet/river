@@ -293,6 +293,34 @@ fn the_owner_bans_in_a_public_room_and_the_contract_removes_the_member_and_their
     })));
 }
 
+fn whole_ms(t: SystemTime) {
+    let d = t.duration_since(SystemTime::UNIX_EPOCH).unwrap();
+    assert_eq!(d.subsec_nanos() % 1_000_000, 0, "{d:?}");
+}
+
+/// A queued ban can carry a time with nanoseconds (an entry stored before the fix); what is
+/// signed from it must be a whole millisecond (freenet/river#971).
+#[test]
+fn a_ban_and_its_rotation_are_signed_a_whole_millisecond() {
+    let w = World::new();
+    let state = w.state(true);
+    let room = w.room(state, w.owner());
+    let t = at(TIME) + Duration::new(0, 123_456_789);
+    let built = build(&room, id(&w.ann), t).unwrap();
+    whole_ms(built.ban.as_ref().unwrap().ban.banned_at);
+    let versions = &built.secrets.as_ref().unwrap().new_versions;
+    assert!(!versions.is_empty());
+    for r in versions {
+        whole_ms(r.record.created_at);
+    }
+    let rotated = build_rotation(&room, t).unwrap();
+    let versions = &rotated.secrets.as_ref().unwrap().new_versions;
+    assert!(!versions.is_empty());
+    for r in versions {
+        whole_ms(r.record.created_at);
+    }
+}
+
 #[test]
 fn a_ban_in_a_private_room_rotates_the_secret_in_the_same_update() {
     let w = World::new();
