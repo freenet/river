@@ -13,6 +13,7 @@ mod invites;
 mod nickname;
 #[allow(dead_code)]
 mod pending_invites;
+mod public_room;
 mod room_data;
 pub mod signing;
 #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]

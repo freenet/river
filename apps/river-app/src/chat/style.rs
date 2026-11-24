@@ -104,6 +104,8 @@ pub const BODY: TextStyle = TextStyle::new(14.0, 400.0);
 pub const NAME: TextStyle = TextStyle::new(15.0, 700.0);
 pub const MESSAGE: TextStyle = TextStyle::new(15.0, 400.0).lh(22.0);
 pub const QUOTE: TextStyle = TextStyle::new(13.0, 400.0).lh(18.0);
+/// A join line: the web UI's 13px muted text on 20px lines.
+pub const JOIN: TextStyle = TextStyle::new(13.0, 400.0).lh(20.0);
 pub const SMALL: TextStyle = TextStyle::new(12.0, 400.0);
 pub const SMALL_STRONG: TextStyle = TextStyle::new(12.5, 600.0);
 pub const TAG: TextStyle = TextStyle::new(10.5, 700.0).tracking(0.3);

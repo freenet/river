@@ -6,8 +6,8 @@
 //! an edit).
 
 use super::model::{
-    self, Appointer, Details, Editable, Limits, Member, MemberId, Message, Reaction, ReplyTo, Role,
-    Room, RotateOffer, Usage,
+    self, Appointer, Details, Editable, Join, Limits, Member, MemberId, Message, Reaction, ReplyTo,
+    Role, Room, RotateOffer, Usage,
 };
 
 pub struct ExampleData {
@@ -192,6 +192,7 @@ fn town_square() -> Room {
             invited(member(ME, "Sam Rivers", Role::Member), PRIYA),
         ],
         messages: b.messages,
+        joins: Vec::new(),
         me: ME,
         unread: 0,
         send_block: None,
@@ -250,6 +251,7 @@ fn design_crew() -> Room {
             member(KWAME, "Kwame Mensah", Role::Member),
         ],
         messages: b.messages,
+        joins: Vec::new(),
         me: ME,
         unread: 2,
         send_block: None,
@@ -298,6 +300,7 @@ fn rust_help() -> Room {
             member(ME, "Sam", Role::Member),
         ],
         messages: b.messages,
+        joins: Vec::new(),
         me: ME,
         unread: 2,
         send_block: None,
@@ -335,6 +338,7 @@ fn family() -> Room {
             member(ME, "Sam", Role::Member),
         ],
         messages: b.messages,
+        joins: Vec::new(),
         me: ME,
         unread: 0,
         send_block: None,
@@ -362,6 +366,7 @@ fn book_club() -> Room {
         private: false,
         members: vec![member(ME, "Sam Rivers", Role::Owner)],
         messages: Vec::new(),
+        joins: Vec::new(),
         me: ME,
         unread: 0,
         send_block: None,
@@ -604,4 +609,23 @@ pub const DM_PEER: &str = "27";
 /// The keys of the example rooms.
 pub fn dm_room_keys() -> Vec<String> {
     data().rooms.into_iter().map(|r| r.key).collect()
+}
+
+/// Join lines for the `chat-joins` scene, in Town Square: one person early, then two within the
+/// hour, and three after the last message.
+pub fn add_example_joins(rooms: &mut [Room]) {
+    let Some(r) = rooms.iter_mut().find(|r| r.key == "town-square") else {
+        return;
+    };
+    let join = |names: &[&str], time: u32, before: usize| Join {
+        key: format!("join-{before}-{time}"),
+        names: names.iter().map(|n| n.to_string()).collect(),
+        time,
+        before,
+    };
+    r.joins = vec![
+        join(&["Kwame Mensah"], at(TODAY, 9, 10), 2),
+        join(&["Elena Petrova", "Tomás"], at(TODAY, 9, 38), 5),
+        join(&["Ana", "Bo", "Cy"], at(TODAY, 10, 20), r.messages.len()),
+    ];
 }

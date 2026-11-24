@@ -305,6 +305,9 @@ pub struct Chat {
     /// Whether the open room's history shows its newest message (the Latest button hides
     /// then). Reported by the history's scroll area.
     pub at_bottom: bool,
+    /// The "N people joined" lines (by `Join::key`) opened to show who, as the web UI's
+    /// `details` does. Not kept across runs.
+    pub joins_open: std::collections::HashSet<String>,
     /// The member (by `Member::uid`) whose info dialog is open, in the open room.
     pub member_modal: Option<String>,
     /// The open dialog's member by full River id, when it was opened from somewhere that knows
@@ -505,6 +508,7 @@ impl Chat {
             mention_sel: (String::new(), 0),
             mention_off: None,
             at_bottom: true,
+            joins_open: Default::default(),
             member_modal: None,
             member_modal_full: None,
             deputy_confirm: None,

@@ -16,6 +16,11 @@ pub fn handle_subscribe_response(key: ContractKey, subscribed: bool) -> bool {
         return false;
     }
 
+    // A public room viewed read-only (freenet/river#513): not a room of ours, never re-PUT.
+    if crate::public_room::is_viewers(key.id()) {
+        return false;
+    }
+
     // Get the owner VK for this contract first, then release the read lock
     let owner_vk_opt = {
         let sync_info = SYNC_INFO.read();

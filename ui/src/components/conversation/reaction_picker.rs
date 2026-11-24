@@ -181,11 +181,13 @@ impl ReactionSurfaces {
     /// only.
     pub(super) fn close_if_stale(self) {
         self.close_mobile_if_stale();
-        let stale = self
-            .target
-            .peek()
-            .as_ref()
-            .is_some_and(|target| !target_is_live(target));
+        // Fallible: this runs deferred, and the conversation (which owns the
+        // signal) may have unmounted by then.
+        let stale = self.target.try_peek().is_ok_and(|target| {
+            target
+                .as_ref()
+                .is_some_and(|target| !target_is_live(target))
+        });
         if stale {
             self.close();
         }

@@ -255,6 +255,12 @@ pub fn App() -> Element {
     // Idempotent.
     crate::util::watch_media(WIDE_VIEWPORT_QUERY, &WIDE_VIEWPORT);
 
+    // Read `?room=` (freenet/river#513) now: the invitation handling below
+    // removes `?invitation=` from the address, and a link carrying both must be
+    // judged with the invitation still in it, so the invitation flow wins.
+    // (`VIEWED_ROOM` initialises from the address on first access.)
+    let _ = crate::public_room::VIEWED_ROOM.peek();
+
     let mut receive_invitation = use_signal(|| None::<Invitation>);
 
     // One-shot guard for the localStorage auto-resume path (#218). The
@@ -554,6 +560,16 @@ pub fn App() -> Element {
         }
     }
 
+    // `?room=<owner key>` (freenet/river#513) opens a public room read-only,
+    // without membership; `VIEWED_ROOM` reads the address itself.
+    let viewing_room = match crate::public_room::VIEWED_ROOM.try_read() {
+        Ok(v) => v.is_some(),
+        Err(_) => {
+            crate::util::signal_guard::schedule_nudge();
+            false
+        }
+    };
+
     // Seed DM_LAST_SEEN from the room state we just hydrated, so
     // previously-existing inbound DMs don't show up as unread on every
     // page load. We explicitly subscribe to ROOMS here so the effect
@@ -697,7 +713,11 @@ pub fn App() -> Element {
                     let is_chat = *MOBILE_VIEW.read() == MobileView::Chat;
                     if is_chat { "flex-1 flex min-w-0" } else { "hidden md:flex md:flex-1 md:min-w-0" }
                 },
-                Conversation {}
+                if viewing_room {
+                    crate::components::viewed_room::ViewedRoomPane {}
+                } else {
+                    Conversation {}
+                }
             }
             div {
                 // From 768px it follows `MEMBERS_PANEL_OPEN` (automatic: `lg:`
@@ -715,7 +735,9 @@ pub fn App() -> Element {
                         (false, Some(false)) => "hidden",
                     }
                 },
-                MemberList {}
+                if !viewing_room {
+                    MemberList {}
+                }
             }
         }
         EditRoomModal {}

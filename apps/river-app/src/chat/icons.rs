@@ -149,3 +149,10 @@ pub static DANGER: Icon = Icon {
     view: 16.0,
     body: r#"<path d="M5.2 1.8h5.6l3.4 3.4v5.6l-3.4 3.4H5.2l-3.4-3.4V5.2l3.4-3.4Z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M8 5v3.6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="8" cy="10.8" r="0.9" fill="currentColor"/>"#,
 };
+
+/// The web UI's join icon (log-in), on its own 24 point grid.
+pub static JOIN: Icon = Icon {
+    name: "river-join",
+    view: 24.0,
+    body: r#"<path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4M10 17l5-5-5-5M15 12H3" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
+};

@@ -160,6 +160,40 @@ pub fn install_test_hooks() {
         let _ = js_sys::Reflect::set(&hooks, &JsValue::from_str(name), &hook);
     };
 
+    // The base58 owner key of an example room a `?room=` link can open
+    // ("public" or "private"; "missing" is well formed but held by no room).
+    // These rooms are not in `ROOMS`.
+    set_hook(
+        "viewableRoomKey",
+        Closure::<dyn FnMut(String) -> String>::new(move |kind: String| {
+            // A well-formed key no fixture room has: the not-found case.
+            // A room the user is in (the example list's "Team Chat Room").
+            if kind == "member" {
+                return ROOMS
+                    .try_read()
+                    .ok()
+                    .and_then(|rooms| {
+                        rooms
+                            .map
+                            .iter()
+                            .find(|(_, r)| r.display_name() == "Team Chat Room")
+                            .map(|(vk, _)| crate::public_room::owner_key_b58(vk))
+                    })
+                    .unwrap_or_default();
+            }
+            if kind == "missing" {
+                let vk = SigningKey::from_bytes(&[0x53; 32]).verifying_key();
+                return crate::public_room::owner_key_b58(&vk);
+            }
+            crate::example_data::viewable_fixtures()
+                .iter()
+                .find(|(k, _, _)| *k == kind)
+                .map(|(_, vk, _)| crate::public_room::owner_key_b58(vk))
+                .unwrap_or_default()
+        })
+        .into_js_value(),
+    );
+
     set_hook(
         "takeMessageGroupRenders",
         Closure::<dyn FnMut() -> u32>::new(move || MESSAGE_GROUP_RENDERS.with(|n| n.replace(0)))
