@@ -36,7 +36,7 @@ use std::collections::{HashMap, HashSet};
 
 use rune::tok::TextStyle;
 use rune::{El, ScrollSpec, col, el, icon, row, text};
-use rune_kit::{Button, ButtonVariant, Kit};
+use rune_kit::{Button, ButtonVariant, Kit, ScrollBar};
 
 use super::Chat;
 use super::conversation::{day_divider, message_body};
@@ -1172,8 +1172,12 @@ fn history(chat: &Chat, shown: &Shown<'_>, hydrated: bool, p: &Palette, k: &Kit)
             .w_full()
             .child(items.selection_group(true))
             .scroll(ScrollSpec { stick_bottom: true })
+            // Focusable so a click focuses it and Up and Down scroll it (see `conversation::history`).
+            .focusable(true)
+            .label("Conversation history")
             .scroll_edge_fade(40.0)
-            .on_at_bottom(|s: &mut RiverApp, at| s.chat.dm.at_bottom = at),
+            .on_at_bottom(|s: &mut RiverApp, at| s.chat.dm.at_bottom = at)
+            .scroll_bar(k),
     );
     if !chat.dm.at_bottom {
         frame = frame.child(

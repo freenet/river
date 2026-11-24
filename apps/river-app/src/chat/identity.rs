@@ -21,7 +21,7 @@
 //! the storage's compare-and-swap, so it does not depend on the list.
 
 use rune::{El, col};
-use rune_kit::{Button, ButtonVariant, Kit, TextArea};
+use rune_kit::{Button, ButtonVariant, Kit, ScrollBar, TextArea};
 
 use super::dialog_kit::{self as dk, DialogSpec, NoticeKind, notice_text};
 use super::style::{self as st};
@@ -314,7 +314,8 @@ pub(super) fn export_dialog(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
                             .wrap_anywhere()
                             .w_full()
                             .key("export-token"),
-                    ),
+                    )
+                    .scroll_bar(k),
             );
             let token = token.clone();
             copy = copy.on_press_tx(move |s: &mut RiverApp, tx: &mut rune::Tx| {

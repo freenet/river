@@ -10,7 +10,7 @@
 //! provides (copy, paste, undo) cannot be found that way; they are in the table by hand.
 
 use rune::{El, KeyEvent, col, row};
-use rune_kit::Kit;
+use rune_kit::{Kit, ScrollBar};
 
 use super::Chat;
 use super::dialog_kit::{self as dk, DialogSpec};
@@ -272,7 +272,8 @@ pub(super) fn shortcuts_dialog(chat: &Chat, win_h: f32, k: &Kit, layer: &mut Vec
             .scroll(rune::ScrollSpec {
                 stick_bottom: false,
             })
-            .child(list),
+            .child(list)
+            .scroll_bar(k),
     )
     .footer(dk::close_footer(
         k,

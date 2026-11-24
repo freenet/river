@@ -12,7 +12,7 @@
 //! it.
 
 use rune::{El, Tx, col, el, row};
-use rune_kit::{Button, ButtonVariant, Kit};
+use rune_kit::{Button, ButtonVariant, Kit, ScrollBar};
 
 use super::dialog_kit::DialogSpec;
 use super::model::{self, Message, Room};
@@ -421,9 +421,12 @@ pub(super) fn overview_dialog(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
     .body_key("overview-body")
     .width(560.0)
     .child(header)
-    .child(list.scroll(rune::ScrollSpec {
-        stick_bottom: false,
-    }))
+    .child(
+        list.scroll(rune::ScrollSpec {
+            stick_bottom: false,
+        })
+        .scroll_bar(k),
+    )
     .child(
         label(
             "Muted rooms are left out. Rooms set to mentions and replies only count just those.",
