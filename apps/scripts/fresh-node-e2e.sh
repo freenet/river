@@ -147,6 +147,7 @@ for _ in $(seq 1 90); do
   if grep -qh "open_conns=[1-9]\|open_connections=[1-9]" "$WORK/peer/log/"freenet.*.log 2>/dev/null; then
     joined=true
     echo "peer connected to the gateway"
+    sleep 5; echo "TEMPORARY forced failure to exercise the log upload (#1033)" >&2; exit 1
     break
   fi
   sleep 1
