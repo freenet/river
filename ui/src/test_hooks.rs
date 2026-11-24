@@ -282,6 +282,86 @@ pub fn install_test_hooks() {
         .into_js_value(),
     );
 
+    // View another example room in place, without closing the current viewer.
+    set_hook(
+        "viewRoom",
+        Closure::<dyn FnMut(String)>::new(move |kind: String| {
+            let Some(vk) = crate::example_data::viewable_fixtures()
+                .iter()
+                .find(|(k, _, _)| *k == kind)
+                .map(|(_, vk, _)| *vk)
+            else {
+                return;
+            };
+            crate::util::defer(move || {
+                crate::public_room::view_for_test(&crate::public_room::owner_key_b58(&vk))
+            });
+        })
+        .into_js_value(),
+    );
+
+    // The current room's own nickname, "" when none.
+    set_hook(
+        "currentRoomSelfNickname",
+        Closure::<dyn FnMut() -> String>::new(move || {
+            let Some(owner) = crate::components::app::CURRENT_ROOM.read().owner_key else {
+                return String::new();
+            };
+            ROOMS
+                .try_read()
+                .ok()
+                .and_then(|r| r.map.get(&owner).and_then(|d| d.self_nickname.clone()))
+                .unwrap_or_default()
+        })
+        .into_js_value(),
+    );
+
+    // Base58 key of whoever authored the (first) message with this exact text
+    // in the current room, found through the room's members and provisional
+    // entries; "" when unknown. Compared with the key before a re-admission.
+    set_hook(
+        "messageAuthorKey",
+        Closure::<dyn FnMut(String) -> String>::new(move |text: String| {
+            use river_core::room_state::member::MemberId;
+            let Some(owner) = crate::components::app::CURRENT_ROOM.read().owner_key else {
+                return String::new();
+            };
+            let Ok(rooms) = ROOMS.try_read() else {
+                return String::new();
+            };
+            let Some(room) = rooms.map.get(&owner) else {
+                return String::new();
+            };
+            let state = &room.room_state;
+            let Some(author) = state
+                .recent_messages
+                .messages
+                .iter()
+                .find(|m| m.message.content.to_string_lossy() == text)
+                .map(|m| m.message.author)
+            else {
+                return String::new();
+            };
+            let vk = state
+                .provisional
+                .entries
+                .iter()
+                .find(|e| e.member_id() == author)
+                .map(|e| e.provisional.member_vk)
+                .or_else(|| {
+                    state
+                        .members
+                        .members
+                        .iter()
+                        .find(|m| MemberId::from(&m.member.member_vk) == author)
+                        .map(|m| m.member.member_vk)
+                });
+            vk.map(|vk| crate::public_room::owner_key_b58(&vk))
+                .unwrap_or_default()
+        })
+        .into_js_value(),
+    );
+
     // The room prunes the current room's open-admission member: their entry,
     // messages and member_info go, as the room's cleanup drops them. With
     // `forget`, the proof held this session is forgotten too, as a reload does.

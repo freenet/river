@@ -174,6 +174,10 @@ pub struct Submission {
     pub state_after: ChatRoomStateV1,
     pub info: AuthorizedMemberInfo,
     pub nickname: String,
+    /// The member the delta admits and the messages it carries, so a later
+    /// apply to a newer state can confirm the room kept all of them.
+    pub member_vk: VerifyingKey,
+    pub message_ids: Vec<river_core::room_state::message::MessageId>,
 }
 
 /// [`build_submission_many`] for one message.
@@ -283,6 +287,8 @@ pub fn build_submission_many(
         state_after,
         info,
         nickname: nickname.to_string(),
+        member_vk,
+        message_ids,
     })
 }
 
@@ -448,6 +454,10 @@ pub struct Machine {
     /// The room a join just completed for: lets its composer's leftover draft
     /// follow the user into the member room.
     joined: Option<VerifyingKey>,
+    /// The text in a composer's draft box, kept as it is typed (not read when
+    /// the composer closes: the member room's composer may be built before the
+    /// join composer is dropped).
+    draft: Option<(VerifyingKey, String)>,
 }
 
 impl Machine {
@@ -464,6 +474,7 @@ impl Machine {
             entry: None,
             readmit: false,
             joined: None,
+            draft: None,
         }
     }
 
@@ -602,10 +613,13 @@ impl Machine {
         if text.len() > limits.max_message_size {
             // Before any work is done: a valid proof would be wasted on it.
             self.give_back(owner, text);
-            self.notice = Some(JoinFailure::TooLong(limits.max_message_size).message());
             if self.owner != Some(owner) && !self.active() {
+                // Another room's leftover state must not show in this room.
                 self.owner = Some(owner);
+                self.phase = JoinPhase::Idle;
+                self.clear_secrets();
             }
+            self.notice = Some(JoinFailure::TooLong(limits.max_message_size).message());
             return Action::Nothing;
         }
         let mine = self.owner == Some(owner);
@@ -720,8 +734,7 @@ impl Machine {
             return None;
         }
         let posted = std::mem::take(&mut self.in_flight);
-        let readmit = self.readmit;
-        self.joined = if readmit { None } else { self.owner };
+        self.joined = self.owner;
         self.clear_secrets();
         self.owner = None;
         self.notice = None;
@@ -734,24 +747,31 @@ impl Machine {
         Some(self.returned.remove(i).1)
     }
 
-    /// The text of a composer that closes after a successful join, for the
-    /// member room's own composer.
-    pub fn carry_draft(&mut self, owner: VerifyingKey, text: String) -> bool {
-        if self.joined != Some(owner) || text.trim().is_empty() {
-            return false;
+    /// Record the text now in `owner`'s draft box.
+    pub fn note_draft(&mut self, owner: VerifyingKey, text: &str) {
+        if text.trim().is_empty() {
+            if self.draft.as_ref().is_some_and(|(o, _)| *o == owner) {
+                self.draft = None;
+            }
+        } else {
+            self.draft = Some((owner, text.to_string()));
         }
-        self.give_back(owner, text);
-        true
     }
 
-    /// The draft a composer left for `owner`'s member room, once.
+    /// The draft a composer left for `owner`'s member room, once, after a
+    /// completed join or re-admission.
     pub fn take_carried(&mut self, owner: &VerifyingKey) -> Option<String> {
         if self.joined.as_ref() != Some(owner) {
             return None;
         }
-        let text = self.take_returned(owner)?;
         self.joined = None;
-        Some(text)
+        match self.draft.take() {
+            Some((o, text)) if o == *owner => Some(text),
+            other => {
+                self.draft = other;
+                None
+            }
+        }
     }
 
     fn submit_inputs(
@@ -845,11 +865,14 @@ pub fn forget_held_entries() {
 /// The room state the join works against: the viewed room, or for a
 /// re-admission the member's own room.
 fn source_state(owner_vk: &VerifyingKey, readmit: bool) -> Option<ChatRoomStateV1> {
-    if readmit {
-        let rooms = crate::components::app::ROOMS.try_peek().ok()?;
-        return rooms.map.get(owner_vk).map(|r| r.room_state.clone());
-    }
-    viewed_state().and_then(|(o, s)| (o == *owner_vk).then_some(s))
+    // Called from the solver task, which does not start inside the runtime.
+    crate::util::in_runtime(|| {
+        if readmit {
+            let rooms = crate::components::app::ROOMS.try_peek().ok()?;
+            return rooms.map.get(owner_vk).map(|r| r.room_state.clone());
+        }
+        viewed_state().and_then(|(o, s)| (o == *owner_vk).then_some(s))
+    })
 }
 
 /// What to tell a member the room pruned, and what their next message does.
@@ -928,6 +951,10 @@ pub fn cancel() {
 /// A room's own messages and rooms loading are both needed before a join can
 /// be started: a key must never be made for a room the user already holds.
 fn start_blocker(owner_vk: &VerifyingKey) -> Option<JoinFailure> {
+    crate::util::in_runtime(|| start_blocker_in_runtime(owner_vk))
+}
+
+fn start_blocker_in_runtime(owner_vk: &VerifyingKey) -> Option<JoinFailure> {
     use crate::components::app::chat_delegate::{RoomsLoadState, ROOMS_LOAD_STATE};
     // The example build has no delegate to load from: its rooms are all there
     // is, and the load state never leaves `Loading`.
@@ -1028,11 +1055,10 @@ pub fn take_returned(owner_vk: &VerifyingKey) -> Option<String> {
     taken
 }
 
-/// A composer closing right after a successful join leaves its draft here for
-/// the member room's composer.
-pub fn carry_draft(owner_vk: VerifyingKey, text: String) {
-    // Stays in `returned`: the member room's composer takes it.
-    machine().carry_draft(owner_vk, text);
+/// Record the text in `owner`'s draft box, so it can follow the user into the
+/// member room after a join.
+pub fn note_draft(owner_vk: VerifyingKey, text: &str) {
+    machine().note_draft(owner_vk, text);
 }
 
 /// The draft the viewer's composer left for the room now selected, for the
@@ -1150,11 +1176,13 @@ async fn run(generation: u64, owner_vk: VerifyingKey) {
 /// the one they have.
 fn nickname_for(owner_vk: &VerifyingKey, signing_key: &SigningKey, readmit: bool) -> String {
     if readmit {
-        if let Some(n) = crate::components::app::ROOMS
-            .try_peek()
-            .ok()
-            .and_then(|r| r.map.get(owner_vk).and_then(|d| d.self_nickname.clone()))
-        {
+        let kept = crate::util::in_runtime(|| {
+            crate::components::app::ROOMS
+                .try_peek()
+                .ok()
+                .and_then(|r| r.map.get(owner_vk).and_then(|d| d.self_nickname.clone()))
+        });
+        if let Some(n) = kept {
             return n;
         }
     }
@@ -1190,30 +1218,12 @@ async fn submit(generation: u64, owner_vk: VerifyingKey) {
         Err(f) => return fail(generation, f),
     };
 
-    // The key is stored now, not when the join started: a cancelled, banned or
-    // failed attempt never reaches here, so it leaves no key in the delegate.
-    // Rooms must still be loaded and not hold this room, or the authoritative
-    // store would replace the key of a room the user is already in.
-    if !readmit {
-        if let Some(blocker) = start_blocker(&owner_vk) {
-            return fail(generation, blocker);
-        }
-        #[cfg(not(feature = "no-sync"))]
-        {
-            let room_key = owner_vk.to_bytes();
-            let stored = crate::signing::migrate_signing_key(room_key, &signing_key, true).await;
-            if stored == crate::signing::MigrationResult::Failed {
-                // The same fallback as an invitation: the key is also kept in
-                // the room's own record, which signs when the delegate cannot.
-                dioxus::logger::tracing::warn!(
-                    "public join: could not store the member key in the delegate"
-                );
-            }
-        }
-    }
     if !is_current(generation) {
         return;
     }
+    // Rooms must be loaded and not hold this room before the room is inserted.
+    // Nothing is stored in the delegate yet: a close or cancel up to here
+    // leaves no key behind.
     crate::util::defer(move || {
         if !is_current(generation) {
             return;
@@ -1223,38 +1233,68 @@ async fn submit(generation: u64, owner_vk: VerifyingKey) {
                 return fail(generation, blocker);
             }
         }
-        remember_entry(owner_vk, entry);
-        if readmit {
-            apply_readmission(owner_vk, submission);
+        let stored_key = signing_key.clone();
+        let applied = if readmit {
+            apply_readmission(owner_vk, submission)
         } else {
-            insert_member_room(owner_vk, signing_key, submission);
+            insert_member_room(owner_vk, signing_key, submission)
+        };
+        if let Err(f) = applied {
+            // The messages go back to the composer; nothing was posted.
+            return fail(generation, f);
         }
+        remember_entry(owner_vk, entry);
         step(|m| m.succeed(generation));
         if !readmit {
             crate::public_room::close();
+            // The room now holds the key (`self_sk`, which signs when the
+            // delegate cannot). Store it through the delegate like an invited
+            // member's, once the room exists, so an abandoned join never
+            // leaves an authoritative key for a room the user does not hold.
+            #[cfg(not(feature = "no-sync"))]
+            crate::util::safe_spawn_local(async move {
+                let room_key = owner_vk.to_bytes();
+                let stored = crate::signing::migrate_signing_key(room_key, &stored_key, true).await;
+                if stored == crate::signing::MigrationResult::Failed {
+                    dioxus::logger::tracing::warn!(
+                        "public join: could not store the member key in the delegate"
+                    );
+                }
+            });
+            #[cfg(feature = "no-sync")]
+            drop(stored_key);
         }
     });
 }
 
-/// `delta` applied to `live`, the state as it is now. Falls back to the state
-/// the submission was built from if the room refuses it.
+/// `delta` applied to `live`, the state as it is now, and checked: the room
+/// must still hold the entry and every message afterwards. A newer joiner, a ban
+/// or a policy change can make its own cleanup drop ours, and then the join did
+/// not happen. There is no fallback to the state the submission was built from:
+/// that would overwrite what arrived meanwhile.
 fn apply_to_live(
     live: &ChatRoomStateV1,
     owner_vk: &VerifyingKey,
     submission: &Submission,
-) -> ChatRoomStateV1 {
+) -> Result<ChatRoomStateV1, JoinFailure> {
     let params = ChatRoomParametersV1 { owner: *owner_vk };
     let mut next = live.clone();
-    match next.apply_delta(live, &params, &Some(submission.delta.clone())) {
-        Ok(()) => {
-            next.recent_messages.rebuild_actions_state();
-            next
-        }
-        Err(e) => {
-            dioxus::logger::tracing::warn!("public join: live state refused the delta: {e:?}");
-            submission.state_after.clone()
-        }
+    next.apply_delta(live, &params, &Some(submission.delta.clone()))
+        .map_err(|e| JoinFailure::Internal(format!("{e:?}")))?;
+    let holds_messages = submission
+        .message_ids
+        .iter()
+        .all(|id| next.recent_messages.messages.iter().any(|m| m.id() == *id));
+    let holds_entry = next
+        .provisional
+        .entries
+        .iter()
+        .any(|e| e.provisional.member_vk == submission.member_vk);
+    if !holds_messages || !holds_entry {
+        return Err(JoinFailure::RoomFull);
     }
+    next.recent_messages.rebuild_actions_state();
+    Ok(next)
 }
 
 /// The member room for a completed join: the viewed state as it is now with
@@ -1291,29 +1331,43 @@ fn build_room_data(
 
 /// The pruned member's own room takes the admission: the entry, the
 /// `member_info` and the messages, applied once to the room as it is now, so
-/// updates that arrived while the proof was solved are kept.
-fn apply_readmission(owner_vk: VerifyingKey, submission: Submission) {
+/// updates that arrived while the proof was solved are kept. An error leaves
+/// the room untouched.
+fn apply_readmission(owner_vk: VerifyingKey, submission: Submission) -> Result<(), JoinFailure> {
     use crate::components::app::{mark_needs_sync, ROOMS};
-    ROOMS.with_mut(|rooms| {
-        if let Some(room) = rooms.map.get_mut(&owner_vk) {
-            let next = apply_to_live(&room.room_state, &owner_vk, &submission);
-            room.room_state = next;
-            room.self_member_info = Some(submission.info);
-            room.self_nickname = Some(submission.nickname);
-        }
+    let result = ROOMS.with_mut(|rooms| {
+        let Some(room) = rooms.map.get_mut(&owner_vk) else {
+            // The user left the room while the proof was solved.
+            return Err(JoinFailure::Internal(
+                "this room is no longer in your list".to_string(),
+            ));
+        };
+        let next = apply_to_live(&room.room_state, &owner_vk, &submission)?;
+        room.room_state = next;
+        room.self_member_info = Some(submission.info);
+        room.self_nickname = Some(submission.nickname);
+        Ok(())
     });
-    mark_needs_sync(owner_vk);
+    if result.is_ok() {
+        mark_needs_sync(owner_vk);
+    }
+    result
 }
 
-/// Insert the joined room. Never replaces a room already in `ROOMS`: the
-/// caller has checked, and this keeps the existing entry if it is wrong.
-fn insert_member_room(owner_vk: VerifyingKey, signing_key: SigningKey, submission: Submission) {
+/// Insert the joined room. Never replaces a room already in `ROOMS`, and is
+/// refused, leaving `ROOMS` untouched, when the viewed room is gone or its
+/// current state does not keep the entry and messages.
+fn insert_member_room(
+    owner_vk: VerifyingKey,
+    signing_key: SigningKey,
+    submission: Submission,
+) -> Result<(), JoinFailure> {
     use crate::components::app::{mark_needs_sync, CURRENT_ROOM, ROOMS};
     let live = viewed_state()
         .and_then(|(o, s)| (o == owner_vk).then_some(s))
-        .map(|s| apply_to_live(&s, &owner_vk, &submission))
-        .unwrap_or_else(|| submission.state_after.clone());
-    let data = build_room_data(owner_vk, signing_key, live, submission);
+        .ok_or(JoinFailure::NotOpen)?;
+    let state = apply_to_live(&live, &owner_vk, &submission)?;
+    let data = build_room_data(owner_vk, signing_key, state, submission);
     let inserted = ROOMS.with_mut(|rooms| match rooms.map.entry(owner_vk) {
         std::collections::hash_map::Entry::Occupied(_) => false,
         std::collections::hash_map::Entry::Vacant(v) => {
@@ -1321,10 +1375,12 @@ fn insert_member_room(owner_vk: VerifyingKey, signing_key: SigningKey, submissio
             true
         }
     });
-    if inserted {
-        CURRENT_ROOM.with_mut(|current| current.owner_key = Some(owner_vk));
-        mark_needs_sync(owner_vk);
+    if !inserted {
+        return Err(JoinFailure::AlreadyMember);
     }
+    CURRENT_ROOM.with_mut(|current| current.owner_key = Some(owner_vk));
+    mark_needs_sync(owner_vk);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1976,18 +2032,32 @@ mod tests {
     }
 
     #[test]
-    fn a_draft_left_by_the_closing_composer_follows_a_completed_join_only() {
+    fn a_draft_in_the_box_follows_a_completed_join_only() {
         let (a, mut m) = (vk(1), Machine::new());
-        // Before any join, or after a cancel, nothing is carried.
-        assert!(!m.carry_draft(a, "left".into()));
+        m.note_draft(a, "left");
+        // No join completed: nothing is carried.
+        assert_eq!(m.take_carried(&a), None);
         let Action::Solve(g) = m.send(a, "sent", limits(), fresh()) else {
             panic!()
         };
+        m.note_draft(a, "left over");
         m.solved(g, some_entry());
         m.succeed(g);
-        assert!(m.carry_draft(a, "left".into()));
         assert_eq!(m.take_carried(&vk(2)), None);
-        assert_eq!(m.take_carried(&a), Some("left".to_string()));
+        assert_eq!(m.take_carried(&a), Some("left over".to_string()));
+        assert_eq!(m.take_carried(&a), None);
+    }
+
+    #[test]
+    fn a_cleared_draft_is_not_carried() {
+        let (a, mut m) = (vk(1), Machine::new());
+        let Action::Solve(g) = m.send(a, "sent", limits(), fresh()) else {
+            panic!()
+        };
+        m.note_draft(a, "typed");
+        m.note_draft(a, "");
+        m.solved(g, some_entry());
+        m.succeed(g);
         assert_eq!(m.take_carried(&a), None);
     }
 
@@ -2015,5 +2085,81 @@ mod tests {
             .map(|m| format!("{:?}", m.message.content))
             .collect();
         assert_eq!(kept.len(), 3, "every message once: {kept:?}");
+    }
+
+    #[test]
+    fn the_live_apply_keeps_what_arrived_and_refuses_when_the_room_drops_ours() {
+        let state = room(PrivacyMode::Public, Some(policy(2, 1)));
+        let sk = SigningKey::from_bytes(&[50u8; 32]);
+        let (owner_vk, entry) = solved(&state, &sk);
+        let sub = build_submission(
+            &state,
+            &owner_vk,
+            &sk,
+            &entry,
+            "mine",
+            "Me",
+            SystemTime::now(),
+        )
+        .expect("admits against the snapshot");
+        // The room is unchanged: the live apply holds the entry and message.
+        let ok = apply_to_live(&state, &owner_vk, &sub).expect("kept");
+        assert!(ok
+            .recent_messages
+            .messages
+            .iter()
+            .any(|m| m.id() == sub.message_ids[0]));
+
+        // Meanwhile another joiner took the only slot with a NEWER message:
+        // the room's cleanup drops our entry. That is a refusal, not a post,
+        // and there is no fallback to the stale snapshot.
+        let other = SigningKey::from_bytes(&[51u8; 32]);
+        let (_, other_entry) = solved(&state, &other);
+        let later = SystemTime::now() + Duration::from_secs(3600);
+        let live = build_submission(
+            &state,
+            &owner_vk,
+            &other,
+            &other_entry,
+            "theirs",
+            "Other",
+            later,
+        )
+        .expect("the other joiner is admitted")
+        .state_after;
+        assert_eq!(
+            apply_to_live(&live, &owner_vk, &sub).unwrap_err(),
+            JoinFailure::RoomFull
+        );
+    }
+
+    #[test]
+    fn a_draft_follows_a_readmission_too() {
+        let (a, mut m) = (vk(1), Machine::new());
+        let plan = StartPlan {
+            readmit: true,
+            ..fresh()
+        };
+        let Action::Solve(g) = m.send(a, "back", limits(), plan) else {
+            panic!()
+        };
+        m.solved(g, some_entry());
+        assert_eq!(m.succeed(g), Some(vec!["back".to_string()]));
+        m.note_draft(a, "typed while solving");
+        assert_eq!(m.take_carried(&a), Some("typed while solving".to_string()));
+    }
+
+    #[test]
+    fn a_too_long_message_in_a_new_room_does_not_show_the_old_rooms_failure() {
+        let (a, b, mut m) = (vk(1), vk(2), Machine::new());
+        let Action::Solve(g) = m.send(a, "x", limits(), fresh()) else {
+            panic!()
+        };
+        m.fail(g, JoinFailure::Banned);
+        assert!(matches!(m.ui().phase_for(&a), JoinPhase::Failed(_)));
+        let long = "y".repeat(101);
+        m.send(b, &long, limits(), fresh());
+        assert_eq!(m.ui().phase_for(&b), JoinPhase::Idle, "B is not banned");
+        assert!(m.ui().notice_for(&b).is_some());
     }
 }

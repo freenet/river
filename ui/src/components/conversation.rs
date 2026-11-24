@@ -3388,6 +3388,7 @@ pub fn Conversation() -> Element {
                                 match (readmit_note, room_data.self_verifying_key()) {
                                     (Some(note), _) => rsx! {
                                         crate::components::viewed_room::JoinComposer {
+                                            key: "{crate::public_room::owner_key_b58(&room_data.owner_vk)}",
                                             owner_vk: room_data.owner_vk,
                                             note,
                                             readmit: true,

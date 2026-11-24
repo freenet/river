@@ -34,6 +34,12 @@ type RiverTestHooks = {
   joinSessionKey(): string;
   // Base58 own member key of the current room; "" when none.
   currentRoomSelfKey(): string;
+  // View another example room in place (as a link followed inside the page would), without closing the viewer.
+  viewRoom(kind: "public" | "private" | "open" | "hard" | "full"): void;
+  // The current room's own nickname; "" when none.
+  currentRoomSelfNickname(): string;
+  // Base58 key of whoever authored the first message with this exact text in the current room; "" when unknown.
+  messageAuthorKey(text: string): string;
   // How many times this exact text is in the rooms the user holds (every room, every message).
   roomMessageCount(text: string): number;
   // The current room under a new contract key, as a room-contract re-key leaves it.

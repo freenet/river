@@ -329,7 +329,12 @@ fn PublicRoomView(
         }
         if can_join {
             if let Some(owner) = owner_vk {
-                JoinComposer { owner_vk: owner, note: note.to_string(), readmit: false }
+                JoinComposer {
+                    key: "{crate::public_room::owner_key_b58(&owner)}",
+                    owner_vk: owner,
+                    note: note.to_string(),
+                    readmit: false,
+                }
             }
         } else {
             div { class: "px-4 py-3 border-t border-border",
@@ -361,14 +366,6 @@ pub(crate) fn JoinComposer(
 ) -> Element {
     let mut draft = use_signal(String::new);
 
-    // After a successful join this composer closes with the viewer: whatever
-    // is left in the draft box goes to the member room's composer.
-    use_drop(move || {
-        if let Ok(d) = draft.try_peek() {
-            public_join::carry_draft(owner_vk, d.clone());
-        }
-    });
-
     // Text handed back after a failure, cancel or close returns to the draft in
     // front of what was typed since. The text is taken from the join itself,
     // so a second run of this effect finds nothing to take.
@@ -384,7 +381,9 @@ pub(crate) fn JoinComposer(
         if has {
             if let Some(back) = public_join::take_returned(&owner_vk) {
                 let current = draft.peek().clone();
-                draft.set(public_join::restore_draft(&current, Some(&back)));
+                let restored = public_join::restore_draft(&current, Some(&back));
+                public_join::note_draft(owner_vk, &restored);
+                draft.set(restored);
             }
         }
     });
@@ -408,6 +407,7 @@ pub(crate) fn JoinComposer(
         if text.trim().is_empty() {
             return;
         }
+        public_join::note_draft(owner_vk, "");
         draft.set(String::new());
         crate::util::defer(move || public_join::send(owner_vk, text));
     };
@@ -456,7 +456,11 @@ pub(crate) fn JoinComposer(
                     rows: "1",
                     placeholder: "Write a message",
                     value: "{draft}",
-                    oninput: move |evt| draft.set(evt.value()),
+                    oninput: move |evt| {
+                        let value = evt.value();
+                        public_join::note_draft(owner_vk, &value);
+                        draft.set(value);
+                    },
                     onkeydown: move |evt| {
                         if evt.key() == Key::Enter && !evt.modifiers().shift() {
                             evt.prevent_default();

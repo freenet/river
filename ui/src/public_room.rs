@@ -382,6 +382,14 @@ pub fn edit_viewed_state(f: impl FnOnce(&mut ChatRoomStateV1)) -> bool {
     }
 }
 
+/// Test hook support: view another room in place, as a link followed inside
+/// the page would, without closing the viewer first.
+#[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+pub fn view_for_test(raw: &str) {
+    let viewed = viewed_from_param(raw);
+    *VIEWED_ROOM.write() = Some(viewed);
+}
+
 /// What a `?room=` value opens: the room (waiting for the network) or the
 /// reason it was refused. Records what the response handlers match on.
 fn viewed_from_param(raw: &str) -> ViewedRoom {

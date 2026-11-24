@@ -77,6 +77,24 @@ pub fn defer(f: impl FnOnce() + 'static) {
         .ok();
 }
 
+/// Run `f` with the captured Dioxus runtime on the stack, so a `GlobalSignal`
+/// read is safe from a task that did not start inside the runtime (a
+/// `safe_spawn_local` future polled from the browser's microtask queue).
+/// `GlobalSignal` access calls `Runtime::current()`, which panics without one.
+#[cfg(target_arch = "wasm32")]
+pub fn in_runtime<T>(f: impl FnOnce() -> T) -> T {
+    match CAPTURED_RUNTIME.with(|rt| rt.borrow().clone()) {
+        Some(rt) => rt.in_scope(dioxus::dioxus_core::ScopeId::ROOT, f),
+        None => f(),
+    }
+}
+
+/// Non-WASM fallback: runs the closure as it is.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn in_runtime<T>(f: impl FnOnce() -> T) -> T {
+    f()
+}
+
 /// Non-WASM fallback — runs the closure immediately.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn defer(f: impl FnOnce() + 'static) {
