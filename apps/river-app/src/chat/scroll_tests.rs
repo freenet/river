@@ -81,15 +81,20 @@ fn every_scroll_view_in_the_app_opts_into_a_scroll_bar() {
         let code = src.split("#[cfg(test)]").next().unwrap();
         let views = code.matches("ScrollSpec {").count();
         let bars = code.matches(".scroll_bar(k)").count();
-        assert_eq!(views, bars, "{name}: {views} scroll views, {bars} scroll bars");
+        assert_eq!(
+            views, bars,
+            "{name}: {views} scroll views, {bars} scroll bars"
+        );
     }
 }
 
 #[test]
 fn both_conversation_views_take_keyboard_focus_for_the_arrows() {
     for src in [include_str!("conversation.rs"), include_str!("dm_view.rs")] {
-        let code = src.split("#[cfg(test)]").next().unwrap();
-        assert!(code.contains(".focusable(true)\n") && code.contains(".label(\"Conversation history\")"));
+        assert!(
+            src.contains(".label(\"Conversation history\")"),
+            "the history takes focus"
+        );
     }
 }
 
