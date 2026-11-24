@@ -2390,6 +2390,11 @@ pub const SCENES: &[Scene] = &[
             .query
             .replace_text("zzzz");
     }),
+    // Join events between messages: one person, two people and three, each its own quiet line.
+    ("chat-joins", |s| {
+        connect(s);
+        s.chat.edit_rooms(|r| chat::example::add_example_joins(r));
+    }),
     // Message search (Ctrl+F): the messages of the open room that contain the query, the
     // matches drawn bold; a query nothing matches says so; a long list is cut and says so.
     ("chat-search", |s| search_scene(s, "the", 0)),

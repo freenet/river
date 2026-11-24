@@ -238,6 +238,42 @@ pub struct Message {
     pub pending: Option<Pending>,
 }
 
+/// Who joined the room, as one quiet line in the conversation. Consecutive join events (none of
+/// the room's messages between them) within an hour of the one before fold into one entry, as in
+/// the web UI. Not a message: it has no author group, no actions, no reactions, and it is never
+/// unread, searched or notified.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Join {
+    /// Stable across updates: the key of the first event folded in.
+    pub key: String,
+    /// Who joined, in join order.
+    pub names: Vec<String>,
+    /// The newest event's time, in the units of `Message::time`.
+    pub time: u32,
+    /// How many of the room's messages come before this line.
+    pub before: usize,
+}
+
+/// A list of one byte range (a `vec![r]` of a range is what clippy takes for a mistake).
+fn one_range(r: std::ops::Range<usize>) -> Vec<std::ops::Range<usize>> {
+    std::iter::once(r).collect()
+}
+
+impl Join {
+    /// The line the web UI shows ("Ann joined", "Ann and Bo joined", "3 people joined") and the
+    /// byte ranges in it to set in bold (the names). Three or more are not named in the line.
+    pub fn line(&self) -> (String, Vec<std::ops::Range<usize>>) {
+        match self.names.as_slice() {
+            [a] => (format!("{a} joined"), one_range(0..a.len())),
+            [a, b] => (
+                format!("{a} and {b} joined"),
+                vec![0..a.len(), a.len() + 5..a.len() + 5 + b.len()],
+            ),
+            names => (format!("{} people joined", names.len()), Vec::new()),
+        }
+    }
+}
+
 /// The room's limits, as its configuration sets them (the web UI's room details fields).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Limits {
@@ -323,6 +359,8 @@ pub struct Room {
     pub private: bool,
     pub members: Vec<Member>,
     pub messages: Vec<Message>,
+    /// Join lines, shown between the messages at `Join::before`.
+    pub joins: Vec<Join>,
     /// Which member this device is in the room.
     pub me: MemberId,
     /// Messages that arrived since this device last read the room.
@@ -846,6 +884,7 @@ mod tests {
             private: false,
             members: vec![],
             messages: vec![msg(7, 2, 900)],
+            joins: Vec::new(),
             me: 1,
             unread: 0,
             send_block: None,

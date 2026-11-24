@@ -29,8 +29,8 @@ use river_core::stored_rooms::StoredRoom;
 
 use super::deputies;
 use crate::chat::model::{
-    self, Appointer, Details, Editable, Limits, Member, MemberId, Message, Reaction, ReplyTo, Role,
-    Room, RotateOffer, Usage,
+    self, Appointer, Details, Editable, Join, Limits, Member, MemberId, Message, Reaction, ReplyTo,
+    Role, Room, RotateOffer, Usage,
 };
 
 /// Why the owner can't change the room's details here (the web UI's `edit-room-no-key-notice`).
@@ -42,6 +42,9 @@ pub const NO_SECRET_TO_EDIT: &str = "This private room's key hasn't reached this
 
 /// How many characters of the replied-to message a reply quotes.
 const REPLY_PREVIEW_CHARS: usize = 100;
+/// Join events fold into one line while each is within this long of the one before (the web
+/// UI's one hour).
+const JOIN_FOLD_SECS: u64 = 60 * 60;
 
 #[derive(Clone)]
 pub struct LiveRoom {
@@ -650,6 +653,7 @@ impl LiveRoom {
             .display_messages()
             .filter(|m| !m.message.content.is_event())
             .collect();
+        let joins = self.joins(me, minutes);
         let message_ids: HashMap<RiverMessageId, model::MessageId> = shown
             .iter()
             .enumerate()
@@ -748,6 +752,7 @@ impl LiveRoom {
             private: self.is_private(),
             members,
             messages,
+            joins,
             me: me_id,
             unread,
             send_block: None,
@@ -857,6 +862,48 @@ impl LiveRoom {
             .canonical(id)
             .and_then(|i| self.unseal(&i.member_info.preferred_nickname))
             .is_some_and(|n| !shown_nickname(&n).is_empty())
+    }
+
+    /// The room's join events as lines between the messages: consecutive events (no message
+    /// between them) within an hour of the one before fold into one line, as the web UI does.
+    /// Events are not messages here: they are in no list a count, a search or a notification
+    /// reads.
+    fn joins(&self, me: Option<RiverMemberId>, minutes: &dyn Fn(SystemTime) -> u32) -> Vec<Join> {
+        let mut out: Vec<Join> = Vec::new();
+        // The newest folded event's real time: the fold compares instants, as the web UI does,
+        // not the local minutes shown (which lose seconds and jump at a clock change).
+        let mut last_secs = 0u64;
+        let mut before = 0;
+        for m in self.stored.room_state.recent_messages.display_messages() {
+            if !m.message.content.is_event() {
+                before += 1;
+                continue;
+            }
+            let secs = m
+                .message
+                .time
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let name = self.nickname(m.message.author, me);
+            match out.last_mut() {
+                Some(j)
+                    if j.before == before
+                        && secs >= last_secs
+                        && secs - last_secs < JOIN_FOLD_SECS =>
+                {
+                    j.names.push(name);
+                    j.time = minutes(m.message.time);
+                }
+                _ => out.push(Join {
+                    key: message_key(&m.id()),
+                    names: vec![name],
+                    time: minutes(m.message.time),
+                    before,
+                }),
+            }
+            last_secs = secs;
+        }
+        out
     }
 
     pub(super) fn nickname(&self, id: RiverMemberId, me: Option<RiverMemberId>) -> String {
