@@ -47,6 +47,8 @@ test("cancelling a running solve stops its workers and keeps the draft", async (
   await page.getByTestId("viewed-room-composer").fill("Keep me");
   await page.getByTestId("viewed-room-send").click();
   await expect(page.getByTestId("viewed-room-join-progress")).toBeVisible();
+  // Workers go on in a background desktop tab; a phone may pause a hidden page.
+  await expect(page.getByTestId("viewed-room-join-progress")).toContainText("Keep this tab open");
   // Really hashing (26 bits is out of reach of a test), in workers, not on the page.
   await expect.poll(() => callRiverTest(page, "powSolverMode"), { timeout: 60_000 }).toBe("workers");
   expect(page.workers().length).toBeGreaterThan(0);

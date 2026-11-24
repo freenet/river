@@ -424,11 +424,11 @@ pub(crate) fn JoinComposer(
             "viewed-room-join-progress",
             if *expected > 0.0 {
                 format!(
-                    "Joining: proving you are not a bot ({}%). You can keep writing. Keep this tab visible: a hidden tab works slowly.",
+                    "Joining: proving you are not a bot ({}%). You can keep writing. Keep this tab open: a phone may pause a hidden tab.",
                     ((*tried as f64 / expected) * 100.0).min(99.0) as u32
                 )
             } else {
-                "Joining: proving you are not a bot. You can keep writing. Keep this tab visible: a hidden tab works slowly.".to_string()
+                "Joining: proving you are not a bot. You can keep writing. Keep this tab open: a phone may pause a hidden tab.".to_string()
             },
         ),
         JoinPhase::Ready => (
