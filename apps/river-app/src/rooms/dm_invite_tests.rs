@@ -686,6 +686,7 @@ fn nothing_in_the_invitation_paths_logs_or_prints() {
         "println!",
         "eprintln!",
         "diag!(",
+        "diag::line(",
         "dbg!",
         "tracing::",
         " log::",

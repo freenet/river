@@ -73,7 +73,7 @@ pub(crate) mod visual_fold;
 pub mod zoom;
 
 pub use background::{BackgroundHost, BackgroundUi};
-pub use diagnostics::{DiagnosticsUi, LogHost};
+pub use diagnostics::{DiagnosticsUi, LogHost, LogState};
 pub use dm_model::DmArrival;
 /// The preference key of [`Chat::private_previews`], unchanged from before it had a switch.
 pub const PREVIEWS_PREF: &str = "notification_previews";

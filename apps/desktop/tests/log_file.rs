@@ -22,17 +22,24 @@ const SEP: char = '\u{1f}';
 /// (`diag!`), `eprintln:TEXT` (std's, which panics if stderr is broken), `child:TEXT` (a
 /// process that inherits stderr writes TEXT), `relaunch:TEXT` (a new probe started the way the
 /// updater starts River, run to the end) and `exec:TEXT` (replace this process with one),
-/// `panic:TEXT`.
+/// `execfail:TEXT` (an exec that fails, as the updater's rollback can, then the probe goes on)
+/// and `panic:TEXT`.
 #[test]
 fn probe_entry() {
     let Ok(spec) = std::env::var("RIVER_LOG_PROBE") else {
         return;
     };
     let args: Vec<&str> = spec.split(SEP).collect();
-    let started = log::start(Path::new(args[0]));
+    // As `main` does: the failure handler first, then the log.
+    river_app::diag::on_failure(log::silence_stderr);
+    let started = log::start(Some(Path::new(args[0])));
     println!(
         "log={}",
-        started.map_or("none".into(), |p| p.display().to_string())
+        match started {
+            log::Started::File(p) => p.display().to_string(),
+            log::Started::Left => "none".into(),
+            log::Started::Failed => "failed".into(),
+        }
     );
     for cmd in &args[1..] {
         let (what, text) = cmd.split_once(':').unwrap();
@@ -53,6 +60,10 @@ fn probe_entry() {
             "exec" => {
                 let err = nested(args[0], text).exec();
                 panic!("exec failed: {err}");
+            }
+            "execfail" => {
+                let err = log::exec_with_child_stderr(&mut Command::new("/nonexistent/river"));
+                river_app::diag!("exec failed as expected: {} ({text})", err.kind());
             }
             "panic" => panic!("probe panic {text}"),
             _ => panic!("unknown command {cmd}"),
@@ -138,7 +149,7 @@ fn a_null_stderr_goes_to_the_file_with_timestamps() {
 }
 
 #[test]
-fn a_closed_stderr_goes_to_the_file() {
+fn a_closed_stderr_is_reopened_by_std_as_null_and_goes_to_the_file() {
     let dir = temp("closed");
     let mut cmd = Command::new(std::env::current_exe().unwrap());
     let spec = [dir.to_str().unwrap(), "say:after close"];
@@ -193,6 +204,58 @@ fn stderr_sent_to_a_pipe_is_left_alone() {
     let text = String::from_utf8_lossy(&out.stderr);
     assert!(text.lines().any(|l| stamped(l, "to the pipe")), "{text}");
     assert!(!dir.join("logs").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A full disk (`/dev/full` fails every write with ENOSPC): `diag!` must not panic, and the
+/// plain `eprintln!` that a dependency makes afterwards must not either, because the first
+/// failed write pointed stderr at the null device.
+#[test]
+fn a_stderr_that_fails_every_write_never_panics_diag_or_eprintln() {
+    let dir = temp("full");
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let out = run(
+        &dir,
+        Stdio::from(full),
+        &["say:one", "say:two", "eprintln:three", "eprintln:four"],
+    );
+    assert!(out.status.success(), "{out:?}");
+    assert!(said(&out).contains("log=none"), "{}", said(&out));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The rollback `exec` that fails must leave this River's own stderr, the log, in place.
+#[test]
+fn a_failed_exec_leaves_stderr_as_it_was() {
+    let dir = temp("execfail");
+    let out = run(
+        &dir,
+        Stdio::null(),
+        &["execfail:x", "say:still here", "eprintln:and here"],
+    );
+    assert!(out.status.success(), "{out:?}");
+    let log = log_of(&dir);
+    assert!(log.contains("exec failed as expected"), "{log}");
+    assert!(
+        log.contains("still here") && log.contains("and here"),
+        "{log}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_log_file_is_private_to_the_user() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp("mode");
+    run(&dir, Stdio::null(), &["say:x"]);
+    let mode = std::fs::metadata(dir.join("logs/river.log"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

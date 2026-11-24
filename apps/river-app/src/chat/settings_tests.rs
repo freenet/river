@@ -66,12 +66,19 @@ struct LogShell {
     refuse: bool,
     /// Keeps no file: stderr goes elsewhere.
     elsewhere: bool,
+    /// Keeps no file and has nowhere to write.
+    unavailable: bool,
 }
 
 impl super::LogHost for LogShell {
-    fn log_path(&self) -> Option<std::path::PathBuf> {
-        (!self.elsewhere)
-            .then(|| std::path::PathBuf::from("/home/ada/.config/River/logs/river.log"))
+    fn log_state(&self) -> super::LogState {
+        if self.unavailable {
+            super::LogState::Unavailable
+        } else if self.elsewhere {
+            super::LogState::Elsewhere
+        } else {
+            super::LogState::File("/home/ada/.config/River/logs/river.log".into())
+        }
     }
     fn open_log_folder(&self) -> Result<(), String> {
         self.opened
@@ -89,6 +96,7 @@ fn log_host() -> std::sync::Arc<LogShell> {
         opened: 0.into(),
         refuse: false,
         elsewhere: false,
+        unavailable: false,
     })
 }
 
@@ -1045,6 +1053,7 @@ fn without_a_log_file_diagnostics_says_where_the_output_goes_and_has_no_button()
         opened: 0.into(),
         refuse: false,
         elsewhere: true,
+        unavailable: false,
     });
     let mut s = connected();
     s.chat.diagnostics = Some(super::DiagnosticsUi::new(host));
@@ -1056,11 +1065,29 @@ fn without_a_log_file_diagnostics_says_where_the_output_goes_and_has_no_button()
 }
 
 #[test]
+fn a_log_that_could_not_be_made_says_diagnostics_are_lost() {
+    let host = std::sync::Arc::new(LogShell {
+        opened: 0.into(),
+        refuse: false,
+        elsewhere: false,
+        unavailable: true,
+    });
+    let mut s = connected();
+    s.chat.diagnostics = Some(super::DiagnosticsUi::new(host));
+    s.chat.settings.open_at(Section::Diagnostics);
+    let rt = render(s, WINDOW_SIZE);
+    assert!(shows(&rt, "could not open its log file"));
+    assert!(!shows(&rt, "output going elsewhere"));
+    assert!(rt.find("settings-log-open").is_none());
+}
+
+#[test]
 fn a_folder_that_will_not_open_says_why() {
     let host = std::sync::Arc::new(LogShell {
         opened: 0.into(),
         refuse: true,
         elsewhere: false,
+        unavailable: false,
     });
     let mut s = connected();
     s.chat.diagnostics = Some(super::DiagnosticsUi::new(host));

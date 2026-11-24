@@ -4,27 +4,38 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use river_app::chat::LogHost;
+use river_app::chat::{LogHost, LogState};
+
+use crate::log::Started;
 
 pub struct DesktopLog {
-    /// `None` when stderr was left alone (a terminal, a file, a system logger): there is no
-    /// log file.
-    path: Option<PathBuf>,
+    started: Started,
 }
 
 impl DesktopLog {
-    pub fn new(path: Option<PathBuf>) -> Self {
-        DesktopLog { path }
+    pub fn new(started: Started) -> Self {
+        DesktopLog { started }
+    }
+
+    fn path(&self) -> Option<&PathBuf> {
+        match &self.started {
+            Started::File(p) => Some(p),
+            _ => None,
+        }
     }
 }
 
 impl LogHost for DesktopLog {
-    fn log_path(&self) -> Option<PathBuf> {
-        self.path.clone()
+    fn log_state(&self) -> LogState {
+        match &self.started {
+            Started::File(p) => LogState::File(p.clone()),
+            Started::Left => LogState::Elsewhere,
+            Started::Failed => LogState::Unavailable,
+        }
     }
 
     fn open_log_folder(&self) -> Result<(), String> {
-        let path = self.path.as_ref().ok_or("River keeps no log file")?;
+        let path = self.path().ok_or("River keeps no log file")?;
         let dir = path.parent().ok_or("the log has no folder")?;
         let mut cmd = opener(dir);
         // This process may have no console (a Windows release build, a launcher), and a child
@@ -64,10 +75,18 @@ mod tests {
 
     #[test]
     fn it_reports_the_path_it_was_given() {
-        let log = DesktopLog::new(Some(PathBuf::from("/c/River/logs/river.log")));
+        let log = DesktopLog::new(Started::File(PathBuf::from("/c/River/logs/river.log")));
         assert_eq!(
-            log.log_path().as_deref(),
-            Some(Path::new("/c/River/logs/river.log"))
+            log.log_state(),
+            LogState::File(PathBuf::from("/c/River/logs/river.log"))
+        );
+        assert_eq!(
+            DesktopLog::new(Started::Left).log_state(),
+            LogState::Elsewhere
+        );
+        assert_eq!(
+            DesktopLog::new(Started::Failed).log_state(),
+            LogState::Unavailable
         );
     }
 
@@ -80,8 +99,8 @@ mod tests {
 
     #[test]
     fn a_path_with_no_folder_is_an_error_not_a_panic() {
-        let log = DesktopLog::new(Some(PathBuf::from("/")));
+        let log = DesktopLog::new(Started::File(PathBuf::from("/")));
         assert!(log.open_log_folder().is_err());
-        assert!(DesktopLog::new(None).open_log_folder().is_err());
+        assert!(DesktopLog::new(Started::Left).open_log_folder().is_err());
     }
 }

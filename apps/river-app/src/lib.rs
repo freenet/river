@@ -1228,8 +1228,8 @@ fn background_scene(s: &mut RiverApp, tray: bool) {
 struct PreviewLog;
 
 impl chat::LogHost for PreviewLog {
-    fn log_path(&self) -> Option<std::path::PathBuf> {
-        Some(std::path::PathBuf::from(
+    fn log_state(&self) -> chat::LogState {
+        chat::LogState::File(std::path::PathBuf::from(
             r"C:\Users\Ada\AppData\Local\Freenet\River\config\logs\river.log",
         ))
     }

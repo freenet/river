@@ -237,8 +237,9 @@ fn note_poller_failure(why: &str) {
     static SAID: AtomicBool = AtomicBool::new(false);
     if !SAID.swap(true, Ordering::Relaxed) {
         crate::diag!(
-            "River: the readiness poller for the Freenet connection failed ({why}); waiting for \
+            "River: the readiness poller for the Freenet connection failed ({}); waiting for \
              Freenet by sleeping {}ms at a time instead, which slows every answer",
+            crate::diag::scrub(why),
             POLL.as_millis()
         );
     }
@@ -825,9 +826,10 @@ fn note_pending(reading: bool, e: &std::io::Error) {
     }
     *last = Some(Instant::now());
     crate::diag!(
-        "River: a socket {} ended with os error {:?} ({e}); the connection is dropped and opened again (number {count} this run)",
+        "River: a socket {} ended with os error {:?} ({}); the connection is dropped and opened again (number {count} this run)",
         if reading { "read" } else { "write" },
         e.raw_os_error(),
+        crate::diag::scrub(e),
     );
 }
 

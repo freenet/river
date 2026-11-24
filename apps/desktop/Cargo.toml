@@ -35,7 +35,7 @@ png = "0.18"
 # The single-instance token.
 getrandom = "0.3"
 
-# The diagnostics log (src/log.rs) points fd 2 at a pipe with dup2. Already in the lockfile.
+# The diagnostics log (src/log.rs) points fd 2 at a file with dup2. Already in the lockfile.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

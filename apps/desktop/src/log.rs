@@ -11,8 +11,9 @@
 //! getting the output, so nothing that works today stops working. Then there is no log file
 //! and Settings says so.
 //!
-//! There is no pipe and no thread: the file is the process's stderr, so nothing can hang or
-//! panic in a diagnostics path, and a process that inherits fd 2 (an `exec`, a relaunch, a
+//! There is no pipe and no thread: the file is the process's stderr, so nothing can hang in a
+//! diagnostics path (a write that fails, such as a full disk, makes stderr the null device
+//! once: [`silence_stderr`]), and a process that inherits fd 2 (an `exec`, a relaunch, a
 //! child) holds a plain file. The time on each line comes from `diag!`, not from here.
 //!
 //! The file is rotated at start only: when `river.log` is over [`LIMIT`] it is renamed to
@@ -83,24 +84,40 @@ pub fn child_stderr() -> std::process::Stdio {
     }
 }
 
-/// Point stderr at the log file in `config_dir` when nobody is reading it ([`decide`]).
-/// Returns the file's path when it did, `None` when stderr was left as it was (somebody reads
-/// it, or the file could not be opened). Call once, after the single-instance check, since it
-/// rotates the file.
-pub fn start(config_dir: &Path) -> Option<PathBuf> {
+/// What [`start`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Started {
+    /// stderr now goes to this file.
+    File(PathBuf),
+    /// Somebody may be reading stderr, so it was left alone: there is no file.
+    Left,
+    /// Nobody reads stderr and the file could not be made (no config folder, a read-only one,
+    /// a folder where the file should be): the diagnostics are lost.
+    Failed,
+}
+
+/// Point stderr at the log file in `config_dir` when nobody is reading it ([`decide`]). Call
+/// once, after the single-instance check, since it rotates the file.
+pub fn start(config_dir: Option<&Path>) -> Started {
     start_with(config_dir, probe())
 }
 
-fn start_with(config_dir: &Path, stderr: Stderr) -> Option<PathBuf> {
+fn start_with(config_dir: Option<&Path>, stderr: Stderr) -> Started {
     if !decide(stderr) {
-        return None;
+        return Started::Left;
     }
     if let Some(p) = PATH.get() {
-        return Some(p.clone());
+        return Started::File(p.clone());
     }
-    let path = path_in(config_dir);
-    let file = open_for_run(&path, LIMIT).ok()?;
-    sys::take_stderr(file).ok()?;
+    let Some(path) = config_dir.map(path_in) else {
+        return Started::Failed;
+    };
+    let Ok(file) = open_for_run(&path, LIMIT) else {
+        return Started::Failed;
+    };
+    if sys::take_stderr(file).is_err() {
+        return Started::Failed;
+    }
     let _ = PATH.set(path.clone());
     river_app::diag!(
         "--- River {} started, pid {}, {} ---",
@@ -109,7 +126,8 @@ fn start_with(config_dir: &Path, stderr: Stderr) -> Option<PathBuf> {
         std::env::consts::OS
     );
     // The default hook prints the panic message as it is, and a message can quote a value
-    // (`called Result::unwrap() on an Err value: ... "hello"`), so the log gets a scrubbed one.
+    // (`called Result::unwrap() on an Err value: ... "hello"`), so the log gets a scrubbed one,
+    // and the backtrace when `RUST_BACKTRACE` asks for one.
     std::panic::set_hook(Box::new(|info| {
         let payload = info.payload();
         let message = payload
@@ -121,13 +139,38 @@ fn start_with(config_dir: &Path, stderr: Stderr) -> Option<PathBuf> {
             .location()
             .map(|l| format!("{}:{}", l.file(), l.line()))
             .unwrap_or_default();
+        let trace = std::backtrace::Backtrace::capture();
+        let trace = match trace.status() {
+            std::backtrace::BacktraceStatus::Captured => format!("\n{trace}"),
+            _ => String::new(),
+        };
         river_app::diag!(
-            "panic in thread '{}' at {at}: {}",
+            "panic in thread '{}' at {at}: {}{trace}",
             std::thread::current().name().unwrap_or("<unnamed>"),
             river_app::diag::scrub(message)
         );
     }));
-    Some(path)
+    Started::File(path)
+}
+
+/// Run `cmd` as an `exec` that replaces this process, with the stderr a started River should
+/// get ([`child_stderr`]). Returns only if the exec failed, with its error. std changes fd 2
+/// before `execvp` and does not undo it when that fails, so a River that stays would be left
+/// with a null stderr: it is put back here.
+#[cfg(unix)]
+pub fn exec_with_child_stderr(cmd: &mut std::process::Command) -> io::Error {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: F_DUPFD_CLOEXEC on fd 2 returns a new descriptor, or -1.
+    let saved = unsafe { libc::fcntl(2, libc::F_DUPFD_CLOEXEC, 3) };
+    let err = cmd.stderr(child_stderr()).exec();
+    if saved >= 0 {
+        // SAFETY: `saved` is ours; dup2 puts it back on fd 2, then it is closed.
+        unsafe {
+            libc::dup2(saved, 2);
+            libc::close(saved);
+        }
+    }
+    err
 }
 
 /// Rotate `path` if it is over `limit`, then open it for appending, creating its folder. A
@@ -139,11 +182,21 @@ pub fn open_for_run(path: &Path, limit: u64) -> io::Result<File> {
     if fs::metadata(path).is_ok_and(|m| m.len() > limit) {
         let _ = fs::rename(path, previous(path));
     }
-    OpenOptions::new().create(true).append(true).open(path)
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    // The log holds paths and keys of rooms: readable by this user only.
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path)
 }
 
 fn probe() -> Stderr {
     sys::probe()
+}
+
+/// What `river_app::diag::on_failure` runs.
+pub fn silence_stderr() {
+    sys::silence_stderr();
 }
 
 #[cfg(unix)]
@@ -172,6 +225,14 @@ mod sys {
         Stderr::Other
     }
 
+    /// Make stderr the null device (a write to it failed: a full disk, a closed pipe).
+    pub fn silence_stderr() {
+        if let Ok(null) = std::fs::OpenOptions::new().write(true).open("/dev/null") {
+            // SAFETY: dup2 onto fd 2 from a valid descriptor.
+            unsafe { libc::dup2(null.as_raw_fd(), 2) };
+        }
+    }
+
     /// Make fd 2 a copy of `file` (opened for appending). `file` is closed after.
     pub fn take_stderr(file: std::fs::File) -> io::Result<()> {
         // SAFETY: dup2 onto fd 2 closes the old fd 2 (if any) and copies `file`'s descriptor.
@@ -188,7 +249,7 @@ mod sys {
     use std::io;
     use std::os::windows::io::IntoRawHandle;
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_CHAR, GetFileType};
+    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_CHAR, FILE_TYPE_UNKNOWN, GetFileType};
     use windows_sys::Win32::System::Console::{
         GetConsoleMode, GetStdHandle, STD_ERROR_HANDLE, SetStdHandle,
     };
@@ -200,7 +261,11 @@ mod sys {
             if h.is_null() || h == INVALID_HANDLE_VALUE {
                 return Stderr::Invalid;
             }
-            if GetFileType(h) == FILE_TYPE_CHAR {
+            let kind = GetFileType(h);
+            if kind == FILE_TYPE_UNKNOWN {
+                return Stderr::Invalid;
+            }
+            if kind == FILE_TYPE_CHAR {
                 let mut mode = 0;
                 // A console answers; NUL is a character device that does not.
                 return if GetConsoleMode(h, &mut mode) != 0 {
@@ -211,6 +276,13 @@ mod sys {
             }
         }
         Stderr::Other
+    }
+
+    /// Make stderr the null device (a write to it failed: a full disk, a closed pipe).
+    pub fn silence_stderr() {
+        if let Ok(null) = std::fs::OpenOptions::new().write(true).open("NUL") {
+            let _ = take_stderr(null);
+        }
     }
 
     /// Make the standard error handle `file`, which stays open for the life of the process.
@@ -254,9 +326,39 @@ mod tests {
     #[test]
     fn a_stderr_that_is_left_alone_makes_no_file() {
         let dir = temp("leave");
-        assert_eq!(start_with(&dir, Stderr::Other), None);
-        assert_eq!(start_with(&dir, Stderr::Terminal), None);
+        assert_eq!(start_with(Some(&dir), Stderr::Other), Started::Left);
+        assert_eq!(start_with(Some(&dir), Stderr::Terminal), Started::Left);
         assert!(!dir.join("logs").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_log_that_cannot_be_made_is_reported_not_hidden() {
+        // No config folder at all.
+        assert_eq!(start_with(None, Stderr::Null), Started::Failed);
+        // A file where the `logs` folder should be.
+        let dir = temp("nofolder");
+        fs::write(dir.join("logs"), "in the way").unwrap();
+        assert_eq!(start_with(Some(&dir), Stderr::Null), Started::Failed);
+        // A folder where the file should be.
+        let dir2 = temp("dirfile");
+        fs::create_dir_all(dir2.join("logs/river.log")).unwrap();
+        assert_eq!(start_with(Some(&dir2), Stderr::Invalid), Started::Failed);
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_file_is_readable_by_its_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp("mode");
+        let path = dir.join("logs").join("river.log");
+        open_for_run(&path, LIMIT).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -303,16 +405,19 @@ mod tests {
     fn main_starts_the_log_after_the_instance_check_and_relaunches_pass_the_stderr_choice() {
         let main = include_str!("main.rs");
         let acquired = main.find("single::acquire(").expect("the instance check");
-        let started = main.find("log::start(&dir)").expect("main starts the log");
+        let started = main
+            .find("log::start(host.config_dir()")
+            .expect("main starts the log");
         assert!(acquired < started);
-        for (name, src) in [
-            ("update/host.rs", include_str!("update/host.rs")),
-            ("update/linux.rs", include_str!("update/linux.rs")),
-        ] {
-            assert!(
-                src.contains(".stderr(crate::log::child_stderr())"),
-                "{name}"
-            );
-        }
+        let host = include_str!("update/host.rs");
+        assert!(
+            host.contains("crate::log::exec_with_child_stderr("),
+            "update/host.rs"
+        );
+        let linux = include_str!("update/linux.rs");
+        assert!(
+            linux.contains(".stderr(crate::log::child_stderr())"),
+            "update/linux.rs"
+        );
     }
 }

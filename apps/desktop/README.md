@@ -149,7 +149,9 @@ standard error at all, so there the lines go nowhere. When River finds that noth
 its standard error (it is closed, or goes to the null device), it writes the lines to a log file
 instead. If River was started from a terminal, with its output sent to a file (`river 2>
 river-log.txt`), or into a pipe or the system's log (journald), it leaves the output there and
-keeps no log file. **Settings > Diagnostics** says which, and when there is a file it shows the
+keeps no log file. (On Linux, a River started from a desktop launcher or at login usually has
+its output in the user journal: try `journalctl --user -b` and look for `river`.)
+**Settings > Diagnostics** says which, and when there is a file it shows the
 path and has an **Open log folder** button. The file is `river.log` in the `logs` folder of
 River's config folder:
 

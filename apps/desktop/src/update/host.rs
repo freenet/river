@@ -162,17 +162,16 @@ fn hand_over_instance<T>(start: impl FnOnce() -> Result<T, String>) -> Result<T,
 fn restart_into(path: &std::path::Path) {
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt;
         // The lock is not carried over an exec (the file is close-on-exec) but is let go of
         // explicitly, and taken back if the exec fails.
         let failed = hand_over_instance(|| {
+            // The previous build starts its own log, and a failed exec leaves our stderr as it
+            // was: see `log::exec_with_child_stderr`.
             Err::<(), String>(
-                std::process::Command::new(path)
-                    .args(std::env::args_os().skip(1))
-                    // The previous build starts its own log; see `log::child_stderr`.
-                    .stderr(crate::log::child_stderr())
-                    .exec()
-                    .to_string(),
+                crate::log::exec_with_child_stderr(
+                    std::process::Command::new(path).args(std::env::args_os().skip(1)),
+                )
+                .to_string(),
             )
         });
         let Err(err) = failed else { return };

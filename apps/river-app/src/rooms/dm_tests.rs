@@ -972,6 +972,7 @@ fn the_direct_message_code_neither_logs_nor_talks_to_the_node() {
             "println!",
             "eprintln!",
             "diag!(",
+            "diag::line(",
             "print!(",
             "dbg!",
             "tracing::",

@@ -7,7 +7,7 @@
 //! prints the node the arguments and environment name and exits (2 if the address is not valid).
 //! `-- --self-update` checks for, installs and starts a newer signed River once, without a
 //! window (see `update/`). `-- --background` starts hidden in the tray (what start at login
-//! runs). Where stderr is not a terminal (a Windows release build, a launcher, the tray) the
+//! runs). Where nothing reads stderr (a Windows release build, a launcher with no output) the
 //! app's stderr goes to a log file instead (see `log`).
 //!
 //! Only one River runs per user: a second launch shows the first one's window and exits.
@@ -119,7 +119,8 @@ fn main() {
         }
     });
     // Diagnostics go to a file when nobody is reading stderr (see `log`).
-    let log_path = host.config_dir().and_then(|dir| log::start(&dir));
+    river_app::diag::on_failure(log::silence_stderr);
+    let log_state = log::start(host.config_dir().as_deref());
     for line in &early {
         river_app::diag!("river: {line}");
     }
@@ -164,7 +165,7 @@ fn main() {
         )
         .with_notifier(Box::new(notifier))
         .with_background(for_settings);
-        let app = app.with_log(Arc::new(diagnostics::DesktopLog::new(log_path)));
+        let app = app.with_log(Arc::new(diagnostics::DesktopLog::new(log_state)));
         match updates {
             Some(updates) => app.with_updates(updates),
             None => app,

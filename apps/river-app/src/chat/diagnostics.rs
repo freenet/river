@@ -19,11 +19,21 @@ use super::style::{self as st, Palette};
 use super::view::label;
 use crate::RiverApp;
 
+/// Where the shell's diagnostics go.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LogState {
+    /// To this file.
+    File(PathBuf),
+    /// To where River was started from (a terminal, a file, a system logger): no file.
+    Elsewhere,
+    /// Nowhere: nothing reads them and the file could not be made.
+    Unavailable,
+}
+
 /// What the shell offers for its log file.
 pub trait LogHost: Send + Sync + 'static {
-    /// The file River is writing its diagnostics to, or `None` when it keeps none because its
-    /// stderr goes somewhere else (a terminal, a file, a system logger).
-    fn log_path(&self) -> Option<PathBuf>;
+    /// Where the diagnostics go.
+    fn log_state(&self) -> LogState;
 
     /// Show the folder that holds it in the system's file manager.
     fn open_log_folder(&self) -> Result<(), String>;
@@ -41,9 +51,9 @@ impl DiagnosticsUi {
         DiagnosticsUi { host, error: None }
     }
 
-    /// The log file, as the shell says.
-    pub fn path(&self) -> Option<PathBuf> {
-        self.host.log_path()
+    /// Where the diagnostics go, as the shell says.
+    pub fn state(&self) -> LogState {
+        self.host.log_state()
     }
 }
 
@@ -61,20 +71,26 @@ pub(super) fn diagnostics_section(chat: &super::Chat, p: &Palette, k: &Kit) -> E
     let Some(d) = chat.diagnostics.as_ref() else {
         return col().key("settings-diagnostics");
     };
-    let Some(path) = d.path() else {
-        // The one sentence is true whatever is reading stderr: that is why there is no file.
-        return col().key("settings-diagnostics").w_full().child(
-            label(
+    let path = match d.state() {
+        LogState::File(path) => path,
+        // Each sentence is true whatever else is going on: that is why there is no file.
+        LogState::Elsewhere => {
+            return notice(
                 "River was started with its output going elsewhere (a terminal, a file or the \
                  system's log), so its diagnostics go there and River keeps no log file of its \
                  own.",
-                st::BODY,
-                p.text_secondary,
-            )
-            .wrap()
-            .w_full()
-            .key("settings-log-elsewhere"),
-        );
+                "settings-log-elsewhere",
+                p,
+            );
+        }
+        LogState::Unavailable => {
+            return notice(
+                "River could not open its log file, so its diagnostics are lost. Check that \
+                 River's config folder can be written to, then start River again.",
+                "settings-log-unavailable",
+                p,
+            );
+        }
     };
     let note = col()
         .gap(2.0)
@@ -126,4 +142,13 @@ pub(super) fn diagnostics_section(chat: &super::Chat, p: &Palette, k: &Kit) -> E
         );
     }
     s
+}
+
+fn notice(text: &str, key: &'static str, p: &Palette) -> El {
+    col().key("settings-diagnostics").w_full().child(
+        label(text.to_owned(), st::BODY, p.text_secondary)
+            .wrap()
+            .w_full()
+            .key(key),
+    )
 }
