@@ -1577,6 +1577,24 @@ impl Carol {
         carol
     }
 
+    /// How many messages the room holds on the node.
+    fn message_count(&self) -> usize {
+        self.state().recent_messages.messages.len()
+    }
+
+    /// Wait (bounded) until the node holds more than `n` messages, so a later "cannot read" is
+    /// about the key and not about the message not having arrived.
+    fn wait_for_more_than(&self, n: usize) {
+        let deadline = Instant::now() + STEP;
+        while self.message_count() <= n {
+            assert!(
+                Instant::now() < deadline,
+                "the node never held the message Carol is meant not to read"
+            );
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+
     /// Whether Carol, with her own key and what node B holds, can read the owner's message
     /// `text` in the room.
     fn reads(&self, text: &str) -> bool {
@@ -2142,6 +2160,166 @@ fn moving_an_identity(
 }
 
 /// A fresh store: registered (not missing), with no rooms.
+/// A private room where the member who stays is a real app and the one removed is not: Carol
+/// (played by the example, see [`Carol`]) is banned, the owner's ban rotates the secret, and Bob's
+/// app, which stayed, reads what the owner and he write under the new version, while Carol, whose
+/// node holds those messages too, cannot open them. Then the owner's own Rotate does the same
+/// once more. (`ban_and_lock_out` covers the other way round: the app banned, a bystander
+/// staying.)
+const ROTATION_ROOM: &str = "Fresh node rotation room";
+
+fn rotation_keeps_a_member_and_drops_another(
+    alice: &mut App,
+    bob: &mut App,
+    b: &str,
+    dir_b: &Path,
+) -> String {
+    const ROOM: &str = ROTATION_ROOM;
+    alice.send(
+        "",
+        Action::CreateRoom {
+            name: ROOM.into(),
+            nickname: "Alice".into(),
+            private: true,
+        },
+    );
+    alice.until("the rotation room is created", |app| {
+        app.room(ROOM).is_some()
+    });
+    let key = alice.room(ROOM).unwrap().key.clone();
+    let invite = |alice: &mut App| {
+        alice.invites.clear();
+        alice.send(&key, Action::Invite);
+        alice.until("an invitation to the rotation room is made", |app| {
+            !app.invites.is_empty()
+        });
+        match alice.invites.pop().unwrap() {
+            (room, Ok(link)) if room == key => link,
+            other => panic!("no invitation: {:?}", other.1.map(|_| "<link>")),
+        }
+    };
+    let link = invite(alice);
+    bob.send(
+        "",
+        Action::Join {
+            code: InviteCode(link),
+            nickname: "Bob".into(),
+        },
+    );
+    bob.until("the rotation room is joined and readable", |app| {
+        app.room(ROOM).is_some_and(|r| r.send_block.is_none())
+    });
+    let clink = invite(alice);
+    let carol = Carol::join(b, dir_b, &clink);
+    alice.until("node A sees Bob and Carol in the rotation room", |app| {
+        app.room(ROOM).is_some_and(|r| {
+            r.members.iter().any(|m| m.nickname == "Bob")
+                && r.members.iter().any(|m| m.nickname == "Carol")
+        })
+    });
+
+    // Before anything is removed, the member who stays reads.
+    let before_text = "Written before Carol is removed";
+    alice.send(
+        &key,
+        Action::Send {
+            text: before_text.into(),
+            reply_to: None,
+        },
+    );
+    bob.until("Bob reads the message written before the removal", |app| {
+        app.has_text(ROOM, before_text)
+    });
+
+    // The owner bans Carol, which rotates the secret in the same update.
+    let version = |app: &App| app.room(ROOM).map(|r| r.details.secret_version);
+    let v0 = version(alice).unwrap();
+    let carol_uid = alice
+        .room(ROOM)
+        .and_then(|r| r.members.iter().find(|m| m.nickname == "Carol"))
+        .map(|m| m.uid.clone())
+        .expect("Carol is a member on node A");
+    alice.send(&key, Action::Ban { target: carol_uid });
+    alice.until("node A dropped Carol and moved to the next secret", |app| {
+        app.room(ROOM).is_some_and(|r| {
+            !r.members.iter().any(|m| m.nickname == "Carol")
+                && r.notices.is_empty()
+                && r.details.secret_version == v0 + 1
+        })
+    });
+    bob.until("Bob's app holds the post-ban secret version", |app| {
+        version(app) == Some(v0 + 1)
+    });
+    bob.until("Bob is still a member and can write", |app| {
+        app.room(ROOM).is_some_and(|r| {
+            r.send_block.is_none() && r.members.iter().any(|m| m.nickname == "Bob")
+        })
+    });
+    let carol_sees = carol.message_count();
+    let after_ban = "Written after Carol is banned";
+    alice.send(
+        &key,
+        Action::Send {
+            text: after_ban.into(),
+            reply_to: None,
+        },
+    );
+    bob.until(
+        "Bob reads the owner's message under the new secret",
+        |app| app.has_text(ROOM, after_ban),
+    );
+    carol.wait_for_more_than(carol_sees);
+    assert!(
+        !carol.reads(after_ban),
+        "the banned member read a message sealed after the ban"
+    );
+    // The member who stayed writes under the new secret and the owner reads it.
+    let from_bob = "Bob writes after Carol is banned";
+    bob.send(
+        &key,
+        Action::Send {
+            text: from_bob.into(),
+            reply_to: None,
+        },
+    );
+    alice.until(
+        "the owner reads Bob's message under the new secret",
+        |app| app.has_text(ROOM, from_bob),
+    );
+
+    // The owner's Rotate moves the room on again; Bob keeps reading, Carol still cannot.
+    alice.send(&key, Action::RotateSecret);
+    alice.until("node A moved to the rotated secret", |app| {
+        app.room(ROOM).is_some_and(|r| {
+            r.details.secret_version == v0 + 2
+                && r.details.rotation.is_none()
+                && r.notices.is_empty()
+        })
+    });
+    bob.until("Bob's app holds the rotated secret version", |app| {
+        version(app) == Some(v0 + 2)
+    });
+    let carol_sees = carol.message_count();
+    let after_rotate = "Written after the owner rotates";
+    alice.send(
+        &key,
+        Action::Send {
+            text: after_rotate.into(),
+            reply_to: None,
+        },
+    );
+    bob.until("Bob reads the message under the rotated secret", |app| {
+        app.has_text(ROOM, after_rotate)
+    });
+    carol.wait_for_more_than(carol_sees);
+    assert!(
+        !carol.reads(after_rotate),
+        "the banned member read a message sealed after the rotation"
+    );
+    println!("D: rotation keeps Bob reading and keeps Carol out");
+    key
+}
+
 fn ready_and_empty(app: &App) -> bool {
     app.access == Some(Access::Ready) && app.rooms.is_empty() && !app.issues.store_missing
 }
@@ -2389,6 +2567,7 @@ fn main() {
         app.has_text(BAN_ROOM, "Bob speaks in the ban room")
     });
     ban_and_lock_out(&mut alice, &mut bob, None, BAN_ROOM, &bkey, false);
+    let rkey = rotation_keeps_a_member_and_drops_another(&mut alice, &mut bob, b, &dir_b);
     // Each app's own key is in its node's delegate for the room, asked of the delegate itself:
     // the creator's is the owner's, the joiner's is the invitee's own, and they differ.
     let owner = expect_signing_key("A", &alice.authority, &dir_a, &key);
@@ -2405,6 +2584,7 @@ fn main() {
     // The banned member still holds the ban room; leaving it is allowed, so the last-room step
     // below still ends with an empty list.
     leave_room(&mut bob, b, &dir_b, BAN_ROOM, &bkey, Some(ROOM));
+    leave_room(&mut bob, b, &dir_b, ROTATION_ROOM, &rkey, Some(ROOM));
 
     newer_river(a, &dir, &dir_a, ROOM, &key, &mut bob);
     // Nothing the outdated app was asked to write reached the room: the app on node B, which
