@@ -3088,7 +3088,7 @@ impl Rooms {
                 }
                 Err(refusal) => crate::diag!(
                     "River: your deleted messages were not signed again: {}",
-                    crate::diag::scrub(&refusal.text())
+                    crate::diag::scrub(refusal.text())
                 ),
             }
         }
