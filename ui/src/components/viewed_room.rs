@@ -422,14 +422,17 @@ pub(crate) fn JoinComposer(
         ),
         JoinPhase::Solving { tried, expected } => (
             "viewed-room-join-progress",
-            if *expected > 0.0 {
-                format!(
-                    "Joining: proving you are not a bot ({}%). You can keep writing. Keep this tab open: a phone may pause a hidden tab.",
+            // Always with a percentage, so the line does not change length when
+            // the first progress arrives and move the Cancel button under a
+            // pointer that is already on its way down.
+            format!(
+                "Joining: proving you are not a bot ({}%). You can keep writing. Keep this tab open: a phone may pause a hidden tab.",
+                if *expected > 0.0 {
                     ((*tried as f64 / expected) * 100.0).min(99.0) as u32
-                )
-            } else {
-                "Joining: proving you are not a bot. You can keep writing. Keep this tab open: a phone may pause a hidden tab.".to_string()
-            },
+                } else {
+                    0
+                }
+            ),
         ),
         JoinPhase::Ready => (
             "viewed-room-join-ready",

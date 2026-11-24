@@ -252,6 +252,15 @@ pub fn install_test_hooks() {
             .into_js_value(),
     );
 
+    // Whether the last worker pool was handed the page's compiled wasm module.
+    set_hook(
+        "powModuleShared",
+        Closure::<dyn FnMut() -> bool>::new(move || {
+            crate::pow_worker::MODULE_SHARED.load(std::sync::atomic::Ordering::Relaxed)
+        })
+        .into_js_value(),
+    );
+
     // Times the join's solver was retargeted to a changed room policy.
     set_hook(
         "powRetargets",

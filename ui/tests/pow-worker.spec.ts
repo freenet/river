@@ -32,6 +32,8 @@ test("a join solves in Web Workers and posts exactly once", async ({ page }) => 
   await page.getByTestId("viewed-room-send").click();
   await expect(page.getByTestId("viewed-room")).toHaveCount(0, { timeout: 60_000 });
   expect(await callRiverTest(page, "powSolverMode")).toBe("workers");
+  // The page compiled the wasm once and handed the module to its workers.
+  expect(await callRiverTest(page, "powModuleShared")).toBe(true);
   expect(await callRiverTest(page, "roomMessageCount", "From a worker")).toBe(1);
   // The solve is over: its workers are gone.
   await expect.poll(() => page.workers().length).toBe(0);
@@ -122,7 +124,15 @@ test("a join solves in Web Workers inside the gateway's sandboxed iframe", async
   const base = process.env.PLAYWRIGHT_BASE_URL ?? "http://localhost:8082";
   await page.route(`${base}/**`, async (route) => {
     const response = await route.fetch();
-    await route.fulfill({ response, headers: { ...response.headers(), "access-control-allow-origin": "*" } });
+    const headers: Record<string, string> = { ...response.headers(), "access-control-allow-origin": "*" };
+    // The policy the gateway serves with the app's document
+    // (freenet-core `sandbox_csp_for_origin`).
+    if (route.request().resourceType() === "document") {
+      headers["content-security-policy"] =
+        `sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads allow-modals; ` +
+        `default-src ${new URL(base).origin} 'unsafe-inline' 'unsafe-eval' blob: data:; connect-src ${new URL(base).origin} blob: data:`;
+    }
+    await route.fulfill({ response, headers });
   });
   await page.goto(`${base}/`);
   await waitForApp(page);
@@ -178,4 +188,49 @@ test("a member removed by a raised difficulty is re-admitted by their next messa
   await expect(page.getByTestId("readmit-pending-message")).toHaveCount(0);
   expect(await callRiverTest(page, "powSolverMode")).toBe("workers");
   expect(panics).toEqual([]);
+});
+
+// A worker that cannot load its module must not make the join wait out the
+// worker timeout, once or on every join: it falls back at once, the message
+// posts exactly once, and later joins skip workers.
+test("workers that cannot load fall back at once, post once, and are not tried again", async ({ page }) => {
+  const panics = panicsOf(page);
+  await openRoom(page, "open");
+  // The page's own script has run; point the worker at a module that is not there.
+  await page.evaluate(() => {
+    for (const s of document.querySelectorAll<HTMLScriptElement>("script[type=module][src]")) {
+      if (/river-ui/.test(s.src)) s.src = s.src.replace(/river-ui[^/]*\.js$/, "river-ui-missing.js");
+    }
+  });
+  const began = Date.now();
+  await page.getByTestId("viewed-room-composer").fill("No workers here");
+  await page.getByTestId("viewed-room-send").click();
+  await expect(page.getByTestId("viewed-room")).toHaveCount(0, { timeout: 60_000 });
+  expect(Date.now() - began, "fell back without waiting out the 30 s worker timeout").toBeLessThan(15_000);
+  expect(await callRiverTest(page, "powSolverMode")).toBe("main");
+  expect(await callRiverTest(page, "roomMessageCount", "No workers here")).toBe(1);
+  await expect.poll(() => page.workers().length).toBe(0);
+  expect(panics).toEqual([]);
+});
+
+test("a join after a worker failure goes straight to the main thread", async ({ page }) => {
+  await openRoom(page, "open");
+  await page.evaluate(() => {
+    for (const s of document.querySelectorAll<HTMLScriptElement>("script[type=module][src]")) {
+      if (/river-ui/.test(s.src)) s.src = s.src.replace(/river-ui[^/]*\.js$/, "river-ui-missing.js");
+    }
+  });
+  await page.getByTestId("viewed-room-composer").fill("First");
+  await page.getByTestId("viewed-room-send").click();
+  await expect(page.getByTestId("viewed-room")).toHaveCount(0, { timeout: 60_000 });
+  // The same page joins another room: no worker is even started.
+  await callRiverTest(page, "viewRoom", "hard");
+  await page.getByTestId("viewed-room-name").waitFor();
+  expect(await callRiverTest(page, "retargetPolicy", "hard", 4, 2)).toBe(true);
+  let started = 0;
+  page.on("worker", () => started++);
+  await page.getByTestId("viewed-room-composer").fill("Second");
+  await page.getByTestId("viewed-room-send").click();
+  await expect(page.getByTestId("viewed-room")).toHaveCount(0, { timeout: 30_000 });
+  expect(started).toBe(0);
 });

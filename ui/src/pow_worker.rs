@@ -46,8 +46,9 @@ pub enum ToWorker {
 pub enum FromWorker {
     /// The worker's module is loaded and it takes messages.
     Ready,
-    /// Nonces this worker has tried since its search (re)started.
-    Progress { tried: u64 },
+    /// Nonces this worker has tried since its search (re)started, in `epoch`
+    /// (a count from before a retarget to a new epoch is not about the new one).
+    Progress { tried: u64, epoch: u32 },
     /// A nonce that meets the target the worker was last given.
     Found { nonce: u64 },
     /// The worker cannot continue.
@@ -68,6 +69,7 @@ pub fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, String> {
 #[derive(Default)]
 pub struct WorkerCore {
     solver: Option<PowSolver>,
+    epoch: u32,
     paused: bool,
     found: bool,
 }
@@ -96,6 +98,7 @@ impl WorkerCore {
                     PowSolver::new(&owner, &member, &requirement(epoch, bits), bits)
                         .with_partition(start, stride),
                 );
+                self.epoch = epoch;
                 self.paused = paused;
                 self.found = false;
                 None
@@ -103,6 +106,7 @@ impl WorkerCore {
             ToWorker::Retarget { epoch, bits } => {
                 if let Some(solver) = self.solver.as_mut() {
                     solver.retarget(&requirement(epoch, bits), bits);
+                    self.epoch = epoch;
                     self.found = false;
                 }
                 None
@@ -134,7 +138,10 @@ impl WorkerCore {
                 self.found = true;
                 FromWorker::Found { nonce }
             }
-            PowStep::Progress { tried, .. } => FromWorker::Progress { tried },
+            PowStep::Progress { tried, .. } => FromWorker::Progress {
+                tried,
+                epoch: self.epoch,
+            },
         })
     }
 }
@@ -148,7 +155,7 @@ fn requirement(epoch: u32, bits: u8) -> PowRequirement {
 }
 
 #[cfg(target_arch = "wasm32")]
-pub use browser::{worker_count, worker_main, Pool};
+pub use browser::{worker_count, worker_main, Pool, MODULE_SHARED};
 
 #[cfg(target_arch = "wasm32")]
 mod browser {
@@ -262,7 +269,10 @@ mod browser {
 
     impl Drop for Pool {
         fn drop(&mut self) {
+            // Detach the handlers before the closures behind them go.
             for w in &self.workers {
+                w.set_onmessage(None);
+                w.set_onerror(None);
                 w.terminate();
             }
             let _ = web_sys::Url::revoke_object_url(&self.blob_url);
@@ -290,11 +300,64 @@ mod browser {
             })
     }
 
+    thread_local! {
+        /// Set once workers fail to load: later joins in this page go straight
+        /// to the main thread instead of waiting for the same failure.
+        static WORKERS_BROKEN: Cell<bool> = const { Cell::new(false) };
+    }
+
+    fn give_up_on_workers() -> Option<Pool> {
+        WORKERS_BROKEN.with(|b| b.set(true));
+        None
+    }
+
+    /// Test hook support: whether the last pool handed its workers the page's
+    /// compiled module (rather than each fetching and compiling the wasm).
+    pub static MODULE_SHARED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// `{ module }` for a worker's first message: the wasm module this page
+    /// compiled, which a worker can instantiate without fetching or compiling
+    /// it again; `null` when the page cannot give it (the worker then loads
+    /// the wasm itself).
+    fn module_message() -> js_sys::Object {
+        let message = js_sys::Object::new();
+        let module = if share_module() {
+            wasm_bindgen::module()
+        } else {
+            JsValue::NULL
+        };
+        let shared = module.is_instance_of::<js_sys::WebAssembly::Module>();
+        MODULE_SHARED.store(shared, std::sync::atomic::Ordering::Relaxed);
+        let _ = js_sys::Reflect::set(
+            &message,
+            &JsValue::from_str("module"),
+            &if shared { module } else { JsValue::NULL },
+        );
+        message
+    }
+
+    /// Test builds can turn the sharing off (`window.__riverNoModuleShare`) to
+    /// compare against workers that fetch and compile the wasm themselves.
+    fn share_module() -> bool {
+        #[cfg(all(feature = "example-data", feature = "no-sync"))]
+        {
+            return !js_sys::Reflect::get(&js_sys::global(), &"__riverNoModuleShare".into())
+                .map(|v| v.is_truthy())
+                .unwrap_or(false);
+        }
+        #[allow(unreachable_code)]
+        true
+    }
+
     impl Pool {
         /// Start `n` workers and wait until all have loaded. `None` if any
         /// cannot start, loading takes longer than [`READY_TIMEOUT_MS`], or
         /// `keep_waiting` turns false (the join was cancelled).
         pub async fn spawn(n: usize, keep_waiting: impl Fn() -> bool) -> Option<Pool> {
+            if WORKERS_BROKEN.with(|b| b.get()) {
+                return None;
+            }
             let document = web_sys::window()?.document()?;
             let glue = glue_url()?;
             let base = document.base_uri().ok().flatten()?;
@@ -305,11 +368,39 @@ mod browser {
             // sandboxed iframe the container serves the app in, a module worker
             // made from a blob fails to start, and one made straight from the
             // glue's URL is a cross-origin worker and is refused.
+            // The page sends the compiled module first (or null): the worker
+            // then needs no fetch and no compile of its own. A failure to load
+            // anything is posted at once as `Failed`, so the page falls back
+            // without waiting out the timeout.
+            let failure = encode(&FromWorker::Failed("worker could not load".into()))
+                .iter()
+                .map(|b| b.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
             let script = format!(
                 "const base = {base};\n\
+                 const failure = new Uint8Array([{failure}]);\n\
+                 const fail = () => postMessage(failure);\n\
+                 self.addEventListener('unhandledrejection', fail);\n\
+                 let shared = false;\n\
                  const nativeFetch = self.fetch.bind(self);\n\
-                 self.fetch = (input, init) => nativeFetch(typeof input === 'string' ? new URL(input, base).href : input, init);\n\
-                 import({glue});\n",
+                 self.fetch = (input, init) => {{\n\
+                   const url = typeof input === 'string' ? new URL(input, base).href : input;\n\
+                   if (shared && typeof url === 'string' && url.split('?')[0].endsWith('.wasm')) {{\n\
+                     return Promise.resolve(new Response(new Uint8Array(0), {{ headers: {{ 'content-type': 'application/wasm' }} }}));\n\
+                   }}\n\
+                   return nativeFetch(url, init);\n\
+                 }};\n\
+                 self.onmessage = (e) => {{\n\
+                   self.onmessage = null;\n\
+                   const module = e.data && e.data.module;\n\
+                   if (module) {{\n\
+                     shared = true;\n\
+                     WebAssembly.instantiateStreaming = async (_response, imports) => ({{\n\
+                       instance: await WebAssembly.instantiate(module, imports), module }});\n\
+                   }}\n\
+                   import({glue}).catch(fail);\n\
+                 }};\n",
                 base = js_string(&base),
                 glue = js_string(&glue),
             );
@@ -329,6 +420,7 @@ mod browser {
             };
             for i in 0..n {
                 let worker = Worker::new(&blob_url).ok()?;
+                worker.post_message(&module_message().into()).ok()?;
                 let sender = tx.clone();
                 let on_message = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
                     let msg = match e.data().dyn_into::<js_sys::Uint8Array>() {
@@ -351,12 +443,15 @@ mod browser {
             drop(tx);
             let (mut ready, mut waited) = (0, 0);
             while ready < n {
-                if !keep_waiting() || waited >= READY_TIMEOUT_MS {
+                if !keep_waiting() {
                     return None;
+                }
+                if waited >= READY_TIMEOUT_MS {
+                    return give_up_on_workers();
                 }
                 match pool.next(READY_POLL_MS).await {
                     Some((_, FromWorker::Ready)) => ready += 1,
-                    Some(_) => return None,
+                    Some(_) => return give_up_on_workers(),
                     None => waited += READY_POLL_MS,
                 }
             }
@@ -494,7 +589,10 @@ mod tests {
         }
         for msg in [
             FromWorker::Ready,
-            FromWorker::Progress { tried: u64::MAX },
+            FromWorker::Progress {
+                tried: u64::MAX,
+                epoch: 7,
+            },
             FromWorker::Found { nonce: u64::MAX },
             FromWorker::Failed("no".into()),
         ] {
@@ -536,14 +634,14 @@ mod tests {
         core.handle(start(5, 20, 0, 1, false));
         assert!(matches!(
             core.run(10),
-            Some(FromWorker::Progress { tried: 10 })
+            Some(FromWorker::Progress { tried: 10, .. })
         ));
         core.handle(ToWorker::Stop);
         assert!(!core.has_work());
         core.handle(start(5, 4, 0, 1, false));
         assert!(matches!(
             core.run(1),
-            Some(FromWorker::Progress { tried: 1 } | FromWorker::Found { .. })
+            Some(FromWorker::Progress { tried: 1, .. } | FromWorker::Found { .. })
         ));
     }
 
@@ -581,12 +679,18 @@ mod tests {
         core.handle(start(2, 30, 1, 2, false));
         assert!(matches!(
             core.run(500),
-            Some(FromWorker::Progress { tried: 500 })
+            Some(FromWorker::Progress {
+                tried: 500,
+                epoch: 2
+            })
         ));
         core.handle(ToWorker::Retarget { epoch: 3, bits: 30 });
         assert!(
-            matches!(core.run(7), Some(FromWorker::Progress { tried: 7 })),
-            "a new epoch counts from zero"
+            matches!(
+                core.run(7),
+                Some(FromWorker::Progress { tried: 7, epoch: 3 })
+            ),
+            "a new epoch counts from zero and reports the new epoch"
         );
     }
 
@@ -598,7 +702,7 @@ mod tests {
         core.handle(ToWorker::Retarget { epoch: 2, bits: 30 });
         assert!(matches!(
             core.run(1),
-            Some(FromWorker::Progress { tried: 501 })
+            Some(FromWorker::Progress { tried: 501, .. })
         ));
     }
 

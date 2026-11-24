@@ -30,6 +30,8 @@ type RiverTestHooks = {
   raiseMemberRoomPolicy(kind: "open" | "hard" | "full", bits: number, epoch: number): boolean;
   // Nonces the join's solver reports tried so far (0 when not solving).
   powTried(): number;
+  // Whether the last worker pool was handed the page's compiled wasm module (workers then neither fetch nor compile it).
+  powModuleShared(): boolean;
   // How many times the join's solver followed a changed room policy.
   powRetargets(): number;
   // The owner of that example room signs a new open-admission policy (`bits` in `epoch`). False if the viewed room is not public.
