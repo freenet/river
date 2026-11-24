@@ -947,7 +947,9 @@ pub fn readmit_note(
 ) -> String {
     match check_admission_status(state, owner_vk, member_vk, entry, now) {
         Ok(_) if entry.is_some() => {
-            "The room removed you for being quiet. Your next message rejoins.".to_string()
+            "The room has a limited number of places for newcomers, and newer \
+            arrivals took yours. Your next message rejoins."
+                .to_string()
         }
         // The proof held no longer passes because the room asks for more bits.
         Err(JoinFailure::PolicyChanged) if difficulty_raised(state, held_bits) => {
@@ -955,7 +957,8 @@ pub fn readmit_note(
             Your next message rejoins after a short proof of work."
                 .to_string()
         }
-        Ok(_) | Err(JoinFailure::PolicyChanged) => "The room removed you for being quiet. \
+        Ok(_) | Err(JoinFailure::PolicyChanged) => "The room has a limited number of places \
+            for newcomers, and newer arrivals took yours. \
             Your next message rejoins after a short proof of work."
             .to_string(),
         Err(f) => f.message(),
@@ -1989,6 +1992,14 @@ mod tests {
             now,
         );
         assert!(note.contains("Your next message rejoins."), "{note}");
+        assert!(
+            note.contains(
+                "The room has a limited number of places for newcomers, \
+                 and newer arrivals took yours."
+            ),
+            "{note}"
+        );
+        assert!(!note.contains("quiet"), "{note}");
         // The held proof still passes, so it goes out as it is.
         let sub = build_submission(&data.room_state, &owner_vk, &sk, &entry, "again", "Me", now)
             .expect("re-admitted");
@@ -2040,6 +2051,17 @@ mod tests {
                 now,
             );
             assert!(!other.contains("security was raised"), "{other}");
+            // A pruned newcomer is told why, in plain words: newer arrivals
+            // took the limited newcomer places, not that they were quiet.
+            assert!(
+                other.contains(
+                    "The room has a limited number of places for newcomers, \
+                     and newer arrivals took yours."
+                ),
+                "{other}"
+            );
+            assert!(other.contains("proof of work"), "{other}");
+            assert!(!other.contains("quiet"), "{other}");
         }
         assert_eq!(
             build_submission(&data.room_state, &owner_vk, &sk, &old_entry, "x", "Me", now)
