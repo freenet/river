@@ -15,6 +15,7 @@ pub mod notify;
 mod notify_actions;
 pub mod rooms;
 pub mod setup;
+pub mod signed_time;
 pub mod update;
 
 /// Where the web UI's code, copied verbatim into `chat/visual_fold.rs`, finds its neighbours.

@@ -248,7 +248,7 @@ pub fn build_join(
     let member_vk = signing_key.verifying_key();
     let config = &room_state.configuration.configuration;
     let stored = storage.get_provisional_entry(owner_key, &member_vk)?;
-    let now = SystemTime::now();
+    let now = crate::signed_time::now();
     match admission_status(room_state, &params, &member_vk, stored.as_ref(), now) {
         AdmissionStatus::Owner | AdmissionStatus::Member => {
             bail!("this key is already a member of the room; use `riverctl message send`")
@@ -330,7 +330,7 @@ pub fn build_join(
     );
     // Taken after the proof solve, which can run for minutes: a message
     // stamped before it would be older than the work that admits it.
-    let message_time = SystemTime::now();
+    let message_time = crate::signed_time::now();
     let message = AuthorizedMessageV1::new(
         MessageV1 {
             room_owner: MemberId::from(owner_key),

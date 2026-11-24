@@ -4813,3 +4813,12 @@ fn a_ban_names_no_member_in_any_debug_output() {
         }
     }
 }
+
+#[test]
+fn every_time_the_outbox_stamps_is_a_whole_millisecond() {
+    // A clock with a nanosecond field a Windows decode would change (freenet/river#971).
+    let awkward = || SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789);
+    let ob = Outbox::with_clock(Box::new(awkward));
+    let d = ob.now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
+    assert_eq!(d, Duration::new(1_700_000_000, 123_000_000));
+}

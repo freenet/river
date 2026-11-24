@@ -2208,7 +2208,7 @@ fn take_state(t: &mut Task, state: &ChatRoomStateV1) -> bool {
                 );
                 return true;
             };
-            match create::join(invitation, &nick, state, key, SystemTime::now()) {
+            match create::join(invitation, &nick, state, key, crate::signed_time::now()) {
                 Ok(p) => {
                     // Kept in the task before it is judged, so a plan that is refused is wiped
                     // with the task's credential.

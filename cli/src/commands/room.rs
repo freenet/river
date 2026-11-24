@@ -345,7 +345,7 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
                         &river_core::room_state::ChatRoomParametersV1 { owner: owner_key },
                         &sk.verifying_key(),
                         stored.as_ref(),
-                        std::time::SystemTime::now(),
+                        crate::signed_time::now(),
                     ))
                 }
                 None => None,

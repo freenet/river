@@ -246,6 +246,7 @@ pub fn banned_and_gone(room: &LiveRoom, target: MemberId) -> bool {
 /// as it is now. Refuses what the web UI's Ban button would not offer, and what this app cannot
 /// finish (a private room's rotation by anyone but the owner).
 pub fn build(room: &LiveRoom, target: MemberId, time: SystemTime) -> Result<Moderation, String> {
+    let time = crate::signed_time::whole_millis(time);
     participation(room).map_err(|b| b.reason().to_owned())?;
     let sk = room
         .stored
@@ -354,7 +355,7 @@ pub fn preview(room: &LiveRoom, target: MemberId) -> BanPreview {
     let ban = AuthorizedUserBan::new(
         UserBan {
             owner_member_id: MemberId::from(&room.stored.owner_vk),
-            banned_at: SystemTime::now(),
+            banned_at: crate::signed_time::now(),
             banned_user: target,
         },
         me,
@@ -475,6 +476,7 @@ pub const NOT_OWNER: &str = "Only the room's owner can rotate its secret.";
 /// The owner's "Rotate": the next secret version for everyone the room still holds, in a private
 /// room, with no ban (the web UI's Rotate button).
 pub fn build_rotation(room: &LiveRoom, time: SystemTime) -> Result<Moderation, String> {
+    let time = crate::signed_time::whole_millis(time);
     participation(room).map_err(|b| b.reason().to_owned())?;
     let sk = room
         .stored
