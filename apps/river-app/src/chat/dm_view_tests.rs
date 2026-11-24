@@ -123,6 +123,13 @@ pub(super) fn peer_key() -> String {
     dm::peer_key(id(PEER))
 }
 
+/// Make the fixture's peer a member of the open room, so a thread with them has a box that takes
+/// text (without it the box is read-only and says the person is not a member).
+pub(super) fn make_peer_a_member(rt: &mut Runtime<RiverApp>) {
+    let peer: i64 = peer_key().parse().unwrap();
+    rt.update(move |s, _| s.chat.room_mut().unwrap().members[1].full_id = peer);
+}
+
 pub(super) fn app() -> Runtime<RiverApp> {
     let mut state = RiverApp::detached();
     state.setup = Setup::Connected {

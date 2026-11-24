@@ -776,10 +776,13 @@ impl Chat {
         self.composer.focused = false;
         self.dm.open = Some((room.to_owned(), uid.to_owned()));
         self.dm.at_bottom = true;
-        // The thread's own box takes the keyboard, with the draft it kept.
+        // The thread's own box takes the keyboard, with the draft it kept, if it can take text.
+        // A box that cannot (the peer left the room) has no edit handler, so rune could never
+        // clear the flag again: a click in the thread would leave it focused (#1022).
         let open = self.dm.open.clone();
         self.dm.compose.tidy(open.as_ref());
-        self.dm.compose_edit().focused = true;
+        let can_type = self.dm_block().is_none();
+        self.dm.compose_edit().focused = can_type;
         true
     }
 
