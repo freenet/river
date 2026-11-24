@@ -6495,120 +6495,23 @@ impl ApiClient {
         let my_member_id: MemberId = signing_key.verifying_key().into();
         let owner_member_id: MemberId = room_owner_key.into();
 
-        // Resolve the member to ban via the same shared resolver the deputy
-        // commands use: a full base58 verifying key (from `member list`) matches
-        // its exact derived id, anything else the 8-char short ID (prefix /
-        // first-8, first-match). No deputy fallback for a ban target.
-        let key_target = crate::deputies::member_id_from_key_input(member_id_short);
-        let banned_member_id = resolve_deputy_target(
-            &member_infos_of_present_members(&room_state),
-            &[],
+        let banned_member_id = ban_preflight(
+            &room_state,
+            my_member_id,
+            owner_member_id,
             member_id_short,
-            false,
-        )
-        .ok_or_else(|| {
-            anyhow!(
-                "Member '{}' not found. Use 'member list' to see member IDs.",
-                member_id_short
-            )
-        })?;
-
-        // A full-key input already names the exact member, so it satisfies the
-        // require-exact preflight by construction; only a short-id input can be
-        // a non-exact (prefix) match that this guard must reject.
-        if safety.require_exact_member_id
-            && key_target.is_none()
-            && banned_member_id.to_string() != member_id_short
-        {
-            return Err(anyhow!(
-                "Safety preflight refused: '{}' is not the exact current member ID '{}'.",
-                member_id_short,
-                banned_member_id
-            ));
-        }
-
-        if safety.require_no_descendants {
-            let removal = crate::deputies::ban_removal_set(&room_state, banned_member_id);
-            if removal.len() != 1 {
-                return Err(anyhow!(
-                    "Safety preflight refused: banning '{}' would remove {} descendants.",
-                    banned_member_id,
-                    removal.len().saturating_sub(1)
-                ));
-            }
-        }
-
-        if safety.require_not_deputy {
-            let is_deputy =
-                is_deputy_of_a_present_appointer(&room_state, owner_member_id, banned_member_id);
-            if is_deputy {
-                return Err(anyhow!(
-                    "Safety preflight refused: member '{}' is a deputy.",
-                    banned_member_id
-                ));
-            }
-        }
-
-        // Prevent banning yourself out of the room, directly or transitively
-        // (freenet/river#478). ONE rule: refuse when the ban's cascade would
-        // remove US — the target being self, or the target being one of our own
-        // invite ancestors, whose invite subtree contains us. Since
-        // freenet/river#702 the contract voids such a ban, so this only spares
-        // the user a ban that would do nothing.
-        if let Some(reason) =
-            crate::deputies::self_removing_ban_reason(&room_state, my_member_id, banned_member_id)
-        {
-            return Err(anyhow!(reason));
-        }
-
-        // Prevent banning the room owner
-        if banned_member_id == owner_member_id {
-            return Err(anyhow!("Cannot ban the room owner"));
-        }
-
-        // Verify authorization using the SAME predicates the contract
-        // enforces: `is_ban_authorized` (owner OR strict-ancestor-of-target OR
-        // owner-appointed global moderator OR deputy-of-an-ancestor, #410) and
-        // `issuer_within_depth_cap` (cleanup drops a ban whose issuer is
-        // deeper in the invite tree than the ban evidence depth cap), so a ban
-        // the contract would ignore is refused here instead of being signed.
-        if my_member_id != owner_member_id {
-            let members_by_id = room_state.members.members_by_member_id();
-            let authorized = river_core::room_state::member::MembersV1::is_ban_authorized(
-                my_member_id,
-                banned_member_id,
-                &members_by_id,
-                &room_state.member_info,
-                owner_member_id,
-            );
-            if !authorized {
-                return Err(anyhow!(
-                    "Not authorized to ban this member. You can ban members you invited \
-                     (directly or indirectly), or members within a subtree you have been \
-                     deputized over."
-                ));
-            }
-            if let Some(reason) = ban_depth_refusal(&room_state, my_member_id, owner_member_id) {
-                return Err(anyhow!(reason));
-            }
-        }
+            safety,
+        )?;
 
         info!("Banning member with ID: {}", banned_member_id.to_string());
 
-        // Create the ban
-        let user_ban = UserBan {
+        let delta = user_ban_delta(
             owner_member_id,
-            banned_at: crate::signed_time::now(),
-            banned_user: banned_member_id,
-        };
-
-        let authorized_ban = AuthorizedUserBan::new(user_ban, my_member_id, &signing_key);
-
-        // Create delta with just the ban
-        let delta = ChatRoomStateV1Delta {
-            bans: Some(vec![authorized_ban.clone()]),
-            ..Default::default()
-        };
+            my_member_id,
+            &signing_key,
+            banned_member_id,
+            crate::signed_time::now(),
+        );
 
         // Serialize the delta
         let delta_bytes = {
@@ -7224,6 +7127,191 @@ fn member_infos_of_present_members(room_state: &ChatRoomStateV1) -> Vec<Authoriz
         })
         .cloned()
         .collect()
+}
+
+/// Every check `member ban` makes against a fresh room state before it signs
+/// anything, and the target it resolves. Pure, so both target kinds (a present
+/// member and a provisional, proof-of-work admitted one) are tested without a
+/// node. Returns the member id to ban.
+fn ban_preflight(
+    room_state: &ChatRoomStateV1,
+    me: MemberId,
+    owner_id: MemberId,
+    member_id_short: &str,
+    safety: BanSafety,
+) -> Result<MemberId> {
+    // Resolve the member to ban via the same shared resolver the deputy
+    // commands use: a full base58 verifying key (from `member list`) matches
+    // its exact derived id, anything else the 8-char short ID (prefix /
+    // first-8, first-match). No deputy fallback for a ban target.
+    let key_target = crate::deputies::member_id_from_key_input(member_id_short);
+    // A provisional (proof-of-work admitted) member is not in `members`, so
+    // the present-member resolver cannot see them; fall back to the
+    // provisional entries (short id or full key). A present member wins.
+    let present_target = resolve_deputy_target(
+        &member_infos_of_present_members(room_state),
+        &[],
+        member_id_short,
+        false,
+    );
+    let provisional_only = present_target.is_none();
+    let banned_member_id = present_target
+        .or_else(|| resolve_provisional_target(room_state, member_id_short))
+        .ok_or_else(|| {
+            anyhow!(
+                "Member '{}' not found. Use 'member list' to see member IDs.",
+                member_id_short
+            )
+        })?;
+
+    // A full-key input already names the exact member, so it satisfies the
+    // require-exact preflight by construction; only a short-id input can be
+    // a non-exact (prefix) match that this guard must reject.
+    if safety.require_exact_member_id
+        && key_target.is_none()
+        && banned_member_id.to_string() != member_id_short
+    {
+        return Err(anyhow!(
+            "Safety preflight refused: '{}' is not the exact current member ID '{}'.",
+            member_id_short,
+            banned_member_id
+        ));
+    }
+
+    // A provisional member has no inviter and no descendants and cannot be
+    // a deputy, so these two preflights hold vacuously for them.
+    if safety.require_no_descendants && !provisional_only {
+        let removal = crate::deputies::ban_removal_set(room_state, banned_member_id);
+        if removal.len() != 1 {
+            return Err(anyhow!(
+                "Safety preflight refused: banning '{}' would remove {} descendants.",
+                banned_member_id,
+                removal.len().saturating_sub(1)
+            ));
+        }
+    }
+
+    if safety.require_not_deputy && !provisional_only {
+        let is_deputy = is_deputy_of_a_present_appointer(room_state, owner_id, banned_member_id);
+        if is_deputy {
+            return Err(anyhow!(
+                "Safety preflight refused: member '{}' is a deputy.",
+                banned_member_id
+            ));
+        }
+    }
+
+    // Prevent banning yourself out of the room, directly or transitively
+    // (freenet/river#478). ONE rule: refuse when the ban's cascade would
+    // remove US — the target being self, or the target being one of our own
+    // invite ancestors, whose invite subtree contains us. Since
+    // freenet/river#702 the contract voids such a ban, so this only spares
+    // the user a ban that would do nothing.
+    if let Some(reason) =
+        crate::deputies::self_removing_ban_reason(room_state, me, banned_member_id)
+    {
+        return Err(anyhow!(reason));
+    }
+
+    // Prevent banning the room owner
+    if banned_member_id == owner_id {
+        return Err(anyhow!("Cannot ban the room owner"));
+    }
+
+    // A ban on a provisional id takes effect only from the owner or an
+    // owner deputy (the contract drops any other issuer's ban), so refuse
+    // here rather than sign a ban that does nothing.
+    if provisional_only && !is_owner_or_owner_deputy(room_state, me, owner_id) {
+        return Err(anyhow!(
+            "Not authorized to ban a provisional member. Only the room owner or a deputy \
+             of the owner can ban someone admitted by proof-of-work."
+        ));
+    }
+
+    // Verify authorization using the SAME predicates the contract
+    // enforces: `is_ban_authorized` (owner OR strict-ancestor-of-target OR
+    // owner-appointed global moderator OR deputy-of-an-ancestor, #410) and
+    // `issuer_within_depth_cap` (cleanup drops a ban whose issuer is
+    // deeper in the invite tree than the ban evidence depth cap), so a ban
+    // the contract would ignore is refused here instead of being signed.
+    if me != owner_id && !provisional_only {
+        let members_by_id = room_state.members.members_by_member_id();
+        let authorized = river_core::room_state::member::MembersV1::is_ban_authorized(
+            me,
+            banned_member_id,
+            &members_by_id,
+            &room_state.member_info,
+            owner_id,
+        );
+        if !authorized {
+            return Err(anyhow!(
+                "Not authorized to ban this member. You can ban members you invited \
+                 (directly or indirectly), or members within a subtree you have been \
+                 deputized over."
+            ));
+        }
+    }
+
+    // The contract drops a ban whose issuer is deeper than the evidence
+    // depth cap, whatever the target (a provisional target included), so
+    // refuse here instead of reporting success for a ban that never lands.
+    if me != owner_id {
+        if let Some(reason) = ban_depth_refusal(room_state, me, owner_id) {
+            return Err(anyhow!(reason));
+        }
+    }
+    Ok(banned_member_id)
+}
+
+/// The signed delta `member ban` sends: one `UserBan` and nothing else. A
+/// provisional-only target gets the same ban, not an entry in the provisional
+/// ban list: that list is capped (`max_provisional_bans`), so an old ban falls
+/// off it and the key can rejoin, while a `UserBan` does not.
+fn user_ban_delta(
+    owner_member_id: MemberId,
+    banner: MemberId,
+    signing_key: &SigningKey,
+    target: MemberId,
+    at: std::time::SystemTime,
+) -> ChatRoomStateV1Delta {
+    let user_ban = UserBan {
+        owner_member_id,
+        banned_at: at,
+        banned_user: target,
+    };
+    ChatRoomStateV1Delta {
+        bans: Some(vec![AuthorizedUserBan::new(user_ban, banner, signing_key)]),
+        ..Default::default()
+    }
+}
+
+/// Resolve a ban target among the provisional (proof-of-work admitted)
+/// entries, by full verifying key or by id prefix / first 8 characters, the
+/// same matching as [`resolve_deputy_target`].
+fn resolve_provisional_target(room_state: &ChatRoomStateV1, input: &str) -> Option<MemberId> {
+    let ids = || room_state.provisional.entries.iter().map(|e| e.member_id());
+    if let Some(target) = crate::deputies::member_id_from_key_input(input) {
+        return ids().any(|id| id == target).then_some(target);
+    }
+    if input.is_empty() {
+        return None;
+    }
+    ids().find(|id| {
+        let s = id.to_string();
+        s.starts_with(input) || s[..8.min(s.len())].eq_ignore_ascii_case(input)
+    })
+}
+
+/// Whether `me` is the room owner or a present member the owner has made a
+/// deputy: the issuers the contract honours for a ban on a provisional id.
+fn is_owner_or_owner_deputy(
+    room_state: &ChatRoomStateV1,
+    me: MemberId,
+    owner_id: MemberId,
+) -> bool {
+    me == owner_id
+        || (room_state.members.members_by_member_id().contains_key(&me)
+            && room_state.member_info.deputies_of(owner_id).contains(&me))
 }
 
 /// Resolve a `member set-deputy` / `revoke-deputy` short id to a full `MemberId`.
@@ -12775,7 +12863,7 @@ mod authorize_send_tests {
         let production = production_source(include_str!("api.rs"));
         let code = strip_comment_lines(&production.source);
         for signature in [
-            "pub async fn ban_member_with_safety(",
+            "fn ban_preflight(",
             "async fn update_own_deputies(",
             "pub(crate) fn resolve_outgoing_mentions(",
         ] {
@@ -14699,29 +14787,460 @@ mod ban_depth_refusal_tests {
         state.configuration.configuration.max_members = 3;
         assert!(ban_depth_refusal(&state, id(3), owner_id).is_some());
     }
-    /// The ban command asks `ban_depth_refusal` before it signs the ban, and
-    /// returns its reason as the error, so a member deeper than the cap is
-    /// refused rather than handed a ban the contract drops.
+    /// The ban command runs `ban_preflight`, which asks `ban_depth_refusal`
+    /// for any non-owner signer and returns its reason as the error, all
+    /// before the ban is signed, so a member deeper than the cap is refused
+    /// rather than handed a ban the contract drops.
     #[test]
     fn the_ban_command_checks_the_depth_cap_before_signing() {
         let src = include_str!("api.rs");
+        let strip = |text: &str| -> String {
+            text.lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
         let start = src
             .find("pub async fn ban_member_with_safety(")
             .expect("the ban command exists");
         let sign_at = start
             + src[start..]
-                .find("AuthorizedUserBan::new(")
+                .find("user_ban_delta(")
                 .expect("the ban command signs a ban");
-        let body: String = src[start..sign_at]
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
         assert!(
-            body.contains(
-                "if let Some(reason) = ban_depth_refusal(&room_state, my_member_id, owner_member_id)"
-            ) && body.contains("return Err(anyhow!(reason));"),
-            "the ban command must refuse with ban_depth_refusal's reason before signing"
+            strip(&src[start..sign_at]).contains("ban_preflight("),
+            "the ban command must run ban_preflight before signing"
         );
+        let pf = src
+            .find("\nfn ban_preflight(")
+            .expect("ban_preflight exists");
+        let pf_end = pf + src[pf..].find("\n}\n").unwrap();
+        let body = strip(&src[pf..pf_end]);
+        assert!(
+            body.contains("if me != owner_id {")
+                && body
+                    .contains("if let Some(reason) = ban_depth_refusal(room_state, me, owner_id)")
+                && body.contains("return Err(anyhow!(reason));"),
+            "ban_preflight must refuse a too-deep issuer for every target kind"
+        );
+    }
+}
+
+#[cfg(test)]
+mod provisional_ban_tests {
+    use super::*;
+    use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+    use river_core::room_state::member::{AuthorizedMember, Member, MembersDelta};
+    use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
+    use river_core::room_state::provisional::{
+        leading_zero_bits, pow_hash, AdmissionEvidence, AuthorizedProvisionalMember, PowPolicy,
+        ProvisionalDelta, ProvisionalMember, PublicRoomPolicy,
+    };
+    use river_core::room_state::ChatRoomParametersV1;
+
+    fn sk(n: u8) -> SigningKey {
+        SigningKey::from_bytes(&[n; 32])
+    }
+    fn id(k: &SigningKey) -> MemberId {
+        k.verifying_key().into()
+    }
+
+    /// A public room at 4 bits of work, with one invited member `m` and one
+    /// owner deputy `d`, then a provisional member admitted under `a`.
+    struct Fixture {
+        owner: SigningKey,
+        params: ChatRoomParametersV1,
+        state: ChatRoomStateV1,
+        m: SigningKey,
+        d: SigningKey,
+        a: SigningKey,
+    }
+
+    fn apply(f: &mut Fixture, delta: ChatRoomStateV1Delta) {
+        let mut next = f.state.clone();
+        next.apply_delta(&f.state.clone(), &f.params, &Some(delta))
+            .expect("delta applies");
+        f.state = next;
+    }
+
+    fn msg(
+        owner: &SigningKey,
+        k: &SigningKey,
+        t: u64,
+    ) -> river_core::room_state::message::AuthorizedMessageV1 {
+        river_core::room_state::message::AuthorizedMessageV1::new(
+            river_core::room_state::message::MessageV1 {
+                room_owner: id(owner),
+                author: id(k),
+                time: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000 + t),
+                content: river_core::room_state::message::RoomMessageBody::public("hi".to_string()),
+            },
+            k,
+        )
+    }
+
+    fn join_delta(f: &Fixture, k: &SigningKey) -> ChatRoomStateV1Delta {
+        let bits = 4u32;
+        let nonce = (0u64..)
+            .find(|n| {
+                leading_zero_bits(&pow_hash(&f.params.owner, &k.verifying_key(), 1, *n)) >= bits
+            })
+            .unwrap();
+        ChatRoomStateV1Delta {
+            provisional: Some(ProvisionalDelta {
+                entries: vec![AuthorizedProvisionalMember::new(
+                    &f.params.owner,
+                    ProvisionalMember {
+                        member_vk: k.verifying_key(),
+                        evidence: AdmissionEvidence::Pow { nonce },
+                    },
+                    k,
+                )],
+                bans: vec![],
+            }),
+            member_info: Some(vec![AuthorizedMemberInfo::new_with_member_key(
+                MemberInfo::new_public(id(k), 1, "Spammer".to_string()),
+                k,
+            )]),
+            // A provisional entry is held only with a recent message.
+            recent_messages: Some(vec![msg(&f.owner, k, 5)]),
+            ..Default::default()
+        }
+    }
+
+    fn fixture() -> Fixture {
+        let owner = sk(200);
+        let params = ChatRoomParametersV1 {
+            owner: owner.verifying_key(),
+        };
+        let config = Configuration {
+            owner_member_id: params.owner_id(),
+            max_recent_messages: 40,
+            max_members: 20,
+            public_admission: Some(PublicRoomPolicy {
+                listed: false,
+                max_provisional: 5,
+                max_provisional_messages: 20,
+                max_provisional_bans: 5,
+                pow: Some(PowPolicy {
+                    difficulty_bits: 4,
+                    epoch: 1,
+                }),
+            }),
+            ..Default::default()
+        };
+        let state = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(config, &owner),
+            ..Default::default()
+        };
+        let (m, d, a) = (sk(1), sk(2), sk(10));
+        let mut f = Fixture {
+            owner: owner.clone(),
+            params,
+            state,
+            m,
+            d,
+            a,
+        };
+        let invite = |k: &SigningKey| {
+            AuthorizedMember::new(
+                Member {
+                    owner_member_id: id(&owner),
+                    invited_by: id(&owner),
+                    member_vk: k.verifying_key(),
+                },
+                &owner,
+            )
+        };
+        let mut d_info = MemberInfo::new_public(id(&f.d), 1, "deputy".to_string());
+        d_info.deputies = vec![];
+        let mut owner_info = MemberInfo::new_public(id(&owner), 1, "owner".to_string());
+        owner_info.deputies = vec![id(&f.d)];
+        let delta = ChatRoomStateV1Delta {
+            members: Some(MembersDelta::new(vec![invite(&f.m), invite(&f.d)])),
+            member_info: Some(vec![
+                AuthorizedMemberInfo::new(owner_info, &owner),
+                AuthorizedMemberInfo::new_with_member_key(d_info, &f.d),
+                AuthorizedMemberInfo::new_with_member_key(
+                    MemberInfo::new_public(id(&f.m), 1, "member".to_string()),
+                    &f.m,
+                ),
+            ]),
+            // A bare invite is pruned for inactivity, so members post at once.
+            recent_messages: Some(vec![msg(&owner, &f.m, 1), msg(&owner, &f.d, 2)]),
+            ..Default::default()
+        };
+        apply(&mut f, delta);
+        let join = join_delta(&f, &f.a.clone());
+        apply(&mut f, join);
+        assert!(
+            f.state.provisional.entries.len() == 1,
+            "fixture admits a: members={} info={} msgs={}",
+            f.state.members.members.len(),
+            f.state.member_info.member_info.len(),
+            f.state.recent_messages.messages.len()
+        );
+        f
+    }
+
+    fn short(k: &SigningKey) -> String {
+        id(k).to_string()
+    }
+
+    #[test]
+    fn a_provisional_target_resolves_by_short_id_and_by_full_key_but_not_as_a_member() {
+        let f = fixture();
+        let a_id = id(&f.a);
+        // The present-member resolver cannot see it: this was the bug.
+        assert_eq!(
+            resolve_deputy_target(
+                &member_infos_of_present_members(&f.state),
+                &[],
+                &short(&f.a),
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_provisional_target(&f.state, &short(&f.a)),
+            Some(a_id)
+        );
+        assert_eq!(
+            resolve_provisional_target(&f.state, &short(&f.a)[..4]),
+            Some(a_id)
+        );
+        let full = bs58::encode(f.a.verifying_key().as_bytes()).into_string();
+        assert_eq!(resolve_provisional_target(&f.state, &full), Some(a_id));
+        assert_eq!(resolve_provisional_target(&f.state, &short(&f.m)), None);
+        assert_eq!(resolve_provisional_target(&f.state, ""), None);
+    }
+
+    #[test]
+    fn only_the_owner_or_an_owner_deputy_may_ban_a_provisional_member() {
+        let f = fixture();
+        let owner_id = id(&f.owner);
+        assert!(is_owner_or_owner_deputy(&f.state, owner_id, owner_id));
+        assert!(is_owner_or_owner_deputy(&f.state, id(&f.d), owner_id));
+        assert!(!is_owner_or_owner_deputy(&f.state, id(&f.m), owner_id));
+        assert!(!is_owner_or_owner_deputy(&f.state, id(&f.a), owner_id));
+    }
+
+    #[test]
+    fn the_owner_and_a_deputy_signed_user_ban_removes_the_entry_and_the_key_cannot_rejoin() {
+        for by_deputy in [false, true] {
+            let mut f = fixture();
+            let (banner, key) = if by_deputy {
+                (id(&f.d), f.d.clone())
+            } else {
+                (id(&f.owner), f.owner.clone())
+            };
+            let delta = user_ban_delta(
+                id(&f.owner),
+                banner,
+                &key,
+                id(&f.a),
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(9),
+            );
+            apply(&mut f, delta);
+            assert!(
+                f.state.provisional.entries.is_empty(),
+                "deputy={by_deputy}: entry removed"
+            );
+            let rejoin = join_delta(&f, &f.a.clone());
+            apply(&mut f, rejoin);
+            assert!(
+                f.state.provisional.entries.is_empty(),
+                "deputy={by_deputy}: the banned key cannot come back"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_deputy_members_user_ban_on_a_provisional_id_changes_nothing() {
+        let mut f = fixture();
+        let delta = user_ban_delta(
+            id(&f.owner),
+            id(&f.m),
+            &f.m.clone(),
+            id(&f.a),
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(9),
+        );
+        apply(&mut f, delta);
+        assert_eq!(f.state.provisional.entries.len(), 1, "inert: entry stays");
+    }
+
+    fn safety(exact: bool, desc: bool, dep: bool) -> BanSafety {
+        BanSafety {
+            require_exact_member_id: exact,
+            require_no_descendants: desc,
+            require_not_deputy: dep,
+        }
+    }
+
+    /// Add a chain of invited members below the owner, `depth` long, and return
+    /// the keys (first is invited by the owner). Pushed straight into state:
+    /// the preflight only reads it.
+    fn push_chain(f: &mut Fixture, seeds: &[u8]) -> Vec<SigningKey> {
+        let mut prev = f.owner.clone();
+        let mut keys = Vec::new();
+        for s in seeds {
+            let k = sk(*s);
+            f.state.members.members.push(AuthorizedMember::new(
+                Member {
+                    owner_member_id: id(&f.owner),
+                    invited_by: id(&prev),
+                    member_vk: k.verifying_key(),
+                },
+                &prev,
+            ));
+            f.state
+                .member_info
+                .member_info
+                .push(AuthorizedMemberInfo::new_with_member_key(
+                    MemberInfo::new_public(id(&k), 1, format!("c{s}")),
+                    &k,
+                ));
+            prev = k.clone();
+            keys.push(k);
+        }
+        keys
+    }
+
+    /// Make `k` an owner deputy by republishing the owner's record.
+    fn grant_owner_deputy(f: &mut Fixture, k: &SigningKey) {
+        let mut info = MemberInfo::new_public(id(&f.owner), 9, "owner".to_string());
+        info.deputies = vec![id(&f.d), id(k)];
+        f.state
+            .member_info
+            .member_info
+            .push(AuthorizedMemberInfo::new(info, &f.owner));
+    }
+
+    #[test]
+    fn preflight_resolves_both_target_kinds_for_the_owner() {
+        let f = fixture();
+        let owner_id = id(&f.owner);
+        let none = BanSafety::default();
+        assert_eq!(
+            ban_preflight(&f.state, owner_id, owner_id, &short(&f.a), none).unwrap(),
+            id(&f.a)
+        );
+        assert_eq!(
+            ban_preflight(&f.state, owner_id, owner_id, &short(&f.m), none).unwrap(),
+            id(&f.m)
+        );
+        assert!(ban_preflight(&f.state, owner_id, owner_id, "ZZZZZZZZ", none).is_err());
+    }
+
+    #[test]
+    fn the_require_flags_are_vacuous_for_a_provisional_target_and_enforced_for_members() {
+        let mut f = fixture();
+        let owner_id = id(&f.owner);
+        let all = safety(true, true, true);
+        // Provisional: all three hold (exact id given, no descendants, no deputy).
+        assert!(ban_preflight(&f.state, owner_id, owner_id, &short(&f.a), all).is_ok());
+        // A prefix is not an exact id, for either kind.
+        assert!(ban_preflight(
+            &f.state,
+            owner_id,
+            owner_id,
+            &short(&f.a)[..5],
+            safety(true, false, false)
+        )
+        .is_err());
+        // Members: a deputy is refused under require_not_deputy ...
+        assert!(ban_preflight(
+            &f.state,
+            owner_id,
+            owner_id,
+            &short(&f.d),
+            safety(false, false, true)
+        )
+        .is_err());
+        // ... and a member with descendants under require_no_descendants.
+        let chain = push_chain(&mut f, &[40, 41]);
+        let err = ban_preflight(
+            &f.state,
+            owner_id,
+            owner_id,
+            &short(&chain[0]),
+            safety(false, true, false),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("descendants"), "{err}");
+        // A leaf member passes.
+        assert!(ban_preflight(
+            &f.state,
+            owner_id,
+            owner_id,
+            &short(&chain[1]),
+            safety(true, true, true)
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_non_deputy_is_refused_for_a_provisional_target() {
+        let f = fixture();
+        let err = ban_preflight(
+            &f.state,
+            id(&f.m),
+            id(&f.owner),
+            &short(&f.a),
+            BanSafety::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("provisional"), "{err}");
+        // An owner deputy near the owner is accepted.
+        assert!(ban_preflight(
+            &f.state,
+            id(&f.d),
+            id(&f.owner),
+            &short(&f.a),
+            BanSafety::default()
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_deputy_beyond_the_depth_cap_is_refused_for_both_target_kinds() {
+        let mut f = fixture();
+        // Cap is min(max_members = 20, 4) = 4 invites below the owner; the
+        // sixth link in the chain is deeper than that.
+        let chain = push_chain(&mut f, &[50, 51, 52, 53, 54, 55]);
+        let deep = chain[5].clone();
+        grant_owner_deputy(&mut f, &deep);
+        let owner_id = id(&f.owner);
+        assert!(is_owner_or_owner_deputy(&f.state, id(&deep), owner_id));
+        let err = ban_preflight(
+            &f.state,
+            id(&deep),
+            owner_id,
+            &short(&f.a),
+            BanSafety::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("invites below the room owner"), "{err}");
+        // The member path was already refused; the same message.
+        let err = ban_preflight(
+            &f.state,
+            id(&deep),
+            owner_id,
+            &short(&f.m),
+            BanSafety::default(),
+        );
+        assert!(err.is_err());
+        // A shallow owner deputy (`d`) is fine, and so is the owner.
+        assert!(ban_preflight(
+            &f.state,
+            id(&f.d),
+            owner_id,
+            &short(&f.a),
+            BanSafety::default()
+        )
+        .is_ok());
     }
 }
