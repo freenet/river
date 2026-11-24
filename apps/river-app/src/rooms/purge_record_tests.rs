@@ -236,7 +236,7 @@ fn leaving_a_room_removes_its_entry_and_only_its_entry() {
 }
 
 #[test]
-fn a_dismissed_deletion_is_taken_back_and_an_empty_room_entry_goes() {
+fn the_tokens_of_a_refused_deletion_are_taken_back_and_an_empty_room_entry_goes() {
     let dir = dir("unrecord");
     let mut record = PurgeRecord::open(&dir);
     record.record(&owner(1), id(2), &[t(1), t(2)]).unwrap();
@@ -313,4 +313,78 @@ fn without_a_directory_the_record_is_kept_for_the_run_only() {
     assert_eq!(record.for_room(&owner(1)).unwrap().purged.len(), 1);
     record.forget(&owner(1)).unwrap();
     assert!(record.for_room(&owner(1)).is_none());
+}
+
+#[test]
+fn recording_says_which_tokens_it_newly_added() {
+    let dir = dir("added");
+    let mut record = PurgeRecord::open(&dir);
+    assert_eq!(
+        record
+            .record(&owner(1), id(2), &[t(2), t(1), t(1)])
+            .unwrap(),
+        vec![t(1), t(2)]
+    );
+    assert_eq!(
+        record.record(&owner(1), id(2), &[t(2), t(3)]).unwrap(),
+        vec![t(3)]
+    );
+    assert!(record.record(&owner(1), id(2), &[t(3)]).unwrap().is_empty());
+    // Another recipient's token is its own.
+    assert_eq!(
+        record.record(&owner(1), id(7), &[t(3)]).unwrap(),
+        vec![t(3)]
+    );
+}
+
+/// The lock cannot be taken (a directory stands where its file should be) while the record
+/// itself reads and writes: the change goes ahead unlocked, as the grant token's store does.
+#[test]
+fn a_lock_that_cannot_be_taken_does_not_stop_the_record() {
+    let dir = dir("lock-fails");
+    fs::create_dir_all(dir.join(format!(".{FILE_NAME}.lock"))).unwrap();
+    let mut record = PurgeRecord::open(&dir);
+    record.record(&owner(1), id(2), &[t(1)]).unwrap();
+    assert_eq!(
+        PurgeRecord::open(&dir).for_room(&owner(1)).unwrap().purged,
+        vec![(id(2), t(1))]
+    );
+}
+
+/// A lock another River holds is waited for a short while, then the change goes ahead.
+#[test]
+fn a_lock_that_stays_held_is_waited_for_only_a_short_while() {
+    let dir = dir("lock-held");
+    let held = lock_file(&dir.join(format!(".{FILE_NAME}.lock"))).unwrap();
+    held.lock().unwrap();
+    let mut record = PurgeRecord::open(&dir);
+    let start = std::time::Instant::now();
+    record.record(&owner(1), id(2), &[t(1)]).unwrap();
+    assert!(start.elapsed() < std::time::Duration::from_secs(10));
+    assert!(PurgeRecord::open(&dir).for_room(&owner(1)).is_some());
+    drop(held);
+}
+
+#[test]
+fn a_record_an_earlier_build_kept_in_the_node_directory_is_moved_in() {
+    let config = dir("absorb-config");
+    let node = dir("absorb-node");
+    PurgeRecord::open(&node)
+        .record(&owner(1), id(2), &[t(1)])
+        .unwrap();
+    let mut here = PurgeRecord::open(&config);
+    here.record(&owner(1), id(2), &[t(2)]).unwrap();
+    here.record(&owner(5), id(2), &[t(9)]).unwrap();
+    here.absorb(&node).unwrap();
+    let after = PurgeRecord::open(&config);
+    assert_eq!(
+        after.for_room(&owner(1)).unwrap().purged,
+        vec![(id(2), t(1)), (id(2), t(2))]
+    );
+    assert!(after.for_room(&owner(5)).is_some());
+    assert!(!node.join(FILE_NAME).exists());
+    // Nothing there, or the same directory: nothing happens.
+    here.absorb(&node).unwrap();
+    here.absorb(&config).unwrap();
+    assert!(config.join(FILE_NAME).exists());
 }

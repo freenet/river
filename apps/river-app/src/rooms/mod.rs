@@ -380,6 +380,19 @@ impl Link {
                 let token_dir = inner.config_dir.as_deref().map(|d| {
                     token::node_dir(d, &authority, inner.explicit.load(Ordering::Acquire))
                 });
+                // This device's record of the deletions it sent lives in the app's config
+                // directory, whatever node River follows: a record kept per node would split
+                // when the node changes. One an earlier build put in the node's directory is
+                // moved in.
+                outbox.keep_purge_record_in(inner.config_dir.as_deref());
+                if let Some(td) = token_dir.as_deref()
+                    && let Err(e) = outbox.absorb_purge_record(td)
+                {
+                    crate::diag!(
+                        "River: an earlier record of your deletions was not moved: {}",
+                        crate::diag::scrub(&e)
+                    );
+                }
                 session::run(
                     &authority,
                     token_dir.as_deref(),

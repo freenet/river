@@ -53,6 +53,9 @@ use super::token::{create_private_dir, lock_file, private_file, sync_dir};
 
 const FILE_NAME: &str = "own-purges.json";
 
+/// How long a change waits for another River's hold on the record.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// What the file holds.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Book {
@@ -124,27 +127,35 @@ impl PurgeRecord {
         self.book.rooms.get(&room_key(owner))
     }
 
-    /// Record that the user deleted `tokens`, signed as `me`, in `owner`'s room. Returns after
-    /// the record is on disk; on an error nothing was recorded.
+    /// Record that the user deleted `tokens`, signed as `me`, in `owner`'s room. Returns the
+    /// tokens this call newly added (the others were recorded already, by an earlier deletion),
+    /// after the record is on disk; on an error nothing was recorded.
     pub fn record(
         &mut self,
         owner: &VerifyingKey,
         me: MemberId,
         tokens: &[PurgeToken],
-    ) -> Result<(), String> {
+    ) -> Result<Vec<PurgeToken>, String> {
         let key = room_key(owner);
         let tokens = tokens.to_vec();
-        self.change(move |book| {
-            book.rooms
-                .entry(key)
-                .or_default()
-                .record(me, tokens.iter().copied());
+        let mut added = Vec::new();
+        self.change(|book| {
+            let own = book.rooms.entry(key).or_default();
+            added = tokens
+                .iter()
+                .copied()
+                .filter(|t| !own.purged.contains(&(me, *t)))
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            own.record(me, tokens.iter().copied());
             true
-        })
+        })?;
+        Ok(added)
     }
 
     /// Take back a record of `tokens` for a deletion the node refused when it went out once, so it
-    /// never took it. Only the outbox calls it, at the moment of the refusal.
+    /// never took it: the tokens that deletion newly added. Only the outbox calls it.
     pub fn unrecord(
         &mut self,
         owner: &VerifyingKey,
@@ -194,6 +205,27 @@ impl PurgeRecord {
         })
     }
 
+    /// Take in the record an earlier build kept in `other_dir` (the per-node grant directory,
+    /// where this record was first put): its rooms are unioned into this one and the file is
+    /// removed. Nothing happens when there is no such file or it is this record's own.
+    pub fn absorb(&mut self, other_dir: &Path) -> Result<(), String> {
+        let Some(path) = self.path.clone() else {
+            return Ok(());
+        };
+        let other = other_dir.join(FILE_NAME);
+        if other == path || !other.exists() {
+            return Ok(());
+        }
+        let (theirs, _) = read_book(&other)?;
+        self.change(move |book| {
+            for (room, own) in &theirs.rooms {
+                book.rooms.entry(room.clone()).or_default().union(own);
+            }
+            true
+        })?;
+        fs::remove_file(&other).map_err(|e| format!("couldn't remove {}: {e}", other.display()))
+    }
+
     /// Remove every room not in `keep` (rooms the user is no longer in, found at start and after
     /// a read of the stored rooms; an entry whose key does not read as a room goes too). One
     /// write, none when nothing goes.
@@ -233,10 +265,9 @@ impl PurgeRecord {
         let dir = path.parent().ok_or("bad record path")?.to_owned();
         create_private_dir(&dir).map_err(|e| format!("couldn't create {}: {e}", dir.display()))?;
         // Held across the read and the write, so two Rivers cannot lose each other's change.
-        let lock = lock_file(&dir.join(format!(".{FILE_NAME}.lock")))
-            .map_err(|e| format!("couldn't lock the record of your deletions: {e}"))?;
-        lock.lock()
-            .map_err(|e| format!("couldn't lock the record of your deletions: {e}"))?;
+        // Like the grant token's store: when the lock cannot be taken the change goes ahead
+        // unlocked, and the lock is waited for only a short while.
+        let _lock = lock_with_timeout(&dir.join(format!(".{FILE_NAME}.lock")));
         let (mut book, corrupt) = read_book(&path)?;
         if corrupt {
             // The file was not a record and was moved aside: what this run knows is kept and
@@ -255,6 +286,34 @@ impl PurgeRecord {
         self.book = book;
         self.rev += 1;
         Ok(())
+    }
+}
+
+/// An exclusive advisory lock on the record, released when dropped. `None` (said once in the log)
+/// when it cannot be had within [`LOCK_WAIT`]: the caller goes ahead unlocked.
+fn lock_with_timeout(path: &Path) -> Option<fs::File> {
+    let file = match lock_file(path) {
+        Ok(f) => f,
+        Err(e) => {
+            crate::diag!(
+                "River: the record of your deletions is not locked: {}",
+                crate::diag::scrub(e.to_string())
+            );
+            return None;
+        }
+    };
+    let start = std::time::Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Some(file),
+            Err(fs::TryLockError::WouldBlock) if start.elapsed() < LOCK_WAIT => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(_) => {
+                crate::diag!("River: the record of your deletions could not be locked in time");
+                return None;
+            }
+        }
     }
 }
 

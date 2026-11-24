@@ -1325,6 +1325,16 @@ impl Work {
         out
     }
 
+    /// The rooms with a leave queued, under way or finished and not yet read back: the user is
+    /// leaving them, and has not necessarily left (a leave that fails brings the room back).
+    pub fn leaving_rooms(&self) -> Vec<VerifyingKey> {
+        self.tasks
+            .iter()
+            .filter(|t| t.is_leave() && t.failed.is_none())
+            .filter_map(Task::owner)
+            .collect()
+    }
+
     /// The rooms whose leave finished since the last call, each once. A leave that failed is
     /// not here, and a leave tried again is reported again when it ends well.
     pub fn take_done_leaves(&mut self) -> Vec<VerifyingKey> {

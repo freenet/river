@@ -59,8 +59,8 @@ use super::room::LiveRoom;
 /// of the user may have deleted recently (the room keeps one list per person, and this copy may
 /// lag the node), or the user may no longer be listed as a member.
 pub const NOT_KEPT: &str = "The room didn't keep this deletion. Another device of yours may have \
-     deleted messages recently, or you may no longer be listed as a member. Retry to \
-     delete again.";
+     deleted messages at the same moment, or you may no longer be listed as a member. If \
+     another device won, River signs this deletion again by itself; Retry tries it now.";
 
 /// Why a deletion was refused before anything was queued. The words never name a message.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -119,6 +119,12 @@ pub struct Work {
     /// [`heal`]), not a deletion the user just asked for. `tokens` are the ones it restores,
     /// whose messages may be gone from this copy already.
     pub heal: bool,
+    /// Whether this deletion is in the record of deletions ([`super::purge_record`]): set as it
+    /// first goes out, cleared when the record is taken back.
+    pub recorded: bool,
+    /// The tokens its recording newly added; a refusal takes back only these, since the others
+    /// were recorded by an earlier deletion that the node may have taken.
+    pub added: Vec<PurgeToken>,
 }
 
 impl std::fmt::Debug for Work {
@@ -331,6 +337,8 @@ pub fn prepare(room: &LiveRoom, peer: MemberId, wanted: &[PurgeToken]) -> Result
         tokens,
         peer,
         heal: false,
+        recorded: false,
+        added: Vec::new(),
     })
 }
 
@@ -376,6 +384,8 @@ pub fn refresh(room: &LiveRoom, work: &Work) -> Result<Option<Work>, Refusal> {
         tokens,
         peer: work.peer,
         heal: false,
+        recorded: work.recorded,
+        added: work.added.clone(),
     }))
 }
 
@@ -411,6 +421,8 @@ pub fn heal(
         tokens,
         peer: me,
         heal: true,
+        recorded: false,
+        added: Vec::new(),
     };
     Some(applied(room, &work.envelope, &work.tokens).map(|_| work))
 }
@@ -452,6 +464,8 @@ fn refresh_heal(room: &LiveRoom, work: &Work) -> Result<Option<Work>, Refusal> {
         tokens,
         peer: work.peer,
         heal: true,
+        recorded: false,
+        added: Vec::new(),
     }))
 }
 

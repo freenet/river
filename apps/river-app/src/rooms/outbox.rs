@@ -1883,6 +1883,15 @@ impl Entry {
         super::dm_send::applied(room, dm).err()
     }
 
+    /// `why`, with a word that a deletion sent before may still be signed again by River.
+    fn with_sent_note(&self, why: &str) -> String {
+        if self.sent && self.purge.as_ref().is_some_and(|w| !w.heal) {
+            format!("{why} This deletion was sent before, so River may still sign it again.")
+        } else {
+            why.to_owned()
+        }
+    }
+
     /// Whether it carries anything to publish.
     fn has_payload(&self) -> bool {
         !self.messages.is_empty()
@@ -1959,9 +1968,10 @@ pub(super) struct Outbox {
     /// the node may have taken an earlier copy, so a refusal of a later one is not proof that
     /// the deletion never happened.
     resent: HashSet<u64>,
-    /// Tokens whose record could not be taken back after the node refused their deletion
-    /// (the storage failed): kept out of re-signing for this run.
-    abandoned: HashSet<(VerifyingKey, MemberId, PurgeToken)>,
+    /// Take-backs of the record that failed after the node refused a deletion (the storage
+    /// failed): entry, room, recipient and tokens. Tried again by [`Outbox::retry_takebacks`];
+    /// meanwhile the tokens are kept out of re-signing.
+    takeback_owed: Vec<(u64, VerifyingKey, MemberId, Vec<PurgeToken>)>,
 }
 
 impl Default for Outbox {
@@ -1979,7 +1989,7 @@ impl Default for Outbox {
             preview_cache: Default::default(),
             purge_record: Default::default(),
             resent: HashSet::new(),
-            abandoned: HashSet::new(),
+            takeback_owed: Vec::new(),
         }
     }
 }
@@ -2591,6 +2601,11 @@ impl Outbox {
         }
     }
 
+    /// Take in the record an earlier build kept in `dir`.
+    pub fn absorb_purge_record(&mut self, dir: &std::path::Path) -> Result<(), String> {
+        self.purge_record.absorb(dir)
+    }
+
     /// This device's record of the deletions it sent.
     pub fn purge_record(&self) -> &super::purge_record::PurgeRecord {
         &self.purge_record
@@ -2636,23 +2651,17 @@ impl Outbox {
         before - self.entries.len()
     }
 
-    /// How many tokens are kept out of re-signing ([`Outbox::without_abandoned`]).
-    pub fn abandoned_count(&self) -> usize {
-        self.abandoned.len()
-    }
-
-    /// `own` without the tokens whose deletion the node refused and whose record could not be
-    /// taken back.
+    /// `own` without the tokens of a refused deletion whose record could not be taken back yet.
     pub fn without_abandoned(
         &self,
         room: &VerifyingKey,
         own: &mut river_core::own_purges::OwnPurges,
     ) {
-        if self.abandoned.is_empty() {
-            return;
+        for (_, vk, me, tokens) in &self.takeback_owed {
+            if vk == room {
+                own.purged.retain(|(r, t)| !(r == me && tokens.contains(t)));
+            }
         }
-        own.purged
-            .retain(|(r, t)| !self.abandoned.contains(&(*room, *r, *t)));
     }
 
     /// Queue the re-signed envelope `work` ([`super::dm_purge::heal`]) for `room`.
@@ -2992,6 +3001,12 @@ impl Outbox {
         if !entry.retryable() {
             return false;
         }
+        // Tried again: an owed take-back of its record is no longer owed, and one the node took
+        // (shown as not kept) may be taken already, so a refusal of this try proves nothing.
+        self.takeback_owed.retain(|o| o.0 != id);
+        if matches!(entry.status, Status::Unconfirmed(_)) {
+            self.resent.insert(id);
+        }
         match &entry.status {
             // Unanswered: the same messages again, which the node may already hold, and only
             // on a new connection. On this one its answer is still owed, and a second copy
@@ -3074,7 +3089,7 @@ impl Outbox {
                 continue;
             }
             if entry.author.is_some() && entry.author != me {
-                entry.status = Status::Failed(IDENTITY_CHANGED.into());
+                entry.status = Status::Failed(entry.with_sent_note(IDENTITY_CHANGED));
                 *changed = true;
                 continue;
             }
@@ -3165,27 +3180,36 @@ impl Outbox {
                     }
                 }
             }
-            // A deletion is recorded before it first goes out, so a crash after it is sent
-            // cannot lose the record that lets a lost race be signed again. A record that
-            // cannot be kept stops the deletion: sent unrecorded, it could come back unrepaired.
-            if !entry.sent
-                && let Some(work) = &entry.purge
+            // A deletion is recorded before it first goes out (and again when one whose record
+            // was taken back is tried again), so a crash after it is sent cannot lose the record
+            // that lets a lost race be signed again. A record that cannot be kept stops the
+            // deletion: sent unrecorded, it could come back unrepaired.
+            if let Some(work) = &mut entry.purge
                 && !work.heal
-                && let Err(e) =
-                    self.purge_record
-                        .record(&vk, work.envelope.recipient_id, &work.tokens)
+                && !work.recorded
             {
-                crate::diag!(
-                    "River: a deletion was not sent, its record was not saved: {}",
-                    crate::diag::scrub(&e)
-                );
-                entry.status = Status::Failed(format!(
-                    "The deletion was not sent: this computer could not save the record that \
-                     lets River sign it again if another device of yours deletes at the same \
-                     moment. {e}"
-                ));
-                *changed = true;
-                continue;
+                match self
+                    .purge_record
+                    .record(&vk, work.envelope.recipient_id, &work.tokens)
+                {
+                    Ok(added) => {
+                        work.recorded = true;
+                        work.added = added;
+                    }
+                    Err(e) => {
+                        crate::diag!(
+                            "River: a deletion was not sent, its record was not saved: {}",
+                            crate::diag::scrub(&e)
+                        );
+                        entry.status = Status::Failed(format!(
+                            "The deletion was not sent: this computer could not save the record \
+                             that lets River sign it again if another device of yours deletes at \
+                             the same moment. {e}"
+                        ));
+                        *changed = true;
+                        continue;
+                    }
+                }
             }
             if entry.sent {
                 self.resent.insert(entry.id);
@@ -3208,7 +3232,7 @@ impl Outbox {
         let mut changed = false;
         for entry in &mut self.entries {
             if entry.status == Status::Queued {
-                entry.status = Status::Failed(why.to_owned());
+                entry.status = Status::Failed(entry.with_sent_note(why));
                 changed = true;
             }
         }
@@ -3364,31 +3388,60 @@ impl Outbox {
     }
 
     /// The node refused entry `i`, a deletion: when it went out only once, the node never took
-    /// it, so its tokens are taken back out of the record (it is no longer one to sign again).
-    /// This is the only place a record is taken back. When that fails, the tokens stay out of
-    /// re-signing for this run and the failure is shown with the entry.
+    /// it, so the tokens its recording newly added are taken back out of the record (it is no
+    /// longer one to sign again). This is the only place a record is taken back. When that
+    /// fails, the take-back is owed ([`Outbox::retry_takebacks`]) and the failure is shown.
     fn take_back_refused_purge(&mut self, i: usize) {
-        let entry = &self.entries[i];
-        let Some(work) = entry.purge.clone().filter(|w| !w.heal) else {
+        let entry = &mut self.entries[i];
+        let Some(work) = entry.purge.as_mut().filter(|w| !w.heal && w.recorded) else {
             return;
         };
         if self.resent.contains(&entry.id) {
             return;
         }
-        let (vk, me) = (entry.room, work.envelope.recipient_id);
-        if let Err(e) = self.purge_record.unrecord(&vk, me, &work.tokens) {
-            crate::diag!(
-                "River: a refused deletion stays recorded: {}",
-                crate::diag::scrub(&e)
-            );
-            self.abandoned
-                .extend(work.tokens.iter().map(|t| (vk, me, *t)));
-            if let Status::Failed(why) = &mut self.entries[i].status {
-                why.push_str(&format!(
-                    " This computer could not update its record of your deletions: {e}"
-                ));
+        let (id, vk, me) = (entry.id, entry.room, work.envelope.recipient_id);
+        let added = std::mem::take(&mut work.added);
+        match self.purge_record.unrecord(&vk, me, &added) {
+            Ok(()) => work.recorded = false,
+            Err(e) => {
+                crate::diag!(
+                    "River: a refused deletion stays recorded for now: {}",
+                    crate::diag::scrub(&e)
+                );
+                self.takeback_owed.push((id, vk, me, added));
+                if let Status::Failed(why) = &mut entry.status {
+                    why.push_str(&format!(
+                        " This computer could not update its record of your deletions yet: {e}"
+                    ));
+                }
             }
         }
+    }
+
+    /// Try again the take-backs that failed. True when any is still owed.
+    pub fn retry_takebacks(&mut self) -> bool {
+        for (id, vk, me, added) in std::mem::take(&mut self.takeback_owed) {
+            match self.purge_record.unrecord(&vk, me, &added) {
+                Ok(()) => {
+                    if let Some(work) = self
+                        .entries
+                        .iter_mut()
+                        .find(|e| e.id == id)
+                        .and_then(|e| e.purge.as_mut())
+                    {
+                        work.recorded = false;
+                    }
+                }
+                Err(e) => {
+                    crate::diag!(
+                        "River: a refused deletion stays recorded for now: {}",
+                        crate::diag::scrub(&e)
+                    );
+                    self.takeback_owed.push((id, vk, me, added));
+                }
+            }
+        }
+        !self.takeback_owed.is_empty()
     }
 
     /// Updates unanswered for `wait` by `now` are shown as not confirmed (their room still
@@ -3872,7 +3925,7 @@ fn rebuild(entry: &mut Entry, room: &LiveRoom, fresh_version: Option<u32>, ctx: 
             return;
         };
         if entry.author.is_some() && entry.author != room.stored.self_verifying_key() {
-            entry.status = Status::Failed(IDENTITY_CHANGED.into());
+            entry.status = Status::Failed(entry.with_sent_note(IDENTITY_CHANGED));
             return;
         }
         match super::dm_purge::refresh(room, &work) {

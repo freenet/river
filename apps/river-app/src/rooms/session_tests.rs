@@ -11055,7 +11055,16 @@ fn leaving_a_room_removes_its_record_of_deletions() {
         .unwrap();
     drop(record);
 
-    let session = Running::start(&node, &dir, quick());
+    // The link opens the record in the config directory before a session starts.
+    let mut outbox = Outbox::default();
+    outbox.keep_purge_record_in(Some(&dir));
+    let session = Running::start_with(
+        &node,
+        &dir,
+        quick(),
+        Arc::new(Mutex::new(outbox)),
+        std::sync::mpsc::channel(),
+    );
     session.wait_rooms("the rooms are live", |r, _, s| {
         r.len() == 2 && s == LinkStatus::Live
     });

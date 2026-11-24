@@ -491,8 +491,6 @@ pub(super) fn run(
         },
         outbox,
     };
-    // This device's record of the deletions it sent lives in the config directory.
-    kept.rooms.outbox.keep_purge_record_in(config_dir);
     run_with(
         authority,
         config_dir,
@@ -2072,6 +2070,11 @@ struct Rooms {
     purge_tick_seen: HashMap<VerifyingKey, u64>,
     /// Rooms whose record is to be removed (the user left): retried until it is.
     purge_forget_owed: HashSet<VerifyingKey>,
+    /// The rooms the last complete read of the stored rooms listed, with a room being left
+    /// still among them until a later read says it is gone.
+    stored_owners: HashSet<VerifyingKey>,
+    /// Failed storage work on the record of deletions waits until then to be tried again.
+    purge_retry_at: Option<Instant>,
     /// A message was sent into a thread this copy of the archive list does not hold: the stored
     /// rooms are read again once at the next tick, and at most once in [`REREAD_EVERY`].
     reread_after_send: bool,
@@ -2445,6 +2448,7 @@ impl Rooms {
         self.complete = !loaded.store_missing && loaded.listed > 0 && loaded.unreadable == 0;
         if self.complete {
             self.outbox.keep_rooms(&shown);
+            self.stored_owners = shown.clone();
         }
         for room in &mut self.list {
             self.outbox.reconcile(room);
@@ -3038,23 +3042,32 @@ impl Rooms {
     /// hold records trade a bounded number of envelopes. The queued envelope is an ordinary
     /// outbox entry, so it waits for the write gate ([`super::generation`]) like every write.
     fn own_purges_tick(&mut self) {
-        // A leave that finished: its record goes. One that could not be taken out is tried
-        // again at every tick until it is.
+        // A leave that finished: its record goes. Storage work that failed (this, and taking
+        // back the record of a refused deletion) is tried again every few seconds until it works.
         self.purge_forget_owed
             .extend(self.outbox.work.take_done_leaves());
-        let owed: Vec<VerifyingKey> = self.purge_forget_owed.iter().copied().collect();
-        for vk in owed {
-            self.healed_run.remove(&vk);
-            self.purge_tick_seen.remove(&vk);
-            match self.outbox.purge_record_mut().forget(&vk) {
-                Ok(()) => {
-                    self.purge_forget_owed.remove(&vk);
+        let now = Instant::now();
+        if self.purge_retry_at.is_none_or(|at| now >= at) {
+            let mut failed = false;
+            let owed: Vec<VerifyingKey> = self.purge_forget_owed.iter().copied().collect();
+            for vk in owed {
+                self.healed_run.remove(&vk);
+                self.purge_tick_seen.remove(&vk);
+                match self.outbox.purge_record_mut().forget(&vk) {
+                    Ok(()) => {
+                        self.purge_forget_owed.remove(&vk);
+                    }
+                    Err(e) => {
+                        failed = true;
+                        crate::diag!(
+                            "River: the record of a left room's deletions stays for now: {}",
+                            crate::diag::scrub(&e)
+                        );
+                    }
                 }
-                Err(e) => crate::diag!(
-                    "River: the record of a left room's deletions stays for now: {}",
-                    crate::diag::scrub(&e)
-                ),
             }
+            failed |= self.outbox.retry_takebacks();
+            self.purge_retry_at = failed.then(|| now + PURGE_STORAGE_RETRY);
         }
         // Re-signed envelopes that failed are background work and are never shown.
         let dropped = self.outbox.drop_failed_heals();
@@ -3062,9 +3075,13 @@ impl Rooms {
             crate::diag!("River: {dropped} re-signed deletion(s) were not kept and were dropped");
         }
         // After a read that listed every room, a room the user is no longer in loses its record
-        // (a leave whose cleanup was lost with a restart, or one that failed).
+        // (a leave whose cleanup was lost with a restart). Against the rooms that read listed,
+        // and those shown or being left now: a room whose leave has not finished is not gone,
+        // however the list looks (a leave that fails brings it back).
         if self.complete && self.loaded {
-            let keep: HashSet<VerifyingKey> = self.list.iter().map(|r| r.stored.owner_vk).collect();
+            let mut keep = self.stored_owners.clone();
+            keep.extend(self.list.iter().map(|r| r.stored.owner_vk));
+            keep.extend(self.outbox.work.leaving_rooms());
             if let Err(e) = self.outbox.purge_record_mut().retain_rooms(&keep) {
                 crate::diag!(
                     "River: records of rooms left were not removed: {}",
@@ -3085,9 +3102,14 @@ impl Rooms {
             {
                 continue;
             }
-            // Only when what it depends on changed: the held envelope, the members, the record.
+            // Only when what it depends on changed: the held envelope, the members, the room's
+            // configuration, the record. A room the user cannot write in is looked at again
+            // every tick, since what unblocks it (a key arriving) is not one of those.
             let seen = self.own_purges_fingerprint(room);
             if self.purge_tick_seen.get(&vk) == Some(&seen) {
+                continue;
+            }
+            if super::outbox::participation(room).is_err() {
                 continue;
             }
             self.purge_tick_seen.insert(vk, seen);
@@ -3104,9 +3126,6 @@ impl Rooms {
             let Some(record) = self.outbox.purge_record().for_room(&vk) else {
                 continue;
             };
-            if super::outbox::participation(room).is_err() {
-                continue;
-            }
             let mut own = record.clone();
             self.outbox.without_abandoned(&vk, &mut own);
             own.healed_at = self.healed_run.get(&vk).cloned().unwrap_or_default();
@@ -3134,35 +3153,27 @@ impl Rooms {
     }
 
     /// What [`Rooms::own_purges_tick`] reads for one room: the envelope the room holds for the
-    /// user, its members and configuration signature, the record's revision and what waits in
-    /// the outbox.
+    /// user (its signature says which, and covers its version), the members, the room's
+    /// configuration signature (what pruning checks) and the record's revision.
     fn own_purges_fingerprint(&self, room: &LiveRoom) -> u64 {
         use std::hash::{DefaultHasher, Hash, Hasher};
         let mut h = DefaultHasher::new();
-        let vk = room.stored.owner_vk;
         self.outbox.purge_record().rev().hash(&mut h);
-        self.outbox.abandoned_count().hash(&mut h);
         let state = &room.stored.room_state;
         if let Some(sk) = &room.stored.self_sk {
             let me = MemberId::from(&sk.verifying_key());
-            if let Some(p) = state
+            state
                 .direct_messages
                 .purges
                 .iter()
                 .find(|p| p.recipient_id == me)
-            {
-                p.state.version.hash(&mut h);
-                p.recipient_signature.to_bytes().hash(&mut h);
-            }
-            me.0.0.hash(&mut h);
+                .map(|p| p.recipient_signature.to_bytes())
+                .hash(&mut h);
         }
-        state.members.members.len().hash(&mut h);
         for m in &state.members.members {
             m.member.id().0.0.hash(&mut h);
         }
         state.configuration.signature.to_bytes().hash(&mut h);
-        super::outbox::participation(room).is_ok().hash(&mut h);
-        vk.as_bytes().hash(&mut h);
         h.finish()
     }
 
@@ -4031,6 +4042,9 @@ fn order(room_order: &[VerifyingKey], mut present: Vec<VerifyingKey>) -> Vec<Ver
     out.extend(present);
     out
 }
+
+/// How long failed storage work on the record of deletions waits before it is tried again.
+const PURGE_STORAGE_RETRY: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
 #[path = "session_tests.rs"]
