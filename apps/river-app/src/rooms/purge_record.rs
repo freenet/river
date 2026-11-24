@@ -71,6 +71,8 @@ fn room_key(owner: &VerifyingKey) -> String {
 pub struct PurgeRecord {
     path: Option<PathBuf>,
     book: Book,
+    /// Counts the changes this record has seen, so a caller can tell cheaply whether it moved.
+    rev: u64,
 }
 
 impl std::fmt::Debug for PurgeRecord {
@@ -83,13 +85,14 @@ impl std::fmt::Debug for PurgeRecord {
 
 impl PurgeRecord {
     /// The record kept in `dir`, the app's config directory. A file that cannot be read as a
-    /// record is moved to `own-purges.json.bad` (never overwritten unseen) and the record starts
+    /// record is moved to `own-purges.json.bad-<time>-<pid>-<n>` (never overwritten unseen) and the record starts
     /// empty; a file that cannot be read at all leaves the record empty, and a change is
     /// refused until it can be read (a deletion is then refused rather than sent unrecorded).
     pub fn open(dir: &Path) -> Self {
         let path = dir.join(FILE_NAME);
+        remove_stale_temporaries(dir);
         let book = match read_book(&path) {
-            Ok(book) => book,
+            Ok((book, _)) => book,
             Err(e) => {
                 crate::diag!(
                     "River: the record of your deletions was not read: {}",
@@ -101,7 +104,13 @@ impl PurgeRecord {
         PurgeRecord {
             path: Some(path),
             book,
+            rev: 0,
         }
+    }
+
+    /// A number that changes whenever the record does.
+    pub fn rev(&self) -> u64 {
+        self.rev
     }
 
     /// Whether this is the record kept in `dir`.
@@ -184,6 +193,24 @@ impl PurgeRecord {
         })
     }
 
+    /// Remove every room not in `keep` (rooms the user is no longer in, found at start and after
+    /// a read of the stored rooms; an entry whose key does not read as a room goes too). One
+    /// write, none when nothing goes.
+    pub fn retain_rooms(
+        &mut self,
+        keep: &std::collections::HashSet<VerifyingKey>,
+    ) -> Result<(), String> {
+        let keep: std::collections::HashSet<String> = keep.iter().map(room_key).collect();
+        if self.book.rooms.keys().all(|k| keep.contains(k)) {
+            return Ok(());
+        }
+        self.change(move |book| {
+            let before = book.rooms.len();
+            book.rooms.retain(|k, _| keep.contains(k));
+            before != book.rooms.len()
+        })
+    }
+
     /// Remove `owner`'s room from the record (the user left it).
     pub fn forget(&mut self, owner: &VerifyingKey) -> Result<(), String> {
         let key = room_key(owner);
@@ -199,43 +226,86 @@ impl PurgeRecord {
     fn change(&mut self, edit: impl FnOnce(&mut Book) -> bool) -> Result<(), String> {
         let Some(path) = self.path.clone() else {
             edit(&mut self.book);
+            self.rev += 1;
             return Ok(());
         };
         let dir = path.parent().ok_or("bad record path")?.to_owned();
         create_private_dir(&dir).map_err(|e| format!("couldn't create {}: {e}", dir.display()))?;
         // Held across the read and the write, so two Rivers cannot lose each other's change.
-        let _lock = lock_file(&dir.join(format!(".{FILE_NAME}.lock")))
-            .ok()
-            .and_then(|f| f.lock().ok().map(|()| f));
-        let mut book = read_book(&path)?;
-        if !edit(&mut book) {
+        let lock = lock_file(&dir.join(format!(".{FILE_NAME}.lock")))
+            .map_err(|e| format!("couldn't lock the record of your deletions: {e}"))?;
+        lock.lock()
+            .map_err(|e| format!("couldn't lock the record of your deletions: {e}"))?;
+        let (mut book, corrupt) = read_book(&path)?;
+        if corrupt {
+            // The file was not a record and was moved aside: what this run knows is kept and
+            // written back, not replaced by an empty record.
+            book = self.book.clone();
+        }
+        if !edit(&mut book) && !corrupt {
             // Nothing to write; what the file holds is what is known.
+            if self.book != book {
+                self.rev += 1;
+            }
             self.book = book;
             return Ok(());
         }
         write_book(&path, &book)?;
         self.book = book;
+        self.rev += 1;
         Ok(())
     }
 }
 
-/// The record in `path`: empty when there is no file, and empty after a file that is not a
-/// record is moved aside. An error only for a file that cannot be read.
-fn read_book(path: &Path) -> Result<Book, String> {
+/// The record in `path` and whether the file was not a record: empty when there is no file, and
+/// empty after a file that is not a record is moved aside (to a name of its own, so an earlier
+/// one is never overwritten). An error only for a file that cannot be read.
+fn read_book(path: &Path) -> Result<(Book, bool), String> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Book::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Book::default(), false)),
         Err(e) => return Err(format!("couldn't read {}: {e}", path.display())),
     };
     match serde_json::from_slice::<Book>(&bytes) {
-        Ok(book) => Ok(book),
+        Ok(book) => Ok((book, false)),
         Err(_) => {
-            let bad = path.with_file_name(format!("{FILE_NAME}.bad"));
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let bad =
+                path.with_file_name(format!("{FILE_NAME}.bad-{at}-{}-{n}", std::process::id()));
             // Said without the content, which is tokens.
             crate::diag!("River: the record of your deletions was unreadable; moved aside");
             fs::rename(path, &bad)
                 .map_err(|e| format!("couldn't move {} aside: {e}", path.display()))?;
-            Ok(Book::default())
+            Ok((Book::default(), true))
+        }
+    }
+}
+
+/// Remove temporary files an earlier run left (it died between creating and renaming one). Only
+/// those not touched for a minute, so another River's write in progress is left alone.
+fn remove_stale_temporaries(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let prefix = format!(".{FILE_NAME}.");
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !(name.starts_with(&prefix) && name.ends_with(".tmp")) {
+            continue;
+        }
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age.as_secs() >= 60);
+        if old {
+            let _ = fs::remove_file(entry.path());
         }
     }
 }

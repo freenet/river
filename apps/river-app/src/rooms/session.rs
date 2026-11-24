@@ -2068,6 +2068,10 @@ struct Rooms {
     /// recipient (`OwnPurges::healed_at`): at most one re-sign per winning version
     /// ([`Rooms::own_purges_tick`]). Not kept on disk, see [`super::purge_record`].
     healed_run: HashMap<VerifyingKey, Vec<(MemberId, u64)>>,
+    /// What [`Rooms::own_purges_tick`] last read for each room.
+    purge_tick_seen: HashMap<VerifyingKey, u64>,
+    /// Rooms whose record is to be removed (the user left): retried until it is.
+    purge_forget_owed: HashSet<VerifyingKey>,
     /// A message was sent into a thread this copy of the archive list does not hold: the stored
     /// rooms are read again once at the next tick, and at most once in [`REREAD_EVERY`].
     reread_after_send: bool,
@@ -3034,11 +3038,36 @@ impl Rooms {
     /// hold records trade a bounded number of envelopes. The queued envelope is an ordinary
     /// outbox entry, so it waits for the write gate ([`super::generation`]) like every write.
     fn own_purges_tick(&mut self) {
-        for vk in self.outbox.work.take_done_leaves() {
+        // A leave that finished: its record goes. One that could not be taken out is tried
+        // again at every tick until it is.
+        self.purge_forget_owed
+            .extend(self.outbox.work.take_done_leaves());
+        let owed: Vec<VerifyingKey> = self.purge_forget_owed.iter().copied().collect();
+        for vk in owed {
             self.healed_run.remove(&vk);
-            if let Err(e) = self.outbox.purge_record_mut().forget(&vk) {
+            self.purge_tick_seen.remove(&vk);
+            match self.outbox.purge_record_mut().forget(&vk) {
+                Ok(()) => {
+                    self.purge_forget_owed.remove(&vk);
+                }
+                Err(e) => crate::diag!(
+                    "River: the record of a left room's deletions stays for now: {}",
+                    crate::diag::scrub(&e)
+                ),
+            }
+        }
+        // Re-signed envelopes that failed are background work and are never shown.
+        let dropped = self.outbox.drop_failed_heals();
+        if dropped > 0 {
+            crate::diag!("River: {dropped} re-signed deletion(s) were not kept and were dropped");
+        }
+        // After a read that listed every room, a room the user is no longer in loses its record
+        // (a leave whose cleanup was lost with a restart, or one that failed).
+        if self.complete && self.loaded {
+            let keep: HashSet<VerifyingKey> = self.list.iter().map(|r| r.stored.owner_vk).collect();
+            if let Err(e) = self.outbox.purge_record_mut().retain_rooms(&keep) {
                 crate::diag!(
-                    "River: the record of a left room's deletions stays: {}",
+                    "River: records of rooms left were not removed: {}",
                     crate::diag::scrub(&e)
                 );
             }
@@ -3052,9 +3081,16 @@ impl Rooms {
             if !self.network_seen.contains(&vk)
                 || self.outbox.purge_record().for_room(&vk).is_none()
                 || self.outbox.purge_pending(&vk)
+                || self.outbox.heal_in_progress(&vk)
             {
                 continue;
             }
+            // Only when what it depends on changed: the held envelope, the members, the record.
+            let seen = self.own_purges_fingerprint(room);
+            if self.purge_tick_seen.get(&vk) == Some(&seen) {
+                continue;
+            }
+            self.purge_tick_seen.insert(vk, seen);
             if let Err(e) = self
                 .outbox
                 .purge_record_mut()
@@ -3072,13 +3108,16 @@ impl Rooms {
                 continue;
             }
             let mut own = record.clone();
+            self.outbox.without_abandoned(&vk, &mut own);
             own.healed_at = self.healed_run.get(&vk).cloned().unwrap_or_default();
             let Some(result) = super::dm_purge::heal(room, &mut own) else {
                 continue;
             };
-            self.healed_run.insert(vk, own.healed_at);
             match result {
                 Ok(work) => {
+                    // The winning version is used up only by an envelope that was queued: one
+                    // that could not be built is tried again when the room changes.
+                    self.healed_run.insert(vk, own.healed_at);
                     crate::diag!(
                         "River: signing your deleted messages again for a room: the room's \
                          winning deletion omits {} that this computer recorded",
@@ -3092,6 +3131,39 @@ impl Rooms {
                 ),
             }
         }
+    }
+
+    /// What [`Rooms::own_purges_tick`] reads for one room: the envelope the room holds for the
+    /// user, its members and configuration signature, the record's revision and what waits in
+    /// the outbox.
+    fn own_purges_fingerprint(&self, room: &LiveRoom) -> u64 {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        let vk = room.stored.owner_vk;
+        self.outbox.purge_record().rev().hash(&mut h);
+        self.outbox.abandoned_count().hash(&mut h);
+        let state = &room.stored.room_state;
+        if let Some(sk) = &room.stored.self_sk {
+            let me = MemberId::from(&sk.verifying_key());
+            if let Some(p) = state
+                .direct_messages
+                .purges
+                .iter()
+                .find(|p| p.recipient_id == me)
+            {
+                p.state.version.hash(&mut h);
+                p.recipient_signature.to_bytes().hash(&mut h);
+            }
+            me.0.0.hash(&mut h);
+        }
+        state.members.members.len().hash(&mut h);
+        for m in &state.members.members {
+            m.member.id().0.0.hash(&mut h);
+        }
+        state.configuration.signature.to_bytes().hash(&mut h);
+        super::outbox::participation(room).is_ok().hash(&mut h);
+        vk.as_bytes().hash(&mut h);
+        h.finish()
     }
 
     /// Drop the sent text of every message its recipient deleted, and owe the store its removal

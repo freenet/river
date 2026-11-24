@@ -2327,6 +2327,7 @@ mod purging {
         assert!(shows(&rt, "cannot be undone"));
         assert!(shows(&rt, "Messages you sent Priya are not deleted"));
         assert!(shows(&rt, "at most 1000 deleted messages"));
+        assert!(shows(&rt, "can return if you go past that"));
         assert!(shows(&rt, "Delete 2 messages"));
 
         press(&mut rt, "dm-purge-cancel");

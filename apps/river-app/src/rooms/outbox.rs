@@ -1955,6 +1955,13 @@ pub(super) struct Outbox {
     /// This device's record of the deletions it sent ([`super::purge_record`]). Kept here so it
     /// outlives a session as what was sent does: a deletion is recorded as it first goes out.
     purge_record: super::purge_record::PurgeRecord,
+    /// Entries that went out more than once (a connection ended while one was owed an answer):
+    /// the node may have taken an earlier copy, so a refusal of a later one is not proof that
+    /// the deletion never happened.
+    resent: HashSet<u64>,
+    /// Tokens whose record could not be taken back after the node refused their deletion
+    /// (the storage failed): kept out of re-signing for this run.
+    abandoned: HashSet<(VerifyingKey, MemberId, PurgeToken)>,
 }
 
 impl Default for Outbox {
@@ -1971,6 +1978,8 @@ impl Default for Outbox {
             preview: None,
             preview_cache: Default::default(),
             purge_record: Default::default(),
+            resent: HashSet::new(),
+            abandoned: HashSet::new(),
         }
     }
 }
@@ -2592,14 +2601,58 @@ impl Outbox {
         &mut self.purge_record
     }
 
-    /// Whether a deletion of `room` is queued, out, or failed and still shown: a re-signed
-    /// envelope waits for it, since it may be the one that restores what is missing, and one
-    /// the user was told failed must not be signed behind their back. One the node took but the
-    /// room did not keep is not waited for: re-signing is what repairs it.
+    /// Whether a deletion the user asked for in `room` is queued or out: a re-signed envelope
+    /// waits for it, since its own tokens are recorded already and it may be the one that puts
+    /// them in the room. A failed one does not hold anything up: a refusal took its tokens out
+    /// of the record, and one that was sent and then failed (requeued, then stopped by the
+    /// identity check or River moving on) stays recorded and is signed again like any other.
+    /// Re-signed envelopes themselves never count ([`Outbox::heal_in_progress`]).
     pub fn purge_pending(&self, room: &VerifyingKey) -> bool {
         self.entries.iter().any(|e| {
-            e.room == *room && e.purge.is_some() && !matches!(e.status, Status::Unconfirmed(_))
+            e.room == *room
+                && e.purge.as_ref().is_some_and(|w| !w.heal)
+                && matches!(e.status, Status::Queued | Status::InFlight { .. })
         })
+    }
+
+    /// Whether a re-signed envelope for `room` is queued or out.
+    pub fn heal_in_progress(&self, room: &VerifyingKey) -> bool {
+        self.entries.iter().any(|e| {
+            e.room == *room
+                && e.purge.as_ref().is_some_and(|w| w.heal)
+                && matches!(e.status, Status::Queued | Status::InFlight { .. })
+        })
+    }
+
+    /// Drop the re-signed envelopes that failed or that the room did not keep. They are
+    /// background work, never shown: the next winning envelope that omits a recorded token
+    /// derives a new one. Returns how many went.
+    pub fn drop_failed_heals(&mut self) -> usize {
+        let before = self.entries.len();
+        self.entries.retain(|e| {
+            !(e.purge.as_ref().is_some_and(|w| w.heal)
+                && matches!(e.status, Status::Failed(_) | Status::Unconfirmed(_)))
+        });
+        before - self.entries.len()
+    }
+
+    /// How many tokens are kept out of re-signing ([`Outbox::without_abandoned`]).
+    pub fn abandoned_count(&self) -> usize {
+        self.abandoned.len()
+    }
+
+    /// `own` without the tokens whose deletion the node refused and whose record could not be
+    /// taken back.
+    pub fn without_abandoned(
+        &self,
+        room: &VerifyingKey,
+        own: &mut river_core::own_purges::OwnPurges,
+    ) {
+        if self.abandoned.is_empty() {
+            return;
+        }
+        own.purged
+            .retain(|(r, t)| !self.abandoned.contains(&(*room, *r, *t)));
     }
 
     /// Queue the re-signed envelope `work` ([`super::dm_purge::heal`]) for `room`.
@@ -2673,37 +2726,13 @@ impl Outbox {
             }
             Action::Discard { entry } => {
                 // Only what is shown as not sent, and only in the room it was written in.
+                // The record of deletions is not touched: a dismissed entry may have been
+                // taken by the node ([`super::purge_record`]).
                 let before = self.entries.len();
-                let vk = room.stored.owner_vk;
-                // A deletion the room refused and the user gives up is no longer one this
-                // device is to sign again ([`super::purge_record`]). One the node took but the
-                // room does not show stays recorded: it was sent.
-                let given_up: Vec<super::dm_purge::Work> = self
-                    .entries
-                    .iter()
-                    .filter(|e| e.id == entry && e.room == vk)
-                    .filter(|e| matches!(e.status, Status::Failed(_)))
-                    .filter_map(|e| e.purge.clone())
-                    .filter(|w| !w.heal)
-                    .collect();
-                self.entries
-                    .retain(|e| e.id != entry || e.room != vk || e.trouble().is_none());
-                let discarded = self.entries.len() != before;
-                if discarded {
-                    for work in given_up {
-                        if let Err(e) = self.purge_record.unrecord(
-                            &vk,
-                            work.envelope.recipient_id,
-                            &work.tokens,
-                        ) {
-                            crate::diag!(
-                                "River: a dismissed deletion stays recorded: {}",
-                                crate::diag::scrub(&e)
-                            );
-                        }
-                    }
-                }
-                return discarded;
+                self.entries.retain(|e| {
+                    e.id != entry || e.room != room.stored.owner_vk || e.trouble().is_none()
+                });
+                return self.entries.len() != before;
             }
             action => self.intent(room, action),
         };
@@ -3158,6 +3187,9 @@ impl Outbox {
                 *changed = true;
                 continue;
             }
+            if entry.sent {
+                self.resent.insert(entry.id);
+            }
             entry.status = Status::InFlight {
                 at: now,
                 late: false,
@@ -3318,6 +3350,7 @@ impl Outbox {
                 } else {
                     self.entries[i].status =
                         Status::Failed(format!("Freenet refused it: {reason}"));
+                    self.take_back_refused_purge(i);
                 }
                 if label == CONFIG_LABEL {
                     self.rebuild_waiting_configs(room);
@@ -3328,6 +3361,34 @@ impl Outbox {
             }
         }
         true
+    }
+
+    /// The node refused entry `i`, a deletion: when it went out only once, the node never took
+    /// it, so its tokens are taken back out of the record (it is no longer one to sign again).
+    /// This is the only place a record is taken back. When that fails, the tokens stay out of
+    /// re-signing for this run and the failure is shown with the entry.
+    fn take_back_refused_purge(&mut self, i: usize) {
+        let entry = &self.entries[i];
+        let Some(work) = entry.purge.clone().filter(|w| !w.heal) else {
+            return;
+        };
+        if self.resent.contains(&entry.id) {
+            return;
+        }
+        let (vk, me) = (entry.room, work.envelope.recipient_id);
+        if let Err(e) = self.purge_record.unrecord(&vk, me, &work.tokens) {
+            crate::diag!(
+                "River: a refused deletion stays recorded: {}",
+                crate::diag::scrub(&e)
+            );
+            self.abandoned
+                .extend(work.tokens.iter().map(|t| (vk, me, *t)));
+            if let Status::Failed(why) = &mut self.entries[i].status {
+                why.push_str(&format!(
+                    " This computer could not update its record of your deletions: {e}"
+                ));
+            }
+        }
     }
 
     /// Updates unanswered for `wait` by `now` are shown as not confirmed (their room still

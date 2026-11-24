@@ -423,96 +423,6 @@ fn nothing_is_signed_again_when_the_room_holds_everything_recorded() {
     assert_eq!(node.purged(me), sorted(tokens));
 }
 
-/// A deletion the room refused is shown as failed with Retry and Discard. It is not signed
-/// again behind the user's back while it is shown, and once dismissed it is not recorded.
-#[test]
-fn a_refused_deletion_is_not_signed_again_and_a_dismissed_one_is_unrecorded() {
-    let f = Fixture::new();
-    let msgs = messages(&f, 1);
-    let token = msgs[0].purge_token();
-    let dir = dir("refused");
-    let mut device = device(&dir, &msgs);
-    let node = Node::of(&device);
-    let owner = device.rooms.list[0].stored.owner_vk;
-    device.delete(&[token]);
-    let mut changed = false;
-    device
-        .rooms
-        .outbox
-        .next_update(&device.rooms.list[0], Instant::now(), &mut changed)
-        .expect("sent");
-    let id = device.rooms.list[0].contract_id();
-    device.rooms.update_answered(&id, Err("refused".into()));
-    let row = device.rooms.outbox.purge_rows(&owner).remove(0);
-    assert!(row.pending.failed.is_some());
-    assert!(PurgeRecord::open(&dir).for_room(&owner).is_some());
-
-    // The room does not hold it and the record does, but the user was told it failed.
-    device.hear(&node);
-    assert!(device.rooms.outbox.purge_rows(&owner).len() == 1);
-    assert!(!device.rooms.outbox.is_empty());
-    let mut changed = false;
-    assert!(
-        device
-            .rooms
-            .outbox
-            .next_update(&device.rooms.list[0], Instant::now(), &mut changed)
-            .is_none(),
-        "a failed entry is not sent and no second one was queued"
-    );
-
-    // Dismissed: no longer a deletion to sign.
-    let room = device.rooms.list[0].clone();
-    assert!(device.rooms.outbox.command(
-        &room,
-        Action::Discard {
-            entry: row.pending.entry
-        }
-    ));
-    assert!(device.rooms.outbox.is_empty());
-    assert!(PurgeRecord::open(&dir).for_room(&owner).is_none());
-    device.hear(&node);
-    assert!(device.rooms.outbox.is_empty());
-}
-
-/// A record that cannot be saved stops the deletion rather than sending it unrecorded.
-#[cfg(unix)]
-#[test]
-fn a_deletion_whose_record_cannot_be_saved_is_not_sent() {
-    use std::os::unix::fs::PermissionsExt;
-    let f = Fixture::new();
-    let msgs = messages(&f, 1);
-    let token = msgs[0].purge_token();
-    let dir = dir("unwritable");
-    let mut device = device(&dir, &msgs);
-    let node = Node::of(&device);
-    device.delete(&[token]);
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
-    let writable = std::fs::File::create(dir.join("probe")).is_ok();
-    let mut changed = false;
-    let sent = device
-        .rooms
-        .outbox
-        .next_update(&device.rooms.list[0], Instant::now(), &mut changed);
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-    if writable {
-        // Running as a user the permission does not bind: nothing to check.
-        return;
-    }
-    assert!(sent.is_none());
-    assert!(changed);
-    let owner = device.rooms.list[0].stored.owner_vk;
-    let failed = device
-        .rooms
-        .outbox
-        .purge_rows(&owner)
-        .remove(0)
-        .pending
-        .failed;
-    assert!(failed.unwrap().contains("not sent"));
-    assert!(node.purged(device.me()).is_empty());
-}
-
 /// The record loses recipients that are no longer members once the room has been read from the
 /// network, and keeps the user's own.
 #[test]
@@ -533,4 +443,363 @@ fn the_record_is_pruned_to_the_rooms_members() {
     let own = on_disk.for_room(&owner).unwrap();
     assert!(own.purged.iter().all(|(r, _)| *r != gone), "{own:?}");
     assert_eq!(own.purged.len(), 1);
+}
+
+// Storage that fails whether or not the process may write (a regular file where the directory
+// should be, so every path under it is "not a directory"; running as root changes nothing).
+
+fn break_storage(dir: &Path) {
+    std::fs::remove_dir_all(dir).unwrap();
+    std::fs::write(dir, b"not a directory").unwrap();
+}
+
+fn mend_storage(dir: &Path) {
+    std::fs::remove_file(dir).unwrap();
+    std::fs::create_dir_all(dir).unwrap();
+}
+
+/// The first send of `device`'s queued deletion, which the node refuses.
+fn sent_and_refused(device: &mut Device) {
+    let mut changed = false;
+    device
+        .rooms
+        .outbox
+        .next_update(&device.rooms.list[0], Instant::now(), &mut changed)
+        .expect("sent");
+    let id = device.rooms.list[0].contract_id();
+    device.rooms.update_answered(&id, Err("refused".into()));
+}
+
+fn owner_of(d: &Device) -> VerifyingKey {
+    d.rooms.list[0].stored.owner_vk
+}
+
+/// The node refused a deletion that went out once: it was never taken, so it is no longer one
+/// to sign again, at the moment of the refusal, and dismissing it changes nothing.
+#[test]
+fn a_deletion_the_node_refused_is_taken_out_of_the_record_when_refused() {
+    let f = Fixture::new();
+    let msgs = messages(&f, 1);
+    let dir = dir("refused");
+    let mut device = device(&dir, &msgs);
+    let node = Node::of(&device);
+    let owner = owner_of(&device);
+    device.delete(&[msgs[0].purge_token()]);
+    // Recorded as it goes out, and taken back as it is refused.
+    sent_and_refused(&mut device);
+    assert!(PurgeRecord::open(&dir).for_room(&owner).is_none());
+    let row = device.rooms.outbox.purge_rows(&owner).remove(0);
+    assert!(row.pending.failed.is_some());
+    // Nothing signs it behind the user's back, now or after a restart.
+    device.hear(&node);
+    assert_eq!(device.rooms.outbox.purge_rows(&owner).len(), 1);
+    let mut restarted = self::device(&dir, &msgs);
+    restarted.hear(&node);
+    assert!(restarted.rooms.outbox.is_empty());
+    // Dismissing it does not touch the record.
+    let room = device.rooms.list[0].clone();
+    assert!(device.rooms.outbox.command(
+        &room,
+        Action::Discard {
+            entry: row.pending.entry
+        }
+    ));
+    assert!(PurgeRecord::open(&dir).for_room(&owner).is_none());
+}
+
+/// A deletion that went out twice may have been taken the first time: a refusal of the second
+/// leaves it recorded, and dismissing it does not unrecord it. It is signed again.
+#[test]
+fn a_deletion_sent_twice_stays_recorded_when_refused_and_when_dismissed() {
+    let f = Fixture::new();
+    let msgs = messages(&f, 1);
+    let token = msgs[0].purge_token();
+    let dir = dir("sent-twice");
+    let mut device = device(&dir, &msgs);
+    let mut node = Node::of(&device);
+    let owner = owner_of(&device);
+    let me = device.me();
+    device.delete(&[token]);
+    let mut changed = false;
+    device
+        .rooms
+        .outbox
+        .next_update(&device.rooms.list[0], Instant::now(), &mut changed)
+        .expect("sent");
+    // The connection ended while it was owed an answer: it goes again.
+    device.rooms.outbox.requeue();
+    sent_and_refused(&mut device);
+    assert!(PurgeRecord::open(&dir).for_room(&owner).is_some());
+    let row = device.rooms.outbox.purge_rows(&owner).remove(0);
+    let room = device.rooms.list[0].clone();
+    assert!(device.rooms.outbox.command(
+        &room,
+        Action::Discard {
+            entry: row.pending.entry
+        }
+    ));
+    assert!(PurgeRecord::open(&dir).for_room(&owner).is_some());
+    // The room does not hold it and the record does: it is signed again.
+    assert_eq!(settle(std::slice::from_mut(&mut device), &mut node), 1);
+    assert_eq!(node.purged(me), vec![token]);
+}
+
+/// A deletion stopped after it went out (River moved on, or the identity changed) is not one
+/// the node refused: it stays recorded.
+#[test]
+fn a_sent_deletion_that_is_failed_without_an_answer_stays_recorded() {
+    let f = Fixture::new();
+    let msgs = messages(&f, 1);
+    let dir = dir("failed-queued");
+    let mut device = device(&dir, &msgs);
+    let owner = owner_of(&device);
+    device.delete(&[msgs[0].purge_token()]);
+    let mut changed = false;
+    device
+        .rooms
+        .outbox
+        .next_update(&device.rooms.list[0], Instant::now(), &mut changed)
+        .expect("sent");
+    device.rooms.outbox.requeue();
+    assert!(device.rooms.outbox.fail_queued("River has moved on"));
+    assert!(PurgeRecord::open(&dir).for_room(&owner).is_some());
+}
+
+/// The node refused it and the record could not be taken back (the storage failed): the tokens
+/// stay out of re-signing for the run, and the entry says why.
+#[test]
+fn a_record_that_cannot_be_taken_back_keeps_the_deletion_out_of_re_signing() {
+    let f = Fixture::new();
+    let msgs = messages(&f, 1);
+    let dir = dir("unrecord-fails");
+    let mut device = device(&dir, &msgs);
+    let node = Node::of(&device);
+    let owner = owner_of(&device);
+    device.delete(&[msgs[0].purge_token()]);
+    let mut changed = false;
+    device
+        .rooms
+        .outbox
+        .next_update(&device.rooms.list[0], Instant::now(), &mut changed)
+        .expect("sent");
+    break_storage(&dir);
+    let id = device.rooms.list[0].contract_id();
+    device.rooms.update_answered(&id, Err("refused".into()));
+    let failed = device
+        .rooms
+        .outbox
+        .purge_rows(&owner)
+        .remove(0)
+        .pending
+        .failed;
+    assert!(failed.unwrap().contains("could not update its record"));
+    // Still in memory, but not signed.
+    assert!(
+        device
+            .rooms
+            .outbox
+            .purge_record()
+            .for_room(&owner)
+            .is_some()
+    );
+    device.hear(&node);
+    assert_eq!(device.rooms.outbox.purge_rows(&owner).len(), 1);
+    assert!(!device.rooms.outbox.heal_in_progress(&owner));
+}
+
+/// A deletion whose record cannot be saved is not sent.
+#[test]
+fn a_deletion_whose_record_cannot_be_saved_is_not_sent() {
+    let f = Fixture::new();
+    let msgs = messages(&f, 1);
+    let dir = dir("unwritable");
+    let mut device = device(&dir, &msgs);
+    let node = Node::of(&device);
+    device.delete(&[msgs[0].purge_token()]);
+    break_storage(&dir);
+    let mut changed = false;
+    let sent = device
+        .rooms
+        .outbox
+        .next_update(&device.rooms.list[0], Instant::now(), &mut changed);
+    assert!(sent.is_none());
+    assert!(changed);
+    let owner = owner_of(&device);
+    let failed = device
+        .rooms
+        .outbox
+        .purge_rows(&owner)
+        .remove(0)
+        .pending
+        .failed;
+    assert!(failed.unwrap().contains("not sent"));
+    assert!(node.purged(device.me()).is_empty());
+}
+
+/// Two devices raced; returns them, the node, the index of the one that lost, and the tokens.
+fn raced(name: &str) -> (Vec<Device>, Node, usize, Vec<PurgeToken>) {
+    let f = Fixture::new();
+    let msgs = messages(&f, 2);
+    let tokens: Vec<PurgeToken> = msgs.iter().map(|m| m.purge_token()).collect();
+    let mut devices: Vec<Device> = (0..2)
+        .map(|i| device(&dir(&format!("{name}-{i}")), &msgs))
+        .collect();
+    let mut node = Node::of(&devices[0]);
+    for (i, d) in devices.iter_mut().enumerate() {
+        d.delete(&[tokens[i]]);
+        assert!(d.send(&mut node));
+    }
+    let kept = node.purged(devices[0].me());
+    let loser = usize::from(kept.contains(&tokens[0]));
+    (devices, node, loser, tokens)
+}
+
+/// A re-signed envelope the node refuses is dropped without a trace on screen, holds nothing
+/// up, is not tried again for the same winning version, and the next winning envelope that
+/// omits a recorded token derives a new one.
+#[test]
+fn a_failed_re_signed_envelope_is_dropped_and_the_next_winning_version_derives_a_new_one() {
+    let (mut devices, mut node, loser, tokens) = raced("failed-heal");
+    let owner = owner_of(&devices[loser]);
+    let me = devices[loser].me();
+    devices[loser].hear(&node);
+    assert!(devices[loser].rooms.outbox.heal_in_progress(&owner));
+    // It is background work: no row in the thread, no purge pending.
+    assert!(devices[loser].rooms.outbox.purge_rows(&owner).is_empty());
+    assert!(!devices[loser].rooms.outbox.purge_pending(&owner));
+    sent_and_refused(&mut devices[loser]);
+    devices[loser].hear(&node);
+    assert!(devices[loser].rooms.outbox.is_empty(), "dropped");
+    // Same winning version: not tried again.
+    devices[loser].hear(&node);
+    assert!(devices[loser].rooms.outbox.is_empty());
+    // Nothing it depends on changed, so the tick does not even look again.
+    devices[loser].rooms.healed_run.clear();
+    devices[loser].hear(&node);
+    assert!(devices[loser].rooms.outbox.is_empty());
+
+    // Another device's envelope, one version higher, omits the loser's token again.
+    let held = node.state.direct_messages.purges[0].clone();
+    let next = river_core::room_state::direct_messages::advance_recipient_purges(
+        &Fixture::new().me,
+        &owner,
+        Some(&held),
+        [PurgeToken([9; 16])],
+    )
+    .unwrap();
+    assert!(!next.state.purged.contains(&tokens[loser]));
+    node.take(&ChatRoomStateV1Delta {
+        direct_messages: Some(DirectMessagesDelta {
+            new_messages: Vec::new(),
+            advanced_purges: vec![next],
+        }),
+        ..Default::default()
+    });
+    devices[loser].hear(&node);
+    assert!(devices[loser].rooms.outbox.heal_in_progress(&owner));
+    assert!(devices[loser].send(&mut node));
+    assert!(node.purged(me).contains(&tokens[loser]));
+}
+
+/// A heal that is waiting when River has moved on fails and is dropped; none is derived while
+/// writes are stopped.
+#[test]
+fn nothing_is_re_signed_once_river_has_moved_on_and_a_waiting_envelope_is_dropped() {
+    let (mut devices, node, loser, _) = raced("moved-on");
+    let owner = owner_of(&devices[loser]);
+    devices[loser].hear(&node);
+    assert!(devices[loser].rooms.outbox.heal_in_progress(&owner));
+    // What the session does when its check says River has moved on.
+    devices[loser].rooms.update_required = true;
+    assert!(
+        devices[loser]
+            .rooms
+            .outbox
+            .fail_queued("River has moved on")
+    );
+    devices[loser].rooms.own_purges_tick();
+    assert!(devices[loser].rooms.outbox.is_empty());
+    // And none is derived while it holds.
+    devices[loser].rooms.purge_tick_seen.clear();
+    devices[loser].rooms.healed_run.clear();
+    devices[loser].rooms.own_purges_tick();
+    assert!(devices[loser].rooms.outbox.is_empty());
+}
+
+/// When the room's envelope already holds the most tokens an envelope can, nothing is signed
+/// and the winning version is not used up.
+#[test]
+fn a_full_envelope_is_not_signed_over_and_does_not_use_up_the_version() {
+    use river_core::room_state::direct_messages::{
+        MAX_PURGED_TOMBSTONES_PER_RECIPIENT, advance_recipient_purges,
+    };
+    let f = Fixture::new();
+    let msgs = messages(&f, 1);
+    let mut device = device(&dir("cap"), &msgs);
+    let owner = owner_of(&device);
+    let me = device.me();
+    let many: Vec<PurgeToken> = (0..MAX_PURGED_TOMBSTONES_PER_RECIPIENT as u32)
+        .map(|n| {
+            let mut t = [0u8; 16];
+            t[..4].copy_from_slice(&(n + 1000).to_le_bytes());
+            PurgeToken(t)
+        })
+        .collect();
+    let full = advance_recipient_purges(&f.me, &owner, None, many).unwrap();
+    device.rooms.list[0]
+        .apply_delta(ChatRoomStateV1Delta {
+            direct_messages: Some(DirectMessagesDelta {
+                new_messages: Vec::new(),
+                advanced_purges: vec![full],
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+    device
+        .rooms
+        .outbox
+        .purge_record_mut()
+        .record(&owner, me, &[PurgeToken([5; 16])])
+        .unwrap();
+    device.rooms.own_purges_tick();
+    assert!(device.rooms.outbox.is_empty());
+    assert!(device.rooms.healed_run.get(&owner).is_none());
+}
+
+/// A room the user is not in loses its record once a read has listed every room, and a record
+/// that could not be removed when the leave ended is removed when the storage works again.
+#[test]
+fn records_of_rooms_left_are_removed_and_a_failed_removal_is_retried() {
+    let f = Fixture::new();
+    let msgs = messages(&f, 1);
+    let dir = dir("forget");
+    let mut device = device(&dir, &msgs);
+    let owner = owner_of(&device);
+    let stranger = SigningKey::from_bytes(&[55; 32]).verifying_key();
+    let record = device.rooms.outbox.purge_record_mut();
+    record
+        .record(&stranger, MemberId::from(&stranger), &[PurgeToken([3; 16])])
+        .unwrap();
+    record
+        .record(&owner, MemberId::from(&owner), &[PurgeToken([4; 16])])
+        .unwrap();
+    // Not before a read that lists every room.
+    device.rooms.complete = false;
+    device.rooms.own_purges_tick();
+    assert!(PurgeRecord::open(&dir).for_room(&stranger).is_some());
+    device.rooms.complete = true;
+    device.rooms.own_purges_tick();
+    let after = PurgeRecord::open(&dir);
+    assert!(after.for_room(&stranger).is_none());
+    assert!(after.for_room(&owner).is_some());
+
+    // A leave whose removal failed is tried again.
+    device.rooms.purge_forget_owed.insert(owner);
+    break_storage(&dir);
+    device.rooms.own_purges_tick();
+    assert!(device.rooms.purge_forget_owed.contains(&owner));
+    mend_storage(&dir);
+    device.rooms.own_purges_tick();
+    assert!(device.rooms.purge_forget_owed.is_empty());
+    assert!(PurgeRecord::open(&dir).for_room(&owner).is_none());
 }

@@ -102,18 +102,118 @@ fn a_second_river_over_the_same_directory_loses_nothing() {
     );
 }
 
+fn bad_files(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(&format!("{FILE_NAME}.bad"))
+        })
+        .collect();
+    v.sort();
+    v
+}
+
 #[test]
-fn a_file_that_is_not_a_record_is_moved_aside_not_overwritten() {
+fn a_file_that_is_not_a_record_is_moved_aside_and_a_second_one_does_not_replace_the_first() {
     let dir = dir("corrupt");
     fs::write(dir.join(FILE_NAME), b"not json at all").unwrap();
     let mut record = PurgeRecord::open(&dir);
     assert!(record.for_room(&owner(1)).is_none());
     record.record(&owner(1), id(2), &[t(1)]).unwrap();
-    assert_eq!(
-        fs::read(dir.join(format!("{FILE_NAME}.bad"))).unwrap(),
-        b"not json at all"
-    );
+    let first = bad_files(&dir);
+    assert_eq!(first.len(), 1);
+    assert_eq!(fs::read(&first[0]).unwrap(), b"not json at all");
     assert!(PurgeRecord::open(&dir).for_room(&owner(1)).is_some());
+
+    // Corrupted again while running: what this run knows is written back, not an empty record,
+    // and the second bad file has a name of its own.
+    fs::write(dir.join(FILE_NAME), b"{{ second").unwrap();
+    record.record(&owner(1), id(2), &[t(2)]).unwrap();
+    let both = bad_files(&dir);
+    assert_eq!(both.len(), 2);
+    assert!(
+        both.iter()
+            .any(|p| fs::read(p).unwrap() == b"not json at all")
+    );
+    assert!(both.iter().any(|p| fs::read(p).unwrap() == b"{{ second"));
+    assert_eq!(
+        PurgeRecord::open(&dir).for_room(&owner(1)).unwrap().purged,
+        vec![(id(2), t(1)), (id(2), t(2))]
+    );
+}
+
+#[test]
+fn a_file_that_cannot_be_read_at_all_refuses_changes_and_is_not_replaced() {
+    let dir = dir("unreadable");
+    // A directory where the file should be: reading it fails whoever runs this.
+    fs::create_dir_all(dir.join(FILE_NAME)).unwrap();
+    let mut record = PurgeRecord::open(&dir);
+    assert!(record.for_room(&owner(1)).is_none());
+    assert!(record.record(&owner(1), id(2), &[t(1)]).is_err());
+    assert!(record.for_room(&owner(1)).is_none(), "nothing was recorded");
+    assert!(dir.join(FILE_NAME).is_dir());
+}
+
+#[test]
+fn a_record_that_cannot_be_locked_or_written_is_an_error_and_changes_nothing() {
+    let dir = dir("unwritable");
+    let mut record = PurgeRecord::open(&dir);
+    record.record(&owner(1), id(2), &[t(1)]).unwrap();
+    // The directory is gone and a file stands in its place: no lock, no write, for anyone.
+    fs::remove_dir_all(&dir).unwrap();
+    fs::write(&dir, b"x").unwrap();
+    assert!(record.record(&owner(1), id(2), &[t(2)]).is_err());
+    assert_eq!(
+        record.for_room(&owner(1)).unwrap().purged,
+        vec![(id(2), t(1))],
+        "memory is as the disk was"
+    );
+}
+
+#[test]
+fn old_temporary_files_are_removed_at_start_and_recent_ones_left() {
+    let dir = dir("tmp");
+    let old = dir.join(format!(".{FILE_NAME}.1.0.tmp"));
+    let recent = dir.join(format!(".{FILE_NAME}.2.0.tmp"));
+    let other = dir.join("notes.tmp");
+    for p in [&old, &recent, &other] {
+        fs::write(p, b"x").unwrap();
+    }
+    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    fs::File::options()
+        .write(true)
+        .open(&old)
+        .unwrap()
+        .set_modified(long_ago)
+        .unwrap();
+    let _ = PurgeRecord::open(&dir);
+    assert!(!old.exists());
+    assert!(recent.exists(), "a write in progress is left alone");
+    assert!(other.exists());
+}
+
+#[test]
+fn rooms_not_kept_are_dropped_in_one_write() {
+    let dir = dir("retain");
+    let mut record = PurgeRecord::open(&dir);
+    record.record(&owner(1), id(2), &[t(1)]).unwrap();
+    record.record(&owner(5), id(2), &[t(2)]).unwrap();
+    let rev = record.rev();
+    record
+        .retain_rooms(&[owner(1), owner(5)].into_iter().collect())
+        .unwrap();
+    assert_eq!(record.rev(), rev, "nothing to drop writes nothing");
+    record
+        .retain_rooms(&[owner(5)].into_iter().collect())
+        .unwrap();
+    let reloaded = PurgeRecord::open(&dir);
+    assert!(reloaded.for_room(&owner(1)).is_none());
+    assert!(reloaded.for_room(&owner(5)).is_some());
 }
 
 #[test]
@@ -213,27 +313,4 @@ fn without_a_directory_the_record_is_kept_for_the_run_only() {
     assert_eq!(record.for_room(&owner(1)).unwrap().purged.len(), 1);
     record.forget(&owner(1)).unwrap();
     assert!(record.for_room(&owner(1)).is_none());
-}
-
-#[cfg(unix)]
-#[test]
-fn a_record_that_cannot_be_written_is_an_error_and_changes_nothing() {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = dir("readonly");
-    let mut record = PurgeRecord::open(&dir);
-    record.record(&owner(1), id(2), &[t(1)]).unwrap();
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
-    let writable = fs::File::create(dir.join("probe")).is_ok();
-    let result = record.record(&owner(1), id(2), &[t(2)]);
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
-    if writable {
-        // Running as a user the permission does not bind (root): nothing to check.
-        return;
-    }
-    assert!(result.is_err());
-    assert_eq!(
-        record.for_room(&owner(1)).unwrap().purged,
-        vec![(id(2), t(1))],
-        "memory is as the disk is"
-    );
 }
