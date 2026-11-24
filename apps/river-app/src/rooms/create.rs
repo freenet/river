@@ -29,7 +29,8 @@
 //!   invitation's secrets up to the room's current version.
 //!
 //! Where joining differs: the web UI publishes the joined room with a whole-state PUT. This
-//! app never PUTs a room it did not just create, so it sends the same additions as an UPDATE
+//! app PUTs a joined room only to move it to its current contract key after a re-key
+//! ([`super::rekey`]), so it sends the same additions as an UPDATE
 //! delta, as riverctl's `accept_invitation_struct` (`cli/src/api.rs`) does: the membership,
 //! the invite chain members the room lacks, the nickname record, the join event. Before
 //! anything is sent, the delta is applied to the room as read, and a room that would not
@@ -75,7 +76,7 @@ use super::room::LiveRoom;
 pub(crate) const ROOM_CONTRACT_WASM: &[u8] =
     include_bytes!("../../../../ui/public/contracts/room_contract.wasm");
 
-fn params_bytes(owner: &VerifyingKey) -> Vec<u8> {
+pub(crate) fn params_bytes(owner: &VerifyingKey) -> Vec<u8> {
     let mut out = Vec::new();
     // CBOR of a struct of one 32-byte key into a Vec does not fail.
     let _ = ciborium::ser::into_writer(&ChatRoomParametersV1 { owner: *owner }, &mut out);

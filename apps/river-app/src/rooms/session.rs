@@ -62,6 +62,11 @@
 //!   nothing about it for [`Pace::resync_idle`], every room not heard about lately when the window
 //!   comes to the front, and a room whose update could not be merged after a backoff
 //!   ([`super::resync`] has the rules and what bounds them). Such a read never reconnects.
+//! - **Earlier River releases.** Once a run, after the first read of the stored rooms, the
+//!   rooms earlier chat delegates hold and the current one does not are carried over
+//!   ([`super::carry`]), as a task. A room stored under an earlier room-contract key is followed
+//!   under the current one, and moved there when the network has no state under it
+//!   ([`super::rekey`]).
 //! - **What can't be shown.** A room whose update from the network could not be applied, a
 //!   stored room this computer cannot read, and a node with no chat delegate under the key
 //!   this build carries are all said on screen ([`Issues`]). A stored room can be unreadable
@@ -801,6 +806,13 @@ impl Subscriptions {
         self.retry.remove(id);
     }
 
+    /// Ask again for `id` as soon as nothing else is out for it (by [`Self::ask_due`]): the
+    /// network has a copy now (the room was moved to its current contract key).
+    fn due_now(&mut self, id: ContractInstanceId) {
+        let attempts = self.retry.get(&id).map_or(0, |(n, _)| *n);
+        self.retry.insert(id, (attempts, Instant::now()));
+    }
+
     /// The subscribe failed, found nothing, or went unanswered: ask again later.
     fn failed(&mut self, id: ContractInstanceId, pace: &Pace) {
         self.pending.remove(&id);
@@ -898,6 +910,18 @@ fn follow_on(
         };
     }
     *unconfirmed = false;
+    // Once a run, with River's storage there: carry over the rooms earlier River releases stored
+    // in their own chat delegates (freenet/river#889). After the read, so it knows which rooms
+    // the store holds; it works as a task, so it waits for the write gate like any other.
+    if !loaded.store_missing && !std::mem::replace(&mut rooms.carry_started, true) {
+        let current = loaded.listed_rooms.iter().map(room_storage_key);
+        let empty = loaded.slots.is_empty();
+        rooms.outbox.work.carry(super::carry::Carry::new(
+            super::carry::predecessors().to_vec(),
+            current,
+            empty,
+        ));
+    }
     rooms.replace(loaded);
     rooms.update_required = watching.watch.is_stale();
     // Every room is subscribed afresh on every connection: subscriptions belong to it.
@@ -1002,6 +1026,16 @@ fn follow_on(
                 "reconnecting to finish creating or joining a room".into()
             });
         }
+        // Moves of rooms to their current contract key: follow a moved room there at once,
+        // and start the moves whose wait is over.
+        for id in rooms.seed_ends(pace, Instant::now()) {
+            subs.due_now(id);
+            changed = true;
+        }
+        if writes {
+            rooms.seeds_due(Instant::now());
+        }
+        subs.keep_only(&rooms.contract_ids());
         rooms.archive_revival(unix_secs());
         rooms.dm_save_tick(writes, Instant::now());
         if writes {
@@ -1123,7 +1157,10 @@ fn follow_on(
         };
         // A create's or join's own answer is its alone (`work` takes only what it awaits).
         if let Some(Ok(HostResponse::ContractResponse(r))) = &response
-            && rooms.outbox.work.on_contract(r)
+            && rooms
+                .outbox
+                .work
+                .on_contract_beside(r, &|id| subs.pending.contains_key(id) || resyncs.is_out(id))
         {
             rooms.report(status, report);
             continue;
@@ -1163,7 +1200,9 @@ fn follow_on(
                 changed |= rooms.apply_update(key.id(), &update);
             }
             // The network has no copy. The web UI would seed one with a PUT; this app PUTs only
-            // a room it has just created, so it keeps showing the stored copy and asks again.
+            // a room it has just created, or one moved across a room-contract re-key from an
+            // earlier key that holds it ([`super::rekey`]), so it keeps showing the stored copy
+            // and asks again.
             Some(Ok(HostResponse::ContractResponse(ContractResponse::NotFound {
                 instance_id,
             }))) if (resyncs.is_out(&instance_id) || resyncs.is_late(&instance_id))
@@ -1183,6 +1222,27 @@ fn follow_on(
             }))) => {
                 subs.failed(instance_id, pace);
                 changed |= rooms.following(&instance_id, false);
+                // After a room-contract re-key the current key may have no state yet: follow
+                // the room under its earlier key, and move it ([`super::rekey`]).
+                if let Some(earlier) = rooms.seed_if_rekeyed(&instance_id) {
+                    subs.due_now(earlier);
+                    subs.keep_only(&rooms.contract_ids());
+                    changed = true;
+                }
+            }
+            // An earlier chat delegate's answer, for carrying rooms over: its own key names it.
+            Some(Ok(HostResponse::DelegateResponse { key, mut values }))
+                if &key != delegate::chat_delegate_key() =>
+            {
+                let mut response = HostResponse::DelegateResponse {
+                    key,
+                    values: std::mem::take(&mut values),
+                };
+                if let Some((from, mut answers)) = super::carry::answers_from(&mut response) {
+                    changed |= rooms.outbox.work.on_predecessor(&from, &answers);
+                    // A room's slot holds the user's signing key for it.
+                    delegate::wipe_answers(&mut answers);
+                }
             }
             Some(Ok(mut other)) => {
                 let answers = delegate::answers(&other);
@@ -1232,21 +1292,22 @@ fn follow_on(
                 // River's storage went missing from the node: whatever was waiting on it fails
                 // below, and the next connection registers it again before anything else.
                 let store_gone = chat_delegate_missing(&e);
+                // Whether a delegate error could be the signing key sweep's or the stored rooms
+                // read's, rather than a task's read of an earlier delegate.
+                rooms
+                    .outbox
+                    .work
+                    .set_delegate_shared(rooms.keys.busy() || reload.is_some());
                 let mut taken_by_work = false;
                 // An error that names nothing is a create's or join's only if nothing else
                 // could have caused it.
-                let alone = subs.pending.is_empty()
-                    && !resyncs.any_out()
-                    && reload.is_none()
-                    && !rooms
-                        .list
-                        .iter()
-                        .any(|r| rooms.outbox.owes(&r.stored.owner_vk));
+                let alone = other_out(&subs, &resyncs, reload.is_some(), rooms).none();
                 // A read given up on may still fail (the node retries a GET, each attempt up to
                 // a minute): an error naming nothing, or naming its room with no other request
                 // out for that room, may be that read's, so it is claimed by nobody. What else
                 // it could have been runs to its own deadline instead.
-                let late_reads = (names_nothing(&e) && resyncs.any_late())
+                let late_reads = (names_nothing(&e)
+                    && (resyncs.any_late() || rooms.outbox.work.has_late()))
                     || failed_contract(&e).is_some_and(|id| {
                         resyncs.is_late(&id)
                             && !resyncs.is_out(&id)
@@ -1421,6 +1482,52 @@ fn reload_due(work: &mut super::work::Work, since_read: Duration, pace: &Pace) -
     !work.busy() && (work.take_reload() || since_read >= pace.refresh)
 }
 
+/// How many times a run a moved room's earlier keys that did not answer, or answered NotFound
+/// while a merge is owed from them, are read again.
+const MAX_FOLD_RETRIES: u32 = 5;
+
+/// What else may be out on the connection when an error that names nothing arrives.
+#[derive(Clone, Copy, Debug, Default)]
+struct OtherOut {
+    subscribing: bool,
+    reading_rooms: bool,
+    reading_store: bool,
+    key_request: bool,
+    update_owed: bool,
+}
+
+/// What else is out on the connection now.
+fn other_out(
+    subs: &Subscriptions,
+    resyncs: &Resyncs,
+    reading_store: bool,
+    rooms: &Rooms,
+) -> OtherOut {
+    OtherOut {
+        subscribing: !subs.pending.is_empty(),
+        reading_rooms: resyncs.any_out(),
+        reading_store,
+        key_request: rooms.keys.busy(),
+        update_owed: rooms
+            .list
+            .iter()
+            .any(|r| rooms.outbox.owes(&r.stored.owner_vk)),
+    }
+}
+
+impl OtherOut {
+    /// Whether nothing but a create's or join's request can have caused an error that names
+    /// nothing: no subscribe, room read, read of the stored rooms or signing key request is
+    /// out, and no room owes an update's answer.
+    fn none(self) -> bool {
+        !self.subscribing
+            && !self.reading_rooms
+            && !self.reading_store
+            && !self.key_request
+            && !self.update_owed
+    }
+}
+
 /// Whether the node's error names no request: how it reports one that failed to start
 /// (`EmptyRing`, `PeerNotJoined`, `Shutdown`, an operation error or failure).
 fn names_nothing(e: &ClientError) -> bool {
@@ -1478,6 +1585,11 @@ struct Loaded {
     store_missing: bool,
     /// How many `room:` keys the store listed (tombstones included).
     listed: usize,
+    /// Those keys' rooms, by owner (tombstones included).
+    listed_rooms: Vec<VerifyingKey>,
+    /// The earlier room-contract keys each room's slot still owes a merge from (the web UI's
+    /// `rekey_merge.owed`), by owner.
+    owed: HashMap<VerifyingKey, Vec<freenet_stdlib::prelude::ContractKey>>,
     /// Stored rooms that could not be decoded.
     unreadable: usize,
     /// What `outbound_dms` held (read here; written by [`super::dm_save`]).
@@ -1492,6 +1604,8 @@ impl Loaded {
             modes: HashMap::new(),
             store_missing: true,
             listed: 0,
+            listed_rooms: Vec::new(),
+            owed: HashMap::new(),
             unreadable: 0,
             dms: DmRead::NotListed,
         }
@@ -1594,6 +1708,7 @@ impl Loader {
             None => DmRead::NotListed,
         };
         let mut slots = Vec::new();
+        let mut owed = HashMap::new();
         let mut unreadable = 0;
         for vk in &self.rooms {
             let Some(Some(Some(bytes))) = wanted.remove(&room_storage_key(vk)) else {
@@ -1603,7 +1718,13 @@ impl Loader {
                 continue;
             }
             match decode_room_slot(&bytes) {
-                Ok(StoredRoomSlot::Present(room)) => slots.push(*room),
+                Ok(StoredRoomSlot::Present(room)) => {
+                    let keys = super::rekey::owed_keys(&bytes);
+                    if !keys.is_empty() {
+                        owed.insert(room.owner_vk, keys);
+                    }
+                    slots.push(*room)
+                }
                 Ok(StoredRoomSlot::Tombstone) => {}
                 // One unreadable room must not hide the others; the screen counts it.
                 Err(e) => {
@@ -1618,6 +1739,8 @@ impl Loader {
             modes,
             store_missing: false,
             listed: self.rooms.len(),
+            listed_rooms: self.rooms.clone(),
+            owed,
             unreadable,
             dms,
         }
@@ -1955,6 +2078,20 @@ struct Rooms {
     exports: Vec<(String, Result<String, String>)>,
     /// The store went missing on the last connection: the next one registers it first.
     register_first: bool,
+    /// Carrying rooms over from earlier chat delegates was started this run.
+    carry_started: bool,
+    /// Rooms stored under an earlier room-contract key, followed under the current one: the
+    /// earlier key, by owner.
+    rekeyed: HashMap<VerifyingKey, freenet_stdlib::prelude::ContractKey>,
+    /// Rooms followed under their earlier key until a move to the current one succeeds.
+    on_earlier: HashSet<VerifyingKey>,
+    /// Rooms being moved to their current contract key now.
+    seeding: HashSet<VerifyingKey>,
+    /// Moves to try again: attempts so far, when, and the earlier keys to read.
+    /// `None` while that move is under way.
+    seed_retry: HashMap<VerifyingKey, (u32, Option<Instant>, Vec<ContractInstanceId>)>,
+    /// The earlier room-contract keys each stored room's slot still owes a merge from.
+    owed: HashMap<VerifyingKey, Vec<freenet_stdlib::prelude::ContractKey>>,
     /// While the store could not be set up: when the app next registers it by itself, and
     /// the wait after that one. `None` while the store is there.
     register_retry: Option<(Instant, Duration)>,
@@ -2195,6 +2332,7 @@ impl Rooms {
         }
         // The rooms stored now are the ones there are: a finished leave has done its work.
         self.outbox.work.rooms_read();
+        self.owed = std::mem::take(&mut loaded.owed);
         let mut old: HashMap<VerifyingKey, LiveRoom> = self
             .list
             .drain(..)
@@ -2202,8 +2340,24 @@ impl Rooms {
             .collect();
         let mut new_ids = Vec::new();
         let mut by_key: HashMap<VerifyingKey, LiveRoom> = HashMap::new();
-        for slot in loaded.slots {
+        for mut slot in loaded.slots {
             let vk = slot.owner_vk;
+            // A room stored under one of its earlier contract keys is followed under the key
+            // this build's room contract gives it ([`super::rekey`]).
+            // While a move of it is under way (the current key had no state), it is followed
+            // under the earlier key it was stored under, as before the re-key.
+            match super::rekey::current_key(&slot) {
+                (current, Some(earlier)) => {
+                    if !self.on_earlier.contains(&vk) {
+                        slot.contract_key = current;
+                    }
+                    self.rekeyed.insert(vk, earlier);
+                }
+                (_, None) => {
+                    self.rekeyed.remove(&vk);
+                    self.on_earlier.remove(&vk);
+                }
+            }
             // A room being left stays off the list (and unsubscribed) while its tombstone
             // is on its way: the read just made may have come first.
             if self.outbox.work.leaving(&vk) {
@@ -3231,6 +3385,144 @@ impl Rooms {
         }
         subs.failed(id, pace);
         self.following(&id, false)
+    }
+
+    /// The network answered that it has no state under `id`. When `id` is the current contract
+    /// key of a room stored under an earlier one, and no move of it is under way or waiting: the
+    /// room is followed under its earlier key again, and moved ([`super::rekey`]). The earlier
+    /// key's id, to ask for, when that happened.
+    fn seed_if_rekeyed(&mut self, id: &ContractInstanceId) -> Option<ContractInstanceId> {
+        let room = self.by_contract(id)?;
+        let owner = room.stored.owner_vk;
+        let earlier = *self.rekeyed.get(&owner)?;
+        if *id != *super::create::contract_key(&owner).id()
+            || self.seeding.contains(&owner)
+            || self.seed_retry.contains_key(&owner)
+        {
+            return None;
+        }
+        let candidates = self.seed_candidates(&owner, earlier);
+        self.start_seed(owner, candidates);
+        self.on_earlier.insert(owner);
+        let room = self.list.iter_mut().find(|r| r.stored.owner_vk == owner)?;
+        room.stored.contract_key = earlier;
+        // Answers owed under the key left won't come under this one (as `replace` does).
+        self.outbox.forget_owed(&owner);
+        Some(*earlier.id())
+    }
+
+    /// The earlier keys to fold when moving `owner`'s room, stored under `earlier`: down to the
+    /// deepest of that key and the keys its slot still owes a merge from (the web UI's
+    /// `rekey_candidates`).
+    fn seed_candidates(
+        &self,
+        owner: &VerifyingKey,
+        earlier: freenet_stdlib::prelude::ContractKey,
+    ) -> Vec<ContractInstanceId> {
+        let mut owed = vec![earlier];
+        owed.extend(self.owed.get(owner).into_iter().flatten().copied());
+        super::rekey::candidates_down_to_owed(owner, &owed)
+    }
+
+    /// Start moving `owner`'s room from the earlier keys `candidates`.
+    fn start_seed(&mut self, owner: VerifyingKey, candidates: Vec<ContractInstanceId>) {
+        let Some(room) = self.list.iter().find(|r| r.stored.owner_vk == owner) else {
+            return;
+        };
+        let (name, local) = (room.name(), room.stored.room_state.clone());
+        // The keys a merge is owed from: the one it was stored under, and its slot's.
+        let owed: Vec<ContractInstanceId> = self
+            .rekeyed
+            .get(&owner)
+            .into_iter()
+            .chain(self.owed.get(&owner).into_iter().flatten())
+            .map(|k| *k.id())
+            .collect();
+        if self
+            .outbox
+            .work
+            .seed_owing(owner, name, candidates, owed, local)
+        {
+            self.seeding.insert(owner);
+        }
+    }
+
+    /// Take the moves that ended: a room moved is followed under its current key (its id is
+    /// returned, to ask for at once), with the earlier keys that did not answer folded in later;
+    /// one that did not move is tried again after a wait that doubles.
+    fn seed_ends(&mut self, pace: &Pace, now: Instant) -> Vec<ContractInstanceId> {
+        let mut follow = Vec::new();
+        for end in self.outbox.work.take_seed_ends() {
+            let owner = end.room;
+            self.seeding.remove(&owner);
+            let Some(earlier) = self.rekeyed.get(&owner).copied() else {
+                continue;
+            };
+            let attempts = self.seed_retry.get(&owner).map_or(0, |(n, _, _)| *n);
+            self.seed_retry.remove(&owner);
+            if !self.list.iter().any(|r| r.stored.owner_vk == owner) {
+                // Left meanwhile: nothing to try again.
+                self.on_earlier.remove(&owner);
+                continue;
+            }
+            if end.moved {
+                self.on_earlier.remove(&owner);
+                let current = super::create::contract_key(&owner);
+                if let Some(room) = self.list.iter_mut().find(|r| r.stored.owner_vk == owner) {
+                    room.stored.contract_key = current;
+                    // Answers owed under the key left won't come under this one.
+                    self.outbox.forget_owed(&owner);
+                    follow.push(*current.id());
+                }
+                // Keys still owed are read again a bounded number of times a run (the web UI
+                // gives one up after `MAX_UNFINISHED_REKEY_LOADS` loads).
+                if !end.unresolved.is_empty() && attempts < MAX_FOLD_RETRIES {
+                    let wait = pace
+                        .resubscribe_first
+                        .saturating_mul(1 << attempts.min(16))
+                        .min(pace.resubscribe_max);
+                    self.seed_retry.insert(
+                        owner,
+                        (attempts.saturating_add(1), Some(now + wait), end.unresolved),
+                    );
+                }
+            } else {
+                let wait = pace
+                    .resubscribe_first
+                    .saturating_mul(1 << attempts.min(16))
+                    .min(pace.resubscribe_max);
+                let candidates = self.seed_candidates(&owner, earlier);
+                self.seed_retry.insert(
+                    owner,
+                    (attempts.saturating_add(1), Some(now + wait), candidates),
+                );
+            }
+        }
+        follow
+    }
+
+    /// Start the moves whose wait is over. One for a room no longer shown, or no longer
+    /// stored under an earlier key, is dropped.
+    fn seeds_due(&mut self, now: Instant) {
+        let due: Vec<(VerifyingKey, Vec<ContractInstanceId>)> = self
+            .seed_retry
+            .iter()
+            .filter(|(o, (_, at, _))| at.is_some_and(|at| at <= now) && !self.seeding.contains(*o))
+            .map(|(o, (_, _, c))| (*o, c.clone()))
+            .collect();
+        for (owner, candidates) in due {
+            let shown = self.list.iter().any(|r| r.stored.owner_vk == owner);
+            if !shown || !self.rekeyed.contains_key(&owner) {
+                self.seed_retry.remove(&owner);
+                self.on_earlier.remove(&owner);
+                continue;
+            }
+            // Under way: the attempt count is kept, and the wait is set again when it ends.
+            if let Some(entry) = self.seed_retry.get_mut(&owner) {
+                entry.1 = None;
+            }
+            self.start_seed(owner, candidates);
+        }
     }
 
     /// Record whether a room is subscribed; true when that changed what shows.

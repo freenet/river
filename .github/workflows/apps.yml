@@ -32,6 +32,8 @@ on:
       # The app reads River's pointer records to tell when River has moved past the WASM
       # it carries, and a test checks the author key against FREENET.md.
       - 'pointer-records.toml'
+      # The app carries rooms over from the earlier chat delegates this registry lists.
+      - 'legacy_delegates.toml'
       - 'FREENET.md'
       - '.github/workflows/apps.yml'
   push:
@@ -54,6 +56,8 @@ on:
       # The app reads River's pointer records to tell when River has moved past the WASM
       # it carries, and a test checks the author key against FREENET.md.
       - 'pointer-records.toml'
+      # The app carries rooms over from the earlier chat delegates this registry lists.
+      - 'legacy_delegates.toml'
       - 'FREENET.md'
       - '.github/workflows/apps.yml'
   workflow_dispatch:

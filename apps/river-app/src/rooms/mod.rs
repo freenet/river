@@ -33,8 +33,11 @@
 //! everything else in the slot. The one other thing it writes is each room's signing
 //! key, in the delegate's own namespace for keys, only where the delegate holds none, or holds
 //! another after the user imported that room's identity ([`keys`]).
-//! Its only PUT is the seed PUT of a room it has just created, under that room's own contract;
-//! it never seeds a room the network lacks, which the web UI does.
+//! It PUTs a room it has just created, under that room's own contract, and, across a room-contract
+//! re-key, a room whose current key answered that it has no state: the room's state carried from
+//! its earlier keys, or its own copy when none holds it, as the web UI seeds one ([`rekey`]).
+//! Before River re-keys, it also carries the user's rooms over from earlier chat delegates
+//! ([`carry`]).
 //!
 //! It writes none of that once River has moved to a newer chat delegate or room contract than
 //! the one it carries ([`generation`]): it would be writing where the web UI no longer reads.
@@ -50,6 +53,7 @@
 //! a thread by editing `hidden_threads` of the same value, in the same write ([`dm_archive`]).
 
 pub mod bans;
+pub mod carry;
 pub mod create;
 pub mod delegate;
 pub mod deputies;
@@ -72,6 +76,7 @@ pub mod leave;
 mod link_tests;
 pub mod modes;
 pub mod outbox;
+pub mod rekey;
 mod resync;
 pub mod room;
 #[cfg(test)]

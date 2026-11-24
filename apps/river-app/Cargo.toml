@@ -21,7 +21,8 @@ polling = "3"
 # client-only features the room-contract and chat-delegate WASM builds never enable.
 # `ecies-randomized` seals what is sent to a private room (it needs a random nonce).
 # `invitation` encodes and decodes invite codes as the web UI does.
-river-core = { path = "../../common", features = ["ecies-randomized", "ecies-client", "mentions", "stored-rooms", "invitation"] }
+# `migration` lists each room's earlier room-contract keys, to follow a room across a re-key.
+river-core = { path = "../../common", features = ["ecies-randomized", "ecies-client", "mentions", "stored-rooms", "invitation", "migration"] }
 # Fresh keys for a new room and for an invitee, from the same thread RNG the web UI and
 # riverctl draw them from (the version river-core already locks here).
 rand = "0.8"
