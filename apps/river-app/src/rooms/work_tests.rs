@@ -2993,6 +2993,8 @@ fn the_walk_stops_at_its_budget_and_try_again_starts_a_new_one() {
         panic!("not failed: {view:?}");
     };
     assert!(why.contains("too long"), "{why}");
+    // It says what helps: the web UI carries rooms past a generation this app can't read.
+    assert!(why.contains("open River in your browser"), "{why}");
     assert!(w.retry(view.id));
     let later = t0 + WALK_BUDGET + Duration::from_secs(1);
     assert!(w.next_request(false, later).is_some(), "a new budget");

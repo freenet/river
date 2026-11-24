@@ -2277,7 +2277,10 @@ fn carry_failure(c: &Carry) -> String {
         (1, Some(why)) => format!("1 room from an earlier version can't be read ({why}). "),
         (n, Some(why)) => format!("{n} rooms from an earlier version can't be read ({why}, ...). "),
     };
-    format!("{carried}{stopped}{held}Try again to read them again.")
+    format!(
+        "{carried}{stopped}{held}What helps: open River in your browser once on this computer's \
+         Freenet (it can carry these rooms over), then Try again here."
+    )
 }
 
 #[cfg(test)]

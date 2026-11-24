@@ -51,6 +51,14 @@
 //! delegate) is an empty store and is passed over; the web UI keeps such a predecessor pending,
 //! since a node can unregister a delegate without deleting its store, which River never does.
 //!
+//! **Residual: a permanently unreadable generation.** A generation that can never be read (a
+//! frozen short index, an old WASM that traps on the current runtime) stops the walk on every
+//! start, after what it proves it holds is carried. A desktop-only user then does not get the
+//! rooms only that generation and older ones hold until the web UI runs on the node once: its
+//! journaled walk carries older generations past a faulty one under ranks and corrects them
+//! later, which needs its room merge (`merge_from_source`); this app does not carry past it.
+//! The failure row says to open River in the browser once, then Try again.
+//!
 //! **Its rank is recorded, before the room.** For each room written, `rooms_meta`'s
 //! `identity_sources` gets the generation its rank is (as the web UI persists ranks below the
 //! current one, `persisted_identity_sources`), so the web UI's ranked merge still lets a newer
