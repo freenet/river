@@ -7556,7 +7556,7 @@ fn sponsor_preflight(
     };
     // A full key names one exact key: the entry must carry it, not just a key
     // that hashes to the same id.
-    if let Some(typed) = bs58::decode(input)
+    if let Some(typed) = bs58::decode(input.trim())
         .into_vec()
         .ok()
         .and_then(|b| <[u8; 32]>::try_from(b).ok())
@@ -15739,6 +15739,10 @@ mod provisional_ban_tests {
         let full = bs58::encode(f.a.verifying_key().as_bytes()).into_string();
         assert!(sponsor_preflight(&f.state, owner_id, owner_id, &full).is_ok());
         assert!(ban_preflight(&f.state, owner_id, owner_id, &full, BanSafety::default()).is_ok());
+        // Padded full-key input is trimmed before the key check, as the id
+        // resolver trims it.
+        let padded = format!("  {full}\n");
+        assert!(sponsor_preflight(&f.state, owner_id, owner_id, &padded).is_ok());
     }
 
     fn safety(exact: bool, desc: bool, dep: bool) -> BanSafety {
