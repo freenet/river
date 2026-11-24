@@ -57,7 +57,10 @@ pub fn current_key(room: &StoredRoom) -> (ContractKey, Option<ContractKey>) {
 
 /// The earlier keys to read for a room stored under `stored`, newest first, down to it (all of
 /// them when it is not one of them).
-pub fn candidates_down_to(owner: &VerifyingKey, stored: Option<&ContractKey>) -> Vec<ContractInstanceId> {
+pub fn candidates_down_to(
+    owner: &VerifyingKey,
+    stored: Option<&ContractKey>,
+) -> Vec<ContractInstanceId> {
     let all = legacy_contract_keys_for_owner(owner);
     let mut out = Vec::new();
     for k in &all {
@@ -86,7 +89,11 @@ impl ProbeStateOps for RiverOps {
         state.configuration.verify_signature(&self.owner).is_ok()
     }
 
-    fn merge_with_local(&self, recovered: ChatRoomStateV1, local: &ChatRoomStateV1) -> ChatRoomStateV1 {
+    fn merge_with_local(
+        &self,
+        recovered: ChatRoomStateV1,
+        local: &ChatRoomStateV1,
+    ) -> ChatRoomStateV1 {
         // A join or import holds no copy (a default state, which no owner signed): nothing to
         // keep. Otherwise what the user's copy holds is merged in, so nothing they had is lost;
         // on a failed merge the recovered state alone goes forward, as in the web UI.
@@ -98,7 +105,9 @@ impl ProbeStateOps for RiverOps {
         match merged.merge_from(&params, local) {
             Ok(()) => merged,
             Err(e) => {
-                eprintln!("River: the copy of a room could not be merged into its earlier state: {e}");
+                eprintln!(
+                    "River: the copy of a room could not be merged into its earlier state: {e}"
+                );
                 recovered
             }
         }
@@ -122,7 +131,11 @@ pub enum Found {
 impl Probe {
     /// A probe of `candidates` (newest first) for `owner`'s room, with the user's copy `local`
     /// (a default state when there is none).
-    pub fn new(owner: VerifyingKey, candidates: Vec<ContractInstanceId>, local: ChatRoomStateV1) -> Probe {
+    pub fn new(
+        owner: VerifyingKey,
+        candidates: Vec<ContractInstanceId>,
+        local: ChatRoomStateV1,
+    ) -> Probe {
         let driver = ProbeDriver::new(
             RiverOps { owner },
             local,
@@ -131,7 +144,9 @@ impl Probe {
         )
         // As the web UI's backward probe: a key that never answers is passed over, so one
         // unreachable generation does not hide an older one that holds the room.
-        .continue_past_unknown(RollbackRiskAck::i_understand_continuing_past_silence_can_roll_back());
+        .continue_past_unknown(
+            RollbackRiskAck::i_understand_continuing_past_silence_can_roll_back(),
+        );
         Probe { owner, driver }
     }
 
@@ -169,7 +184,10 @@ impl Probe {
 /// The PUT that carries `state` to `owner`'s room under the current key: its upgrade pointer
 /// stripped (an earlier key's pointer must never be planted on the current one, freenet/river#427)
 /// and normalized, as the room contract accepts only states its cleanup leaves unchanged.
-pub fn put_forward(owner: &VerifyingKey, state: &ChatRoomStateV1) -> Result<ContractRequest<'static>, String> {
+pub fn put_forward(
+    owner: &VerifyingKey,
+    state: &ChatRoomStateV1,
+) -> Result<ContractRequest<'static>, String> {
     let mut stripped = state.clone();
     stripped.upgrade = OptionalUpgradeV1(None);
     let normalized = stripped

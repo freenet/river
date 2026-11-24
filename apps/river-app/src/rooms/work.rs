@@ -57,7 +57,8 @@
 //!   such a build creates after that window never reaches the web UI. Before the app
 //!   registered, that build showed "update this app" instead. Detecting a newer delegate
 //!   through River's pointer records and refusing to write closes this (`generation.rs`,
-//!   freenet/river#888). A desktop-only user's rooms still need carrying forward (#889).
+//!   freenet/river#888). A desktop-only user's rooms are carried forward by this app itself
+//!   ([`super::carry`], #889), a task like the others here.
 //! - **Schema skew.** The walk runs only over a complete current room set
 //!   (`room_set_complete`), which needs every stored slot and `rooms_meta` to decode. A slot
 //!   or meta written by this app in a shape an older web UI cannot decode refuses the walk
@@ -68,7 +69,9 @@
 //! **Matching answers.** Delegate answers carry no request id, and neither do contract
 //! answers. So one task works at a time, with one request out, and an answer is taken only if
 //! it is the kind awaited, for the key awaited: a `GetVersionedResponse` or `CasStoreResponse`
-//! for the delegate key, a GET, PUT or UPDATE answer for the room's contract. Nothing else on
+//! for the delegate key, a GET, PUT or UPDATE answer for the room's contract, a `ListResponse`
+//! or `GetResponse` from the earlier chat delegate asked ([`super::carry`], whose answers name
+//! that delegate's key, so nothing else on the connection can be taken for them). Nothing else on
 //! the connection sends those: the stored rooms are read with `GetRequest`, and the session
 //! does not start reading them while a task is working, nor a task while a read is out; while
 //! a join's room is shown, nothing else is sent to it. An error that names nothing is taken
@@ -94,7 +97,9 @@ use freenet_stdlib::client_api::{
     ClientError, ClientRequest, ContractError, ContractRequest, ContractResponse, DelegateError,
     ErrorKind, RequestError,
 };
-use freenet_stdlib::prelude::{ContractInstanceId, ContractKey, DelegateKey, StateDelta, UpdateData};
+use freenet_stdlib::prelude::{
+    ContractInstanceId, ContractKey, DelegateKey, StateDelta, UpdateData,
+};
 use river_core::chat_delegate::{CasStoreResult, ChatDelegateResponseMsg};
 use river_core::invitation::Invitation;
 use river_core::room_state::ChatRoomStateV1;
@@ -105,7 +110,6 @@ use river_core::stored_rooms::{
 };
 
 use super::carry::{self, Ask, Carry};
-use super::rekey::{self, Found, Probe};
 use super::create::{self, JoinPlan, NewRoomPlan};
 use super::delegate;
 use super::dm_archive::ArchiveOp;
@@ -114,6 +118,7 @@ use super::dm_store::{self, DmOp, EntryKey};
 use super::identity::{self, IdentityToken, ImportWrite};
 use super::leave::{meta_without_room, tombstone_write};
 use super::modes::{NotificationMode, meta_with_mode};
+use super::rekey::{self, Found, Probe};
 
 /// How many times a write is worked out again after another writer got in first. The web UI's
 /// `ROOMS_CAS_MAX_ATTEMPTS`.
@@ -828,8 +833,18 @@ impl Work {
     /// Move `room`, stored under the earlier contract key `stored`, to its current key, which
     /// has no state on the network ([`super::rekey`]); `local` is the copy the user holds. Once
     /// per room per run: false when it was asked already.
-    pub fn seed(&mut self, room: VerifyingKey, name: String, stored: ContractKey, local: ChatRoomStateV1) -> bool {
-        if self.tasks.iter().any(|t| t.is_seed() && t.owner() == Some(room)) {
+    pub fn seed(
+        &mut self,
+        room: VerifyingKey,
+        name: String,
+        stored: ContractKey,
+        local: ChatRoomStateV1,
+    ) -> bool {
+        if self
+            .tasks
+            .iter()
+            .any(|t| t.is_seed() && t.owner() == Some(room))
+        {
             return false;
         }
         let candidates = rekey::candidates_down_to(&room, Some(&stored));
@@ -846,7 +861,11 @@ impl Work {
     }
 
     /// An answer from an earlier chat delegate (`from`). True when it was the working task's.
-    pub fn on_predecessor(&mut self, from: &DelegateKey, answers: &[ChatDelegateResponseMsg]) -> bool {
+    pub fn on_predecessor(
+        &mut self,
+        from: &DelegateKey,
+        answers: &[ChatDelegateResponseMsg],
+    ) -> bool {
         let Some(t) = self.active() else {
             return false;
         };
@@ -1305,8 +1324,11 @@ impl Work {
     /// delegate's: a delegate runs on the node itself, with no ring), and an `Unhandled` is taken
     /// for it only when nothing else is out.
     pub fn has_out(&self) -> bool {
-        self.active_ref()
-            .is_some_and(|t| t.out.as_ref().is_some_and(|(o, _)| !matches!(o, Out::Pred(_))))
+        self.active_ref().is_some_and(|t| {
+            t.out
+                .as_ref()
+                .is_some_and(|(o, _)| !matches!(o, Out::Pred(_)))
+        })
     }
 
     /// Whether a task is working on the room owned by `owner`, so nothing else may be sent to
@@ -1706,16 +1728,15 @@ impl Work {
         // a delegate error is this read's. The node not holding it is the usual answer.
         if let Out::Pred(ask) = out {
             let ask = ask.clone();
-            let why = match e.kind() {
-                ErrorKind::RequestError(RequestError::DelegateError(DelegateError::Missing(k)))
-                    if k == ask.delegate() =>
-                {
-                    None
-                }
-                ErrorKind::RequestError(RequestError::DelegateError(d)) => Some(d.to_string()),
-                ErrorKind::Unhandled { cause } if alone => Some(short(cause)),
-                _ => return false,
-            };
+            let why =
+                match e.kind() {
+                    ErrorKind::RequestError(RequestError::DelegateError(
+                        DelegateError::Missing(k),
+                    )) if k == ask.delegate() => None,
+                    ErrorKind::RequestError(RequestError::DelegateError(d)) => Some(d.to_string()),
+                    ErrorKind::Unhandled { cause } if alone => Some(short(cause)),
+                    _ => return false,
+                };
             let Kind::Carry(c) = &mut t.kind else {
                 return false;
             };
@@ -1740,7 +1761,8 @@ impl Work {
             let id = *id;
             let absent = match e.kind() {
                 ErrorKind::RequestError(RequestError::ContractError(ContractError::Get {
-                    key, ..
+                    key,
+                    ..
                 })) if *key.id() == id => false,
                 ErrorKind::RequestError(RequestError::ContractError(
                     ContractError::MissingContract { key },

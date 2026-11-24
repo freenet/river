@@ -48,13 +48,11 @@ use std::sync::OnceLock;
 
 use freenet_stdlib::client_api::{ClientRequest, DelegateRequest, HostResponse};
 use freenet_stdlib::prelude::{
-    ApplicationMessage, CodeHash, DelegateKey, InboundDelegateMsg, OutboundDelegateMsg,
-    Parameters,
+    ApplicationMessage, CodeHash, DelegateKey, InboundDelegateMsg, OutboundDelegateMsg, Parameters,
 };
 use river_core::chat_delegate::{ChatDelegateKey, ChatDelegateRequestMsg, ChatDelegateResponseMsg};
 use river_core::stored_rooms::{
-    NewRoom, StoredRoom, StoredRoomSlot, decode_room_slot, encode_new_room,
-    parse_room_storage_key,
+    NewRoom, StoredRoom, StoredRoomSlot, decode_room_slot, encode_new_room, parse_room_storage_key,
 };
 use zeroize::Zeroize;
 
@@ -140,7 +138,9 @@ pub fn request(key: &DelegateKey, msg: &ChatDelegateRequestMsg) -> ClientRequest
 
 /// The answers in a response from the delegate `key`, if the response is that delegate's. The
 /// payloads are wiped once decoded: a room's slot holds the user's signing key for it.
-pub fn answers_from(response: &mut HostResponse) -> Option<(DelegateKey, Vec<ChatDelegateResponseMsg>)> {
+pub fn answers_from(
+    response: &mut HostResponse,
+) -> Option<(DelegateKey, Vec<ChatDelegateResponseMsg>)> {
     let HostResponse::DelegateResponse { key, values } = response else {
         return None;
     };
@@ -276,7 +276,12 @@ impl Carry {
     }
 
     /// The predecessor's answer to `ask`, the request out. True when it was that answer.
-    pub fn on_answer(&mut self, ask: &Ask, from: &DelegateKey, answer: &ChatDelegateResponseMsg) -> bool {
+    pub fn on_answer(
+        &mut self,
+        ask: &Ask,
+        from: &DelegateKey,
+        answer: &ChatDelegateResponseMsg,
+    ) -> bool {
         if ask.delegate() != from || self.next_ask().as_ref() != Some(ask) {
             return false;
         }
@@ -304,14 +309,22 @@ impl Carry {
                 if k.as_bytes() == key.as_slice() =>
             {
                 let version = self.preds[self.at].version.clone();
-                match value.as_deref().filter(|v| !v.is_empty()).map(decode_room_slot) {
+                match value
+                    .as_deref()
+                    .filter(|v| !v.is_empty())
+                    .map(decode_room_slot)
+                {
                     Some(Ok(StoredRoomSlot::Present(room))) => {
                         // A slot under another room's key is not that room's: left alone.
                         if parse_room_storage_key(key) == Some(room.owner_vk) {
-                            self.found
-                                .insert(key.clone(), (version, Found::Room(Box::new(new_room(*room)))));
+                            self.found.insert(
+                                key.clone(),
+                                (version, Found::Room(Box::new(new_room(*room)))),
+                            );
                         } else {
-                            eprintln!("River: a room stored in {version} names another room; not carried");
+                            eprintln!(
+                                "River: a room stored in {version} names another room; not carried"
+                            );
                         }
                     }
                     Some(Ok(StoredRoomSlot::Tombstone)) => {

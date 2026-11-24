@@ -1063,11 +1063,13 @@ fn answer(world: &Mutex<World>, n: usize, bytes: &[u8]) -> Vec<Vec<u8>> {
         }
         // An earlier chat delegate (carrying rooms over): answered from `legacy` when the node
         // holds it, `Missing` otherwise, as a node answers for a delegate never registered.
-        ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages { key, inbound, .. })
-            if &key != delegate::chat_delegate_key() =>
-        {
+        ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages {
+            key, inbound, ..
+        }) if &key != delegate::chat_delegate_key() => {
             assert!(
-                super::super::carry::predecessors().iter().any(|p| p.key == key),
+                super::super::carry::predecessors()
+                    .iter()
+                    .any(|p| p.key == key),
                 "the app asked a delegate that is neither River's nor an earlier River's: {key}"
             );
             w.legacy_asks.push((n, key.clone()));
@@ -10097,7 +10099,10 @@ mod rekey {
         let session = Running::start(&node, &dir, quick());
         session.wait_rooms("the room is shown", |r, _, _| names(r) == ["A"]);
         session.wait_until("the carry is over", || {
-            session.last_work().iter().all(|w| !w.what.contains("earlier version"))
+            session
+                .last_work()
+                .iter()
+                .all(|w| !w.what.contains("earlier version"))
         });
         assert_eq!(node.with(|w| w.slots[&slot_key].clone()), their_slot);
     }
@@ -10139,7 +10144,9 @@ mod rekey {
                 matches!(&w.state, WorkState::Failed { why, retry: true } if why.contains(&preds[0].version))
             })
         });
-        session.wait_rooms("the other store's room is shown", |r, _, _| names(r) == ["B"]);
+        session.wait_rooms("the other store's room is shown", |r, _, _| {
+            names(r) == ["B"]
+        });
         node.with(|w| w.silence_legacy = None);
         let id = session
             .last_work()
@@ -10158,15 +10165,17 @@ mod rekey {
     fn a_room_under_an_earlier_contract_key_is_moved_to_the_current_one() {
         let node = fake_node(vec![]);
         let owner = SigningKey::from_bytes(&[1; 32]);
-        let earlier = river_core::migration::legacy_contract_keys_for_owner(&owner.verifying_key())[0];
+        let earlier =
+            river_core::migration::legacy_contract_keys_for_owner(&owner.verifying_key())[0];
         let current = crate::rooms::create::contract_key(&owner.verifying_key());
         let mut room = TestRoom::new(1, "A", 1, &["in my copy"]);
         room.key = earlier;
         let mut network = room.state.clone();
-        network
-            .recent_messages
-            .messages
-            .push(message(&room.owner, SystemTime::now(), "on the earlier key"));
+        network.recent_messages.messages.push(message(
+            &room.owner,
+            SystemTime::now(),
+            "on the earlier key",
+        ));
         node.with(|w| {
             w.slots.insert(room_storage_key(&room.vk()), room.slot());
             w.contracts
@@ -10192,7 +10201,10 @@ mod rekey {
                 && s == LinkStatus::Live
         });
         node.with(|w| {
-            assert!(w.subscribes_to(*current.id()) >= 2, "asked again once moved");
+            assert!(
+                w.subscribes_to(*current.id()) >= 2,
+                "asked again once moved"
+            );
             // The earlier key is only read, never subscribed to or written.
             assert!(w.reads.iter().any(|(id, _)| id == earlier.id()));
             assert!(w.updates.iter().all(|(k, _)| k != &earlier));

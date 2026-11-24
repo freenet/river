@@ -2,10 +2,10 @@ use super::*;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use freenet_stdlib::prelude::{ContractCode, ContractKey};
 use river_core::room_state::ChatRoomParametersV1;
+use river_core::room_state::ChatRoomStateV1;
 use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
 use river_core::room_state::member::MemberId;
 use river_core::room_state::privacy::RoomDisplayMetadata;
-use river_core::room_state::ChatRoomStateV1;
 use river_core::stored_rooms::room_storage_key;
 
 fn cbor<T: serde::Serialize>(v: &T) -> Vec<u8> {
@@ -144,7 +144,10 @@ fn the_registry_parses_newest_first_with_every_row() {
         [0x1a, 0x93, 0x30, 0x82]
     );
     // None is the delegate this build carries.
-    assert!(list.iter().all(|p| &p.key != super::super::delegate::chat_delegate_key()));
+    assert!(
+        list.iter()
+            .all(|p| &p.key != super::super::delegate::chat_delegate_key())
+    );
 }
 
 #[test]
@@ -162,7 +165,10 @@ fn a_new_registry_row_is_walked_with_no_code_change() {
 
 #[test]
 fn rooms_only_in_a_predecessor_are_carried_with_their_identity() {
-    let stores: Stores = BTreeMap::from([(39, BTreeMap::from([(key(1), slot(1, 11)), (key(2), slot(2, 12))]))]);
+    let stores: Stores = BTreeMap::from([(
+        39,
+        BTreeMap::from([(key(1), slot(1, 11)), (key(2), slot(2, 12))]),
+    )]);
     let mut c = Carry::new(preds(&[39, 38]), Vec::new(), true);
     let out = walk(&mut c, &stores);
     assert_eq!(out, BTreeMap::from([(key(1), me(11)), (key(2), me(12))]));
@@ -187,11 +193,18 @@ fn a_skipped_release_is_carried_from_older_generations() {
 fn the_newest_generation_decides_identity_and_tombstones() {
     let stores: Stores = BTreeMap::from([
         // Newest: room 1 left, room 2 under identity 22.
-        (39, BTreeMap::from([(key(1), tombstone()), (key(2), slot(2, 22))])),
+        (
+            39,
+            BTreeMap::from([(key(1), tombstone()), (key(2), slot(2, 22))]),
+        ),
         // Older: room 1 present, room 2 under identity 12, room 3 present.
         (
             38,
-            BTreeMap::from([(key(1), slot(1, 11)), (key(2), slot(2, 12)), (key(3), slot(3, 13))]),
+            BTreeMap::from([
+                (key(1), slot(1, 11)),
+                (key(2), slot(2, 12)),
+                (key(3), slot(3, 13)),
+            ]),
         ),
         // Oldest: room 3 left long ago (older than its presence in V38).
         (37, BTreeMap::from([(key(3), tombstone())])),
@@ -209,8 +222,10 @@ fn the_newest_generation_decides_identity_and_tombstones() {
 fn rooms_the_current_store_holds_are_never_read_or_carried() {
     // The successor is partly populated: room 1 is there (the user's own copy, or a tombstone),
     // room 2 is not.
-    let stores: Stores =
-        BTreeMap::from([(39, BTreeMap::from([(key(1), slot(1, 11)), (key(2), slot(2, 12))]))]);
+    let stores: Stores = BTreeMap::from([(
+        39,
+        BTreeMap::from([(key(1), slot(1, 11)), (key(2), slot(2, 12))]),
+    )]);
     let mut c = Carry::new(preds(&[39]), vec![key(1)], false);
     let mut gets = Vec::new();
     while let Some(ask) = c.next_ask() {
@@ -284,8 +299,14 @@ fn what_is_written_is_what_the_web_ui_reads_and_keeps_the_old_contract_key() {
 fn unreadable_and_mismatched_slots_leave_the_room_to_an_older_generation() {
     let stores: Stores = BTreeMap::from([
         // Newest: room 1's value can't be read, room 2's key holds room 3's slot.
-        (39, BTreeMap::from([(key(1), b"garbage".to_vec()), (key(2), slot(3, 13))])),
-        (38, BTreeMap::from([(key(1), slot(1, 11)), (key(2), slot(2, 12))])),
+        (
+            39,
+            BTreeMap::from([(key(1), b"garbage".to_vec()), (key(2), slot(3, 13))]),
+        ),
+        (
+            38,
+            BTreeMap::from([(key(1), slot(1, 11)), (key(2), slot(2, 12))]),
+        ),
     ]);
     let mut c = Carry::new(preds(&[39, 38]), Vec::new(), true);
     let out = walk(&mut c, &stores);
@@ -340,8 +361,11 @@ fn try_again_walks_from_the_newest_again() {
 #[test]
 fn a_request_to_a_predecessor_is_addressed_as_the_web_ui_addresses_it() {
     let p = pred(39);
-    let ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages { key, params, inbound }) =
-        Ask::List(p.key.clone()).to_request()
+    let ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages {
+        key,
+        params,
+        inbound,
+    }) = Ask::List(p.key.clone()).to_request()
     else {
         panic!("not an application message");
     };

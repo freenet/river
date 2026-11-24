@@ -62,6 +62,11 @@
 //!   nothing about it for [`Pace::resync_idle`], every room not heard about lately when the window
 //!   comes to the front, and a room whose update could not be merged after a backoff
 //!   ([`super::resync`] has the rules and what bounds them). Such a read never reconnects.
+//! - **Earlier River releases.** Once a run, after the first read of the stored rooms, the
+//!   rooms earlier chat delegates hold and the current one does not are carried over
+//!   ([`super::carry`]), as a task. A room stored under an earlier room-contract key is followed
+//!   under the current one, and moved there when the network has no state under it
+//!   ([`super::rekey`]).
 //! - **What can't be shown.** A room whose update from the network could not be applied, a
 //!   stored room this computer cannot read, and a node with no chat delegate under the key
 //!   this build carries are all said on screen ([`Issues`]). A stored room can be unreadable
@@ -1175,7 +1180,9 @@ fn follow_on(
                 changed |= rooms.apply_update(key.id(), &update);
             }
             // The network has no copy. The web UI would seed one with a PUT; this app PUTs only
-            // a room it has just created, so it keeps showing the stored copy and asks again.
+            // a room it has just created, or one moved across a room-contract re-key from an
+            // earlier key that holds it ([`super::rekey`]), so it keeps showing the stored copy
+            // and asks again.
             Some(Ok(HostResponse::ContractResponse(ContractResponse::NotFound {
                 instance_id,
             }))) if (resyncs.is_out(&instance_id) || resyncs.is_late(&instance_id))

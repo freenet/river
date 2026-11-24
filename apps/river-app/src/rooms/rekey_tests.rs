@@ -100,8 +100,14 @@ fn the_earlier_keys_are_read_newest_first_down_to_the_stored_one() {
     let all: Vec<ContractInstanceId> = earlier().iter().map(|k| *k.id()).collect();
     let o = owner().verifying_key();
     assert_eq!(candidates_down_to(&o, None), all);
-    assert_eq!(candidates_down_to(&o, Some(&earlier()[0])), all[..1].to_vec());
-    assert_eq!(candidates_down_to(&o, Some(&earlier()[3])), all[..4].to_vec());
+    assert_eq!(
+        candidates_down_to(&o, Some(&earlier()[0])),
+        all[..1].to_vec()
+    );
+    assert_eq!(
+        candidates_down_to(&o, Some(&earlier()[3])),
+        all[..4].to_vec()
+    );
     // A stored key that is not an earlier one: every earlier key.
     let other = contract_key_for_code_hash(&o, &[7; 32]);
     assert_eq!(candidates_down_to(&o, Some(&other)), all);
@@ -109,7 +115,10 @@ fn the_earlier_keys_are_read_newest_first_down_to_the_stored_one() {
 
 /// Run `probe` against `states` (by key; a key not there is absent) and return what it found
 /// and what it read.
-fn run(mut probe: Probe, states: &[(ContractInstanceId, Option<Vec<u8>>)]) -> (Found, Vec<ContractInstanceId>) {
+fn run(
+    mut probe: Probe,
+    states: &[(ContractInstanceId, Option<Vec<u8>>)],
+) -> (Found, Vec<ContractInstanceId>) {
     let mut read = Vec::new();
     loop {
         match probe.next() {
@@ -137,7 +146,11 @@ fn the_newest_key_holding_a_real_room_wins() {
         (all[2], Some(cbor(&room(&["newer"])))),
         (all[3], Some(cbor(&room(&["older"])))),
     ];
-    let probe = Probe::new(owner().verifying_key(), all.clone(), ChatRoomStateV1::default());
+    let probe = Probe::new(
+        owner().verifying_key(),
+        all.clone(),
+        ChatRoomStateV1::default(),
+    );
     let (found, read) = run(probe, &states);
     let Found::State(state) = found else {
         panic!("found nothing");
@@ -150,7 +163,11 @@ fn the_newest_key_holding_a_real_room_wins() {
 fn a_key_that_does_not_answer_is_passed_over() {
     let all = candidates_down_to(&owner().verifying_key(), None);
     let states = vec![(all[0], None), (all[1], Some(cbor(&room(&["older"]))))];
-    let probe = Probe::new(owner().verifying_key(), all.clone(), ChatRoomStateV1::default());
+    let probe = Probe::new(
+        owner().verifying_key(),
+        all.clone(),
+        ChatRoomStateV1::default(),
+    );
     let (found, _) = run(probe, &states);
     assert!(matches!(found, Found::State(s) if texts(&s) == vec!["older"]));
 }
@@ -158,7 +175,11 @@ fn a_key_that_does_not_answer_is_passed_over() {
 #[test]
 fn nothing_found_anywhere_is_nothing() {
     let all = candidates_down_to(&owner().verifying_key(), None);
-    let probe = Probe::new(owner().verifying_key(), all.clone(), ChatRoomStateV1::default());
+    let probe = Probe::new(
+        owner().verifying_key(),
+        all.clone(),
+        ChatRoomStateV1::default(),
+    );
     let (found, read) = run(probe, &[]);
     assert!(matches!(found, Found::Nothing));
     assert_eq!(read, all);
