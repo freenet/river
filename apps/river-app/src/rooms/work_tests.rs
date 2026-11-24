@@ -3113,3 +3113,73 @@ fn the_carrys_rank_write_conflicts_and_refusals() {
     };
     assert!(w.next_request(false, Instant::now()).is_none());
 }
+
+/// A read of an earlier key given up on stops being waited for after [`LATE_FOR`], and a
+/// move that reads the same key again takes the answer as its own (Codex, review of #997).
+#[test]
+fn a_late_read_expires_and_a_new_read_of_the_key_keeps_its_answer() {
+    let owner_sk = SigningKey::from_bytes(&[68; 32]);
+    let plan = crate::rooms::create::new_room(owner_sk.clone(), "Open", "Olive", false).unwrap();
+    let owner = owner_sk.verifying_key();
+    let earlier = river_core::migration::legacy_contract_keys_for_owner(&owner);
+    let mut w = Work::default();
+    w.seed(
+        owner,
+        "Open".into(),
+        ids(&earlier[..1]),
+        plan.room.room_state.clone(),
+    );
+    let t0 = Instant::now();
+    let Some(ClientRequest::ContractOp(ContractRequest::Get { key, .. })) =
+        w.next_request(false, t0)
+    else {
+        panic!("a GET");
+    };
+    let gave_up = t0 + Duration::from_secs(61);
+    assert!(!w.expire(Duration::from_secs(20), Duration::from_secs(60), gave_up));
+    assert!(w.has_late());
+    // The move ends unmoved; a new move reads the same key again, and its answer is its own.
+    assert!(w.next_request(false, gave_up).is_none());
+    assert_eq!(w.take_seed_ends().len(), 1);
+    w.seed(
+        owner,
+        "Open".into(),
+        ids(&earlier[..1]),
+        plan.room.room_state.clone(),
+    );
+    let Some(ClientRequest::ContractOp(ContractRequest::Get { key: again, .. })) =
+        w.next_request(false, gave_up)
+    else {
+        panic!("a GET");
+    };
+    assert_eq!(again, key);
+    get_answer(&mut w, earlier[0], &plan.room.room_state);
+    assert!(matches!(
+        w.next_request(false, gave_up),
+        Some(ClientRequest::ContractOp(ContractRequest::Put { .. }))
+    ));
+    // Another key given up on is forgotten after a while.
+    let owner2 = SigningKey::from_bytes(&[69; 32]).verifying_key();
+    let mut w = Work::default();
+    w.seed(
+        owner2,
+        "B".into(),
+        ids(&river_core::migration::legacy_contract_keys_for_owner(&owner2)[..1]),
+        plan.room.room_state.clone(),
+    );
+    let _ = w.next_request(false, t0);
+    assert!(!w.expire(Duration::from_secs(20), Duration::from_secs(60), gave_up));
+    assert!(w.has_late());
+    assert!(!w.expire(
+        Duration::from_secs(20),
+        Duration::from_secs(60),
+        gave_up + LATE_FOR - Duration::from_secs(1)
+    ));
+    assert!(w.has_late());
+    assert!(!w.expire(
+        Duration::from_secs(20),
+        Duration::from_secs(60),
+        gave_up + LATE_FOR
+    ));
+    assert!(!w.has_late());
+}
