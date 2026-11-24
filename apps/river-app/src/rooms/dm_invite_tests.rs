@@ -685,6 +685,7 @@ fn nothing_in_the_invitation_paths_logs_or_prints() {
     let banned = [
         "println!",
         "eprintln!",
+        "diag!(",
         "dbg!",
         "tracing::",
         " log::",
@@ -735,7 +736,7 @@ fn nothing_in_the_invitation_paths_logs_or_prints() {
     // The session's handler has one print: the existing notice about unsaved sent texts.
     let session = production(include_str!("session.rs"));
     let handler = comments_out(function(&session, "invite_dm"));
-    assert_eq!(handler.matches("eprintln!").count(), 1);
+    assert_eq!(handler.matches("diag!(").count(), 1);
     assert!(handler.contains("too many sent direct messages"));
     assert!(!handler.contains(":?}"));
     // The window's handler of the answers prints nothing either.

@@ -556,7 +556,10 @@ impl Watch {
         let records = match Records::shipped() {
             Ok(r) => r,
             Err(e) => {
-                crate::diag!("River: not watching for a newer River: pointer-records.toml: {e}");
+                crate::diag!(
+                    "River: not watching for a newer River: pointer-records.toml: {}",
+                    crate::diag::scrub(e)
+                );
                 Records {
                     author: String::new(),
                     records: Vec::new(),
@@ -656,7 +659,10 @@ impl Shared {
             .and_then(|()| std::fs::rename(&tmp, &path));
         if let Err(e) = written {
             let _ = std::fs::remove_file(&tmp);
-            crate::diag!("River: couldn't keep the newer River's pointer record: {e}");
+            crate::diag!(
+                "River: couldn't keep the newer River's pointer record: {}",
+                crate::diag::scrub(&e)
+            );
         }
     }
 

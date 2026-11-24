@@ -971,6 +971,7 @@ fn the_direct_message_code_neither_logs_nor_talks_to_the_node() {
         for banned in [
             "println!",
             "eprintln!",
+            "diag!(",
             "print!(",
             "dbg!",
             "tracing::",

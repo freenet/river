@@ -142,27 +142,33 @@ Open an issue at <https://github.com/freenet/river/issues> and include:
 
 ### The log file
 
-River writes what it reports about itself (lost connections, rooms it could not read, updates
-it refused) to a log file, so a bug report can include it even when River has no console. This
-is the case for a Windows release build, and for River started from Finder, a desktop entry, at
-login or from the tray. Each line starts with the time in UTC. When River is run from a terminal
-it also prints the same lines there, and writes the file too.
-
-**Settings > Diagnostics** shows the path and has an **Open log folder** button. The file is
-`river.log` in the `logs` folder of River's config folder:
+River reports what goes wrong with itself (lost connections, rooms it could not read, updates
+it refused) on its standard error, with the time (UTC) at the start of each line. A Windows
+release build has no console, and a River started from a launcher or at login can have no
+standard error at all, so there the lines go nowhere. When River finds that nothing is reading
+its standard error (it is closed, or goes to the null device), it writes the lines to a log file
+instead. If River was started from a terminal, with its output sent to a file (`river 2>
+river-log.txt`), or into a pipe or the system's log (journald), it leaves the output there and
+keeps no log file. **Settings > Diagnostics** says which, and when there is a file it shows the
+path and has an **Open log folder** button. The file is `river.log` in the `logs` folder of
+River's config folder:
 
 - Linux: `~/.config/River/logs/river.log` (or under `$XDG_CONFIG_HOME`)
 - Windows: `%LOCALAPPDATA%\Freenet\River\config\logs\river.log`
 - macOS: under `~/Library/Application Support` (Settings shows the exact folder)
 
-The file stops growing at about 2 MB: River then renames it to `river.log.1`, replacing the one
-before, and starts a new `river.log`. Attach `river.log`, and `river.log.1` if the problem is
-older than the newest file. The log holds room keys, contract keys and error messages. It is
-written never to hold message text, nicknames, signing keys, secrets or invite codes; if you find
-a line that does, tell us. It also shows your user name where it is part of a path.
+River starts a new file only when it starts: if `river.log` is over 2 MB then, it is renamed to
+`river.log.1` (replacing the one before). A River that runs for a long time and reports a lot
+can make the file larger than that until its next start. Attach `river.log`, and `river.log.1`
+if the problem is older than the newest file.
 
-To reproduce a problem and capture only that run, quit River, delete or move the two files, start
-River, trigger the problem, and attach the new `river.log`.
+River does not write message text, nicknames or signing keys to it, but it does write room keys
+and contract keys, and your user name where it is part of a path. Look through the file before
+you share it, and tell us if you find a line that should not be there.
+
+To capture one run: from a terminal, `river 2> river-log.txt` (on Windows, `river.exe 2>
+river-log.txt` from a command prompt; the release build then writes to that file). Or quit River,
+move the two log files away, start River, trigger the problem, and attach the new `river.log`.
 
 **Never paste an exported identity token, an invite code or a private key.** An exported identity
 token contains your private key, and anyone who has it can write as you in your rooms.

@@ -36,9 +36,11 @@ Linux Ctrl+Right/Ctrl+Delete follow Rune's word rule (start of the next word); a
 
 ## The log file
 
-`apps/desktop/src/log.rs` points the process's stderr at a pipe (`dup2` on Unix, `SetStdHandle` on Windows) and a thread timestamps each line (UTC, ISO 8601) into `<config dir>/logs/river.log`, rotating at 2 MB to `river.log.1`. It runs when stderr is not a terminal and always in a Windows release build; on a terminal it also prints there. It starts after the single-instance check, so a second launch cannot rotate the first one's file. Anything that exits the process should call `log::flush()` first (the panic hook does), because a line still in the pipe is lost on exit.
+`apps/desktop/src/log.rs` points the process's stderr straight at `<config dir>/logs/river.log` (an append-mode file; `dup2` onto fd 2 on Unix, `SetStdHandle` on Windows) **only when nothing else can be reading it**: stderr is invalid or closed, or the null device. A terminal, a file (`2> river-log.txt`), a pipe and journald are left alone (`log::decide`); then Settings > Diagnostics says the output goes elsewhere. There is no pipe and no reader thread on purpose: an earlier design had one, and an `exec` into the previous build (`restart_into`) inherited a pipe with no reader, so its first `eprintln!` panicked. A diagnostics feature must not be able to hang or crash the app.
 
-Rule for `eprintln!` in `apps/`: never print message text, nicknames, signing keys, secrets or invitation codes. An error from a decoder, a room merge or the node can quote them (serde quotes the wrong-typed value), so print it through `river_app::diag::scrub`.
+The file rotates at start only (over 2 MB: renamed to `river.log.1`; a failed rename keeps appending). Nothing rotates in a run, so two Rivers during an update handover cannot move the file under each other. It starts after the single-instance check. A River started by this one gets `log::child_stderr()` (null when the log is active) so it makes its own decision and its own Settings text.
+
+`river_app::diag!` replaces `eprintln!` everywhere in `apps/` (a test in `diag.rs` fails on a new `eprintln!`): it prefixes a UTC ISO 8601 time and never panics on a broken stderr. Never print message text, nicknames, signing keys, secrets or invitation codes. An error from a decoder, a room merge or the node can quote them (serde quotes the wrong-typed value), so print it through `river_app::diag::scrub`; the same test counts those sites. The log's panic hook scrubs the panic message the same way.
 
 ## How river-app reads rooms
 

@@ -133,8 +133,12 @@ mod tests {
                 f.display()
             );
             scrubbed += code.matches("diag::scrub(").count();
+            // Under `rooms/` an error can come from decoded room data, a merge or the node. The
+            // other errors printed (tray, notifications, the updater, saving a file) are the
+            // operating system's.
+            let in_rooms = f.components().any(|c| c.as_os_str() == "rooms");
             for (n, l) in code.lines().enumerate() {
-                if l.contains("diag!(") && (l.contains("{e}") || l.contains("{why}")) {
+                if in_rooms && l.contains("diag!(") && (l.contains("{e}") || l.contains("{why}")) {
                     panic!(
                         "{}:{}: an error printed raw, use diag::scrub",
                         f.display(),
@@ -144,7 +148,7 @@ mod tests {
             }
         }
         assert_eq!(
-            scrubbed, 17,
+            scrubbed, 20,
             "the scrubbed sites changed: update this count on purpose"
         );
     }
