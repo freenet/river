@@ -5,6 +5,9 @@ use dioxus::prelude::*;
 mod avatar_salt;
 mod components;
 mod constants;
+// R2 adds the callers of `discover_index::open`/`close` and `DISCOVER_INDEX`.
+#[allow(dead_code)]
+mod discover_index;
 #[cfg(feature = "example-data")]
 mod example_data;
 mod fonts;

@@ -54,6 +54,12 @@ pub async fn handle_get_response(
         return Ok(());
     }
 
+    // Atlas's room index or its pointer, read for Discover Rooms
+    // (freenet/river#975): not a room.
+    if crate::discover_index::deliver_state(key.id(), &state) {
+        return Ok(());
+    }
+
     // Backward-probe routing (freenet/river#292): a GET response whose
     // contract id matches an outstanding legacy-key probe is for a
     // *previous* room-contract generation. It cannot be resolved to an
@@ -1454,6 +1460,9 @@ pub async fn handle_get_not_found(instance_id: ContractInstanceId) {
         return;
     }
     if crate::public_room::deliver_not_found(&instance_id) {
+        return;
+    }
+    if crate::discover_index::deliver_not_found(&instance_id) {
         return;
     }
     if deliver_probe_absent(instance_id).await {

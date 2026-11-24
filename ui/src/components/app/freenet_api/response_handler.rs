@@ -125,7 +125,11 @@ impl ResponseHandler {
                     flags.needs_reput = handle_subscribe_response(key, subscribed);
                     // A pointer record's GET already carried its state.
                     let is_pointer = super::generation_watch::is_watched(key.id());
-                    if subscribed && !is_pointer && !crate::public_room::is_viewers(key.id()) {
+                    if subscribed
+                        && !is_pointer
+                        && !crate::public_room::is_viewers(key.id())
+                        && !crate::discover_index::is_discover(key.id())
+                    {
                         // Fetch current contract state after successful subscribe.
                         // On reconnect, rooms loaded from delegate storage may be stale.
                         // Subscribe doesn't return state, so we need an explicit GET.
