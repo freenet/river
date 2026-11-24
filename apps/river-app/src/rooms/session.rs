@@ -2070,9 +2070,6 @@ struct Rooms {
     purge_tick_seen: HashMap<VerifyingKey, u64>,
     /// Rooms whose record is to be removed (the user left): retried until it is.
     purge_forget_owed: HashSet<VerifyingKey>,
-    /// The rooms the last complete read of the stored rooms listed, with a room being left
-    /// still among them until a later read says it is gone.
-    stored_owners: HashSet<VerifyingKey>,
     /// Failed storage work on the record of deletions waits until then to be tried again.
     purge_retry_at: Option<Instant>,
     /// A message was sent into a thread this copy of the archive list does not hold: the stored
@@ -2448,7 +2445,6 @@ impl Rooms {
         self.complete = !loaded.store_missing && loaded.listed > 0 && loaded.unreadable == 0;
         if self.complete {
             self.outbox.keep_rooms(&shown);
-            self.stored_owners = shown.clone();
         }
         for room in &mut self.list {
             self.outbox.reconcile(room);
@@ -3074,21 +3070,6 @@ impl Rooms {
         if dropped > 0 {
             crate::diag!("River: {dropped} re-signed deletion(s) were not kept and were dropped");
         }
-        // After a read that listed every room, a room the user is no longer in loses its record
-        // (a leave whose cleanup was lost with a restart). Against the rooms that read listed,
-        // and those shown or being left now: a room whose leave has not finished is not gone,
-        // however the list looks (a leave that fails brings it back).
-        if self.complete && self.loaded {
-            let mut keep = self.stored_owners.clone();
-            keep.extend(self.list.iter().map(|r| r.stored.owner_vk));
-            keep.extend(self.outbox.work.leaving_rooms());
-            if let Err(e) = self.outbox.purge_record_mut().retain_rooms(&keep) {
-                crate::diag!(
-                    "River: records of rooms left were not removed: {}",
-                    crate::diag::scrub(&e)
-                );
-            }
-        }
         if self.update_required {
             return;
         }
@@ -3153,7 +3134,7 @@ impl Rooms {
     }
 
     /// What [`Rooms::own_purges_tick`] reads for one room: the envelope the room holds for the
-    /// user (its signature says which, and covers its version), the members, the room's
+    /// user (its signature says which, and covers its version), who the user is, the members, the room's
     /// configuration signature (what pruning checks) and the record's revision.
     fn own_purges_fingerprint(&self, room: &LiveRoom) -> u64 {
         use std::hash::{DefaultHasher, Hash, Hasher};
@@ -3162,6 +3143,7 @@ impl Rooms {
         let state = &room.stored.room_state;
         if let Some(sk) = &room.stored.self_sk {
             let me = MemberId::from(&sk.verifying_key());
+            me.0.0.hash(&mut h);
             state
                 .direct_messages
                 .purges

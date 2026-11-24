@@ -198,25 +198,6 @@ fn old_temporary_files_are_removed_at_start_and_recent_ones_left() {
 }
 
 #[test]
-fn rooms_not_kept_are_dropped_in_one_write() {
-    let dir = dir("retain");
-    let mut record = PurgeRecord::open(&dir);
-    record.record(&owner(1), id(2), &[t(1)]).unwrap();
-    record.record(&owner(5), id(2), &[t(2)]).unwrap();
-    let rev = record.rev();
-    record
-        .retain_rooms(&[owner(1), owner(5)].into_iter().collect())
-        .unwrap();
-    assert_eq!(record.rev(), rev, "nothing to drop writes nothing");
-    record
-        .retain_rooms(&[owner(5)].into_iter().collect())
-        .unwrap();
-    let reloaded = PurgeRecord::open(&dir);
-    assert!(reloaded.for_room(&owner(1)).is_none());
-    assert!(reloaded.for_room(&owner(5)).is_some());
-}
-
-#[test]
 fn leaving_a_room_removes_its_entry_and_only_its_entry() {
     let dir = dir("forget");
     let mut record = PurgeRecord::open(&dir);
@@ -365,26 +346,34 @@ fn a_lock_that_stays_held_is_waited_for_only_a_short_while() {
     drop(held);
 }
 
+/// Without the lock, a change another River made between this one's read and its write is kept:
+/// the file is read again before the write and the change made again on what is there.
 #[test]
-fn a_record_an_earlier_build_kept_in_the_node_directory_is_moved_in() {
-    let config = dir("absorb-config");
-    let node = dir("absorb-node");
-    PurgeRecord::open(&node)
-        .record(&owner(1), id(2), &[t(1)])
+fn without_the_lock_a_change_made_in_between_is_kept() {
+    let dir = dir("unlocked-race");
+    fs::create_dir_all(dir.join(format!(".{FILE_NAME}.lock"))).unwrap();
+    let mut record = PurgeRecord::open(&dir);
+    let mut first = true;
+    let (mine, key) = (id(2), bs58::encode(owner(1).as_bytes()).into_string());
+    record
+        .change(|book| {
+            if std::mem::take(&mut first) {
+                // Another River writes while this one is between its read and its write.
+                PurgeRecord::open(&dir)
+                    .record(&owner(5), id(2), &[t(9)])
+                    .unwrap();
+            }
+            book.rooms
+                .entry(key.clone())
+                .or_default()
+                .record(mine, [t(1)]);
+            true
+        })
         .unwrap();
-    let mut here = PurgeRecord::open(&config);
-    here.record(&owner(1), id(2), &[t(2)]).unwrap();
-    here.record(&owner(5), id(2), &[t(9)]).unwrap();
-    here.absorb(&node).unwrap();
-    let after = PurgeRecord::open(&config);
-    assert_eq!(
-        after.for_room(&owner(1)).unwrap().purged,
-        vec![(id(2), t(1)), (id(2), t(2))]
+    let after = PurgeRecord::open(&dir);
+    assert!(after.for_room(&owner(1)).is_some());
+    assert!(
+        after.for_room(&owner(5)).is_some(),
+        "the other River's change survived"
     );
-    assert!(after.for_room(&owner(5)).is_some());
-    assert!(!node.join(FILE_NAME).exists());
-    // Nothing there, or the same directory: nothing happens.
-    here.absorb(&node).unwrap();
-    here.absorb(&config).unwrap();
-    assert!(config.join(FILE_NAME).exists());
 }

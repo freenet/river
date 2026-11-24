@@ -787,34 +787,21 @@ fn a_full_envelope_is_not_signed_over_and_does_not_use_up_the_version() {
     assert!(!device.rooms.healed_run.contains_key(&owner));
 }
 
-/// A room the user is not in loses its record once a read has listed every room, and a record
-/// that could not be removed when the leave ended is removed when the storage works again.
+/// A record that could not be removed when a leave ended is removed when the storage works
+/// again.
 #[test]
-fn records_of_rooms_left_are_removed_and_a_failed_removal_is_retried() {
+fn a_failed_removal_of_a_left_rooms_record_is_retried() {
     let f = Fixture::new();
     let msgs = messages(&f, 1);
     let dir = dir("forget");
     let mut device = device(&dir, &msgs);
     let owner = owner_of(&device);
-    let stranger = SigningKey::from_bytes(&[55; 32]).verifying_key();
-    let record = device.rooms.outbox.purge_record_mut();
-    record
-        .record(&stranger, MemberId::from(&stranger), &[PurgeToken([3; 16])])
-        .unwrap();
-    record
+    device
+        .rooms
+        .outbox
+        .purge_record_mut()
         .record(&owner, MemberId::from(&owner), &[PurgeToken([4; 16])])
         .unwrap();
-    // Not before a read that lists every room.
-    device.rooms.complete = false;
-    device.rooms.own_purges_tick();
-    assert!(PurgeRecord::open(&dir).for_room(&stranger).is_some());
-    device.rooms.complete = true;
-    device.rooms.own_purges_tick();
-    let after = PurgeRecord::open(&dir);
-    assert!(after.for_room(&stranger).is_none());
-    assert!(after.for_room(&owner).is_some());
-
-    // A leave whose removal failed is tried again.
     device.rooms.purge_forget_owed.insert(owner);
     break_storage(&dir);
     device.rooms.own_purges_tick();
@@ -869,6 +856,100 @@ fn trying_a_refused_deletion_again_records_it_again_and_clears_what_was_owed() {
     // Still broken, and yet nothing is owed any more: that try is the deletion's again.
     assert!(!device.rooms.outbox.retry_takebacks(), "no longer owed");
     mend_storage(&dir);
+    // The tokens are this try's again: when it is refused too, they are taken back.
+    PurgeRecord::open(&dir)
+        .record(&owner, device.me(), &[token])
+        .unwrap();
+    let mut changed = false;
+    device
+        .rooms
+        .outbox
+        .next_update(&device.rooms.list[0], Instant::now(), &mut changed)
+        .expect("sent again");
+    device
+        .rooms
+        .update_answered(&id, Err("refused again".into()));
+    assert!(
+        PurgeRecord::open(&dir).for_room(&owner).is_none(),
+        "the second refusal took the tokens back"
+    );
+}
+
+/// A deletion asked for again while the take-back of an earlier try of the same token is owed:
+/// the take-back does not undo it.
+#[test]
+fn an_owed_take_back_does_not_undo_a_later_deletion_of_the_same_token() {
+    let f = Fixture::new();
+    let msgs = messages(&f, 1);
+    let token = msgs[0].purge_token();
+    let dir = dir("owed-then-again");
+    let mut device = device(&dir, &msgs);
+    let owner = owner_of(&device);
+    let me = device.me();
+    device.delete(&[token]);
+    let mut changed = false;
+    device
+        .rooms
+        .outbox
+        .next_update(&device.rooms.list[0], Instant::now(), &mut changed)
+        .expect("sent");
+    break_storage(&dir);
+    let id = device.rooms.list[0].contract_id();
+    device.rooms.update_answered(&id, Err("refused".into()));
+    assert!(device.rooms.outbox.retry_takebacks(), "owed");
+    // The storage works again; the user asks again.
+    mend_storage(&dir);
+    device.delete(&[token]);
+    let mut changed = false;
+    device
+        .rooms
+        .outbox
+        .next_update(&device.rooms.list[0], Instant::now(), &mut changed)
+        .expect("sent again");
+    // Nothing is owed any more, and the deletion is recorded.
+    assert!(!device.rooms.outbox.retry_takebacks());
+    assert_eq!(
+        PurgeRecord::open(&dir).for_room(&owner).unwrap().purged,
+        vec![(me, token)]
+    );
+    // And as this deletion's own, it is taken back if the node refuses it.
+    device.rooms.update_answered(&id, Err("refused".into()));
+    assert!(PurgeRecord::open(&dir).for_room(&owner).is_none());
+}
+
+/// Who the user is is read by the tick: when the identity changes to one that has a recorded
+/// token, with nothing else changed, the tick looks again.
+#[test]
+fn a_change_of_identity_makes_the_tick_look_again() {
+    let f = Fixture::new();
+    let msgs = messages(&f, 1);
+    let mut device = device(&dir("identity"), &msgs);
+    let owner = owner_of(&device);
+    let other = SigningKey::from_bytes(&[95; 32]);
+    let other_id = MemberId::from(&other.verifying_key());
+    device.rooms.list[0].stored.room_state.members.members.push(
+        river_core::room_state::member::AuthorizedMember::new(
+            river_core::room_state::member::Member {
+                owner_member_id: f.owner_id(),
+                invited_by: f.owner_id(),
+                member_vk: other.verifying_key(),
+            },
+            &f.owner,
+        ),
+    );
+    device
+        .rooms
+        .outbox
+        .purge_record_mut()
+        .record(&owner, other_id, &[PurgeToken([6; 16])])
+        .unwrap();
+    // The user is the first identity, which has nothing recorded.
+    device.rooms.own_purges_tick();
+    assert!(device.rooms.outbox.is_empty());
+    // Replaced by the second, which is a member too; neither holds an envelope.
+    device.rooms.list[0].stored.self_sk = Some(other);
+    device.rooms.own_purges_tick();
+    assert!(device.rooms.outbox.heal_in_progress(&owner));
 }
 
 /// Entry E1 was taken by the node (and shown as not kept); the same deletion asked for again
@@ -894,44 +975,6 @@ fn a_refused_second_deletion_does_not_take_back_what_an_earlier_one_recorded() {
     assert_eq!(
         PurgeRecord::open(&dir).for_room(&owner).unwrap().purged,
         vec![(me, token)]
-    );
-}
-
-/// The leave is queued: the record stays while it is pending, and when it fails and the room
-/// is read back.
-#[test]
-fn a_room_whose_leave_has_not_finished_keeps_its_record_even_when_the_leave_fails() {
-    let f = Fixture::new();
-    let msgs = messages(&f, 1);
-    let dir = dir("leave-fails");
-    let mut device = device(&dir, &msgs);
-    let owner = owner_of(&device);
-    let me = device.me();
-    device
-        .rooms
-        .outbox
-        .purge_record_mut()
-        .record(&owner, me, &[msgs[0].purge_token()])
-        .unwrap();
-    // A room the last complete read did not list (joined since): while its leave is pending
-    // it is not gone.
-    let key = device.key.clone();
-    assert!(device.rooms.list_command(&key, Action::LeaveRoom));
-    assert!(device.rooms.list.is_empty(), "shown no more");
-    device.rooms.own_purges_tick();
-    assert!(
-        PurgeRecord::open(&dir).for_room(&owner).is_some(),
-        "leave pending"
-    );
-    // One the last complete read listed: when the tombstone write fails, the leave fails and the
-    // room is read back; it is not gone in between.
-    device.rooms.stored_owners.insert(owner);
-    device.rooms.outbox.work.halt("the store refused");
-    device.rooms.own_purges_tick();
-    assert!(device.rooms.list.is_empty());
-    assert!(
-        PurgeRecord::open(&dir).for_room(&owner).is_some(),
-        "leave failed"
     );
 }
 

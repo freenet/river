@@ -24,7 +24,8 @@
 //! token the room does not hold, which the next heal signs. The record is bounded: a room's
 //! entries go when its recipient is no longer a member ([`OwnPurges::prune`], as `riverctl`
 //! does), and the whole entry goes when the user leaves the room ([`PurgeRecord::forget`], retried until it
-//! works) or is found not to be in the room ([`PurgeRecord::retain_rooms`]).
+//! works). A record left for a room the user left some other way is harmless: a re-sign is
+//! only ever for the user's current member id in a room they are in.
 //! A deletion can only be queued while it fits the room's 1000-token cap, so what is recorded
 //! for one recipient is bounded the same way.
 //!
@@ -140,7 +141,7 @@ impl PurgeRecord {
         let tokens = tokens.to_vec();
         let mut added = Vec::new();
         self.change(|book| {
-            let own = book.rooms.entry(key).or_default();
+            let own = book.rooms.entry(key.clone()).or_default();
             added = tokens
                 .iter()
                 .copied()
@@ -205,45 +206,6 @@ impl PurgeRecord {
         })
     }
 
-    /// Take in the record an earlier build kept in `other_dir` (the per-node grant directory,
-    /// where this record was first put): its rooms are unioned into this one and the file is
-    /// removed. Nothing happens when there is no such file or it is this record's own.
-    pub fn absorb(&mut self, other_dir: &Path) -> Result<(), String> {
-        let Some(path) = self.path.clone() else {
-            return Ok(());
-        };
-        let other = other_dir.join(FILE_NAME);
-        if other == path || !other.exists() {
-            return Ok(());
-        }
-        let (theirs, _) = read_book(&other)?;
-        self.change(move |book| {
-            for (room, own) in &theirs.rooms {
-                book.rooms.entry(room.clone()).or_default().union(own);
-            }
-            true
-        })?;
-        fs::remove_file(&other).map_err(|e| format!("couldn't remove {}: {e}", other.display()))
-    }
-
-    /// Remove every room not in `keep` (rooms the user is no longer in, found at start and after
-    /// a read of the stored rooms; an entry whose key does not read as a room goes too). One
-    /// write, none when nothing goes.
-    pub fn retain_rooms(
-        &mut self,
-        keep: &std::collections::HashSet<VerifyingKey>,
-    ) -> Result<(), String> {
-        let keep: std::collections::HashSet<String> = keep.iter().map(room_key).collect();
-        if self.book.rooms.keys().all(|k| keep.contains(k)) {
-            return Ok(());
-        }
-        self.change(move |book| {
-            let before = book.rooms.len();
-            book.rooms.retain(|k, _| keep.contains(k));
-            before != book.rooms.len()
-        })
-    }
-
     /// Remove `owner`'s room from the record (the user left it).
     pub fn forget(&mut self, owner: &VerifyingKey) -> Result<(), String> {
         let key = room_key(owner);
@@ -256,7 +218,7 @@ impl PurgeRecord {
     /// Apply `edit` to the file's current content and keep the result, in memory and on disk.
     /// `edit` says whether it changed anything; nothing is written when it did not. When the
     /// write fails the memory is left as it was.
-    fn change(&mut self, edit: impl FnOnce(&mut Book) -> bool) -> Result<(), String> {
+    fn change(&mut self, mut edit: impl FnMut(&mut Book) -> bool) -> Result<(), String> {
         let Some(path) = self.path.clone() else {
             edit(&mut self.book);
             self.rev += 1;
@@ -265,23 +227,40 @@ impl PurgeRecord {
         let dir = path.parent().ok_or("bad record path")?.to_owned();
         create_private_dir(&dir).map_err(|e| format!("couldn't create {}: {e}", dir.display()))?;
         // Held across the read and the write, so two Rivers cannot lose each other's change.
-        // Like the grant token's store: when the lock cannot be taken the change goes ahead
-        // unlocked, and the lock is waited for only a short while.
-        let _lock = lock_with_timeout(&dir.join(format!(".{FILE_NAME}.lock")));
-        let (mut book, corrupt) = read_book(&path)?;
-        if corrupt {
+        // Like the grant token's store: when the lock cannot be taken (said in the log) the
+        // change goes ahead without it, and the lock is waited for only a short while. Without
+        // it the file is read again just before the write, and the change is made again on
+        // what is there if it moved, so a change another River made in between is kept (a
+        // few tries; a write that races a third time is made on the last read).
+        let lock = lock_with_timeout(&dir.join(format!(".{FILE_NAME}.lock")));
+        let mut tries = 0;
+        let book = loop {
+            let (read, corrupt) = read_book(&path)?;
+            let mut book = if corrupt {
+                self.book.clone()
+            } else {
+                read.clone()
+            };
             // The file was not a record and was moved aside: what this run knows is kept and
             // written back, not replaced by an empty record.
-            book = self.book.clone();
-        }
-        if !edit(&mut book) && !corrupt {
-            // Nothing to write; what the file holds is what is known.
-            if self.book != book {
-                self.rev += 1;
+            let changed = edit(&mut book);
+            if lock.is_none() && tries < 3 && !corrupt {
+                tries += 1;
+                let (again, _) = read_book(&path)?;
+                if again != read {
+                    continue;
+                }
             }
-            self.book = book;
-            return Ok(());
-        }
+            if !changed && !corrupt {
+                // Nothing to write; what the file holds is what is known.
+                if self.book != book {
+                    self.rev += 1;
+                }
+                self.book = book;
+                return Ok(());
+            }
+            break book;
+        };
         write_book(&path, &book)?;
         self.book = book;
         self.rev += 1;
@@ -289,8 +268,9 @@ impl PurgeRecord {
     }
 }
 
-/// An exclusive advisory lock on the record, released when dropped. `None` (said once in the log)
-/// when it cannot be had within [`LOCK_WAIT`]: the caller goes ahead unlocked.
+/// An exclusive advisory lock on the record, released when dropped. `None` (said in the log each
+/// time) when it cannot be had within [`LOCK_WAIT`] or at all: the caller goes ahead unlocked and
+/// reads the file again before it writes.
 fn lock_with_timeout(path: &Path) -> Option<fs::File> {
     let file = match lock_file(path) {
         Ok(f) => f,

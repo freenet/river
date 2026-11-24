@@ -2601,11 +2601,6 @@ impl Outbox {
         }
     }
 
-    /// Take in the record an earlier build kept in `dir`.
-    pub fn absorb_purge_record(&mut self, dir: &std::path::Path) -> Result<(), String> {
-        self.purge_record.absorb(dir)
-    }
-
     /// This device's record of the deletions it sent.
     pub fn purge_record(&self) -> &super::purge_record::PurgeRecord {
         &self.purge_record
@@ -3003,7 +2998,16 @@ impl Outbox {
         }
         // Tried again: an owed take-back of its record is no longer owed, and one the node took
         // (shown as not kept) may be taken already, so a refusal of this try proves nothing.
-        self.takeback_owed.retain(|o| o.0 != id);
+        let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.takeback_owed)
+            .into_iter()
+            .partition(|o| o.0 == id);
+        self.takeback_owed = rest;
+        if let Some(work) = entry.purge.as_mut() {
+            // Its tokens are this deletion's again: a refusal of this try takes them back.
+            for (_, _, _, tokens) in mine {
+                work.added = tokens;
+            }
+        }
         if matches!(entry.status, Status::Unconfirmed(_)) {
             self.resent.insert(id);
         }
@@ -3188,11 +3192,28 @@ impl Outbox {
                 && !work.heal
                 && !work.recorded
             {
-                match self
-                    .purge_record
-                    .record(&vk, work.envelope.recipient_id, &work.tokens)
-                {
-                    Ok(added) => {
+                // A token whose take-back is owed (an earlier try of it was refused and the
+                // storage failed) is asked for again by this deletion: that take-back must not
+                // undo it, and the token is this deletion's now.
+                let me = work.envelope.recipient_id;
+                let mut taken_over = Vec::new();
+                for owed in &mut self.takeback_owed {
+                    if owed.1 == vk && owed.2 == me {
+                        owed.3.retain(|t| {
+                            let ours = work.tokens.contains(t);
+                            if ours {
+                                taken_over.push(*t);
+                            }
+                            !ours
+                        });
+                    }
+                }
+                self.takeback_owed.retain(|o| !o.3.is_empty());
+                match self.purge_record.record(&vk, me, &work.tokens) {
+                    Ok(mut added) => {
+                        added.extend(taken_over);
+                        added.sort();
+                        added.dedup();
                         work.recorded = true;
                         work.added = added;
                     }
