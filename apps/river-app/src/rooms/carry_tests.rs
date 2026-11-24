@@ -180,12 +180,12 @@ fn walk_with(
 
 /// Make every write of a walk into an empty store: the slots written (by room key, the
 /// identity of each room, `None` for a tombstone) and the ranks recorded.
-fn writes(
-    carry: &mut Carry,
-) -> (
+type Written = (
     BTreeMap<Vec<u8>, Option<VerifyingKey>>,
     Vec<(VerifyingKey, [u8; 32])>,
-) {
+);
+
+fn writes(carry: &mut Carry) -> Written {
     let mut out = BTreeMap::new();
     let mut ranks = Vec::new();
     while let Some(w) = carry.write() {
