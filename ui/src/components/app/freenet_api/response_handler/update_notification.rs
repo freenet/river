@@ -235,6 +235,10 @@ pub fn handle_update_notification(
     if crate::public_room::deliver_update(key.id(), &update) {
         return Ok(());
     }
+    // Atlas's room index, read for Discover Rooms (freenet/river#975).
+    if crate::discover_index::deliver_update(key.id(), &update) {
+        return Ok(());
+    }
     // Get contract info, return early if not found
     let room_owner_vk = match SYNC_INFO.read().get_owner_vk_for_instance_id(key.id()) {
         Some(vk) => vk,

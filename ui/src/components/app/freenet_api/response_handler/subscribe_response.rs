@@ -21,6 +21,11 @@ pub fn handle_subscribe_response(key: ContractKey, subscribed: bool) -> bool {
         return false;
     }
 
+    // Atlas's room index (freenet/river#975): not a room of ours, never re-PUT.
+    if crate::discover_index::is_discover(key.id()) {
+        return false;
+    }
+
     // Get the owner VK for this contract first, then release the read lock
     let owner_vk_opt = {
         let sync_info = SYNC_INFO.read();
