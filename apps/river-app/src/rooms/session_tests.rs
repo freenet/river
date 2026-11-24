@@ -10813,6 +10813,10 @@ mod rekey_state {
                 }
             }
             moves += 1;
+            assert!(
+                moves <= 1 + MAX_FOLD_RETRIES as usize,
+                "the retries never end"
+            );
             assert_eq!(rooms.seed_ends(&pace, now), vec![current]);
             match rooms.seed_retry.get(&room.vk()).cloned() {
                 Some((_, Some(due), candidates)) => {
