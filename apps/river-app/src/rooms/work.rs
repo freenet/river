@@ -2287,7 +2287,7 @@ fn settle_probe(t: &mut Task, now: Instant) {
         }
         Found::Local(_) | Found::Nothing if !t.is_seed() => t.fail(NOT_FOUND, true),
         Found::Local(_) | Found::Nothing => {
-            eprintln!(
+            crate::diag!(
                 "River: a re-keyed room's earlier keys did not all answer; trying again later"
             );
             t.fail("Not all of the room's earlier keys answered.", true);

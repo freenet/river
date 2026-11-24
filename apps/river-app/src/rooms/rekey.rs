@@ -170,8 +170,9 @@ impl ProbeStateOps for RiverOps {
         match merged.merge_from(&params, local) {
             Ok(()) => merged,
             Err(e) => {
-                eprintln!(
-                    "River: the copy of a room could not be merged into its earlier state: {e}"
+                crate::diag!(
+                    "River: the copy of a room could not be merged into its earlier state: {}",
+                    crate::diag::scrub(&e)
                 );
                 recovered
             }
@@ -193,7 +194,7 @@ impl ProbeStateOps for RiverOps {
         if other.merge_from(&params, &newer).is_ok() && merged.merge_from(&params, &other).is_ok() {
             return merged;
         }
-        eprintln!("River: folding an earlier key of a room failed; keeping the newer state");
+        crate::diag!("River: folding an earlier key of a room failed; keeping the newer state");
         newer
     }
 }

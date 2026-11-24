@@ -184,7 +184,7 @@ pub fn predecessors() -> &'static [Predecessor] {
         // The registry is committed and checked by CI (and by a test here), so this does not
         // fail in a build; if it did, carrying nothing is the safe outcome.
         let mut list = parse_registry(REGISTRY_TOML).unwrap_or_else(|e| {
-            eprintln!("River: {e}");
+            crate::diag!("River: {}", crate::diag::scrub(&e));
             Vec::new()
         });
         // Never this build's own delegate (a registry row committed before the WASM swap, or a
@@ -537,7 +537,10 @@ impl Carry {
             self.preds[self.at].version.clone(),
             self.preds[self.at].rank,
         );
-        eprintln!("River: an earlier River's storage ({version}) could not be read: {why}");
+        crate::diag!(
+            "River: an earlier River's storage ({version}) could not be read: {}",
+            crate::diag::scrub(&why)
+        );
         // A copy found at a rank some generation not read could outrank is not decided yet:
         // this one (unless the copy is this one's own), and every older one above its rank.
         let unread_above = |f: &Found| {
@@ -959,7 +962,7 @@ impl Carry {
         match (found.item, self.write_step) {
             (Item::Room(..), WriteStep::Slot) if stored => {
                 self.carried += 1;
-                eprintln!("River: carried a room over from {}", found.version);
+                crate::diag!("River: carried a room over from {}", found.version);
             }
             // Another writer stored the room first, under another identity (or something else):
             // the rank this carry added is not that room's, so it is taken out.
