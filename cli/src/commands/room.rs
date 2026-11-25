@@ -161,7 +161,7 @@ pub enum RoomCommands {
         #[arg(long)]
         max_provisional_messages: Option<u32>,
 
-        /// Most provisional bans the room holds (0 to 32)
+        /// Most provisional bans the room holds (0 to 24)
         #[arg(long)]
         max_provisional_bans: Option<u32>,
 
