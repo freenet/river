@@ -3,8 +3,11 @@
 //! River signs the CBOR of structs holding a `SignedTime` (`MessageV1.time`, `UserBan.banned_at`,
 //! `SecretVersionRecordV1.created_at`). `SignedTime` keeps the exact `(secs, nanos)` pair, so a
 //! verifier's decode and re-encode returns the signed bytes on every platform, Windows included
-//! (freenet/river#971, #1018). The whole-millisecond rounding here is therefore no longer needed
-//! for signatures to verify; it keeps stamps compatible with the web UI's millisecond precision.
+//! (freenet/river#971, #1018). For stamps this build makes, the whole-millisecond rounding here is
+//! therefore no longer needed for signatures to verify. It stays for two reasons: it keeps stamps
+//! compatible with the web UI's millisecond precision, and older Windows builds of riverctl and the
+//! desktop app (which floor decoded times to 100ns) can only verify stamps that are whole
+//! milliseconds.
 //!
 //! Never apply this to a timestamp that is already signed: it would change the signed bytes.
 
