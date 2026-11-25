@@ -764,3 +764,10 @@ export async function withFingers(page: Page, body: (fingers: Fingers) => Promis
     await cdp.detach();
   }
 }
+
+// Leave a room opened from a link without joining it: the x on the room's rail
+// row on a wide screen, the x in the room's header on a narrow one. Whichever
+// of them is on screen.
+export async function closeViewer(page: Page) {
+  await page.locator('[data-testid^="viewed-room-close"]:visible').first().click();
+}

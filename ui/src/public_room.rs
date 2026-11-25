@@ -211,7 +211,7 @@ pub fn classify_state(state: Option<ChatRoomStateV1>) -> ViewedRoomStatus {
 /// whether joining is offered (`public_join::offers_join`).
 pub fn composer_note(state: &ChatRoomStateV1) -> &'static str {
     if crate::public_join::offers_join(state) {
-        "Join to post: your device does a little work to prove you are not a bot."
+        "Your first message joins you."
     } else {
         "You are viewing this room read-only. Joining needs an invitation from a member."
     }

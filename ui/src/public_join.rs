@@ -85,13 +85,12 @@ pub enum JoinFailure {
 impl JoinFailure {
     pub fn message(&self) -> String {
         match self {
-            Self::RoomFull => "The room's open-member slots are held by newer messages. \
+            Self::RoomFull => "This room has no free spot for a new person right now. \
                 Try again later, or ask a member for an invitation."
                 .to_string(),
             Self::Banned => "You are banned from this room.".to_string(),
-            Self::Shadowed => "Another key already holds this identity in the room, and \
-                your key stays the same, so trying again will not help. \
-                Ask a member for an invitation."
+            Self::Shadowed => "This room already has someone with the same identity as you, \
+                so trying again will not help. Ask a member for an invitation."
                 .to_string(),
             Self::NoKey => "This browser no longer holds your key for this room. \
                 Ask a member for an invitation."
@@ -101,13 +100,13 @@ impl JoinFailure {
             Self::NotOpen => "This room no longer admits new members this way. \
                 Ask a member for an invitation."
                 .to_string(),
-            Self::PolicyChanged => "The room changed what it asks of newcomers. \
-                Join again to meet the new requirement."
+            Self::PolicyChanged => "The room changed what it asks of newcomers while you waited. \
+                Try again."
                 .to_string(),
-            Self::TooLong(max) => {
-                format!("The message is longer than the room allows ({max} bytes).")
-            }
-            Self::Internal(e) => format!("Joining failed: {e}"),
+            Self::TooLong(_) => "The message is longer than the room allows.".to_string(),
+            // The detail is logged where the failure is made; it is a Debug
+            // string, not something to show a visitor.
+            Self::Internal(_) => "Something went wrong while joining. Try again.".to_string(),
         }
     }
 
@@ -546,7 +545,6 @@ impl Machine {
         self.generation += 1;
         self.hand_back_all();
         self.clear_secrets();
-        self.nickname = None;
         self.phase = JoinPhase::Idle;
         self.notice = None;
     }
@@ -843,6 +841,9 @@ fn is_current(generation: u64) -> bool {
 }
 
 fn fail(generation: u64, failure: JoinFailure) {
+    if let JoinFailure::Internal(detail) = &failure {
+        dioxus::logger::tracing::warn!("public join failed: {detail}");
+    }
     step(|m| m.fail(generation, failure));
 }
 
@@ -968,13 +969,16 @@ fn start_blocker(owner_vk: &VerifyingKey) -> Option<JoinFailure> {
 }
 
 fn start_blocker_in_runtime(owner_vk: &VerifyingKey) -> Option<JoinFailure> {
-    use crate::components::app::chat_delegate::{RoomsLoadState, ROOMS_LOAD_STATE};
+    use crate::components::app::chat_delegate::ROOMS_LOAD_STATE;
     // The example build has no delegate to load from: its rooms are all there
     // is, and the load state never leaves `Loading`.
+    // Settled, not only `Loaded`: when the load failed the viewer still shows
+    // the room (`viewed_room::load_settled`), and joining must not then fail
+    // with "still loading" forever.
     let loaded = cfg!(feature = "no-sync")
         || ROOMS_LOAD_STATE
             .try_peek()
-            .map(|s| *s == RoomsLoadState::Loaded)
+            .map(|s| crate::components::viewed_room::load_settled(*s))
             .unwrap_or(false);
     if !loaded {
         return Some(JoinFailure::NotReady);
@@ -1086,8 +1090,22 @@ pub fn default_nickname() -> Option<String> {
 }
 
 /// Record the display name the visitor chose. Read when the entry is posted.
-pub fn set_nickname(name: String) {
-    machine().nickname = Some(name.trim().to_string());
+/// `None` keeps the generated default, whatever key the join ends up with.
+pub fn set_nickname(name: Option<String>) {
+    machine().nickname = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+}
+
+/// Make sure a key exists for this visitor (a failed or cancelled start leaves
+/// none), so the display-name prompt can be prefilled. A no-op while a join is
+/// under way for this room.
+pub fn ensure_started(owner_vk: VerifyingKey) {
+    let needs = {
+        let m = machine();
+        m.signing_key.is_none() && m.can_start(&owner_vk)
+    };
+    if needs && matches!(viewed_state(), Some((o, _)) if o == owner_vk) {
+        start(owner_vk);
+    }
 }
 
 /// Take the text handed back to `owner`'s composer, if any.
@@ -1910,6 +1928,37 @@ mod tests {
     }
 
     #[test]
+    fn no_failure_text_uses_the_jargon_of_the_work_or_the_buttons_that_are_gone() {
+        for f in [
+            JoinFailure::RoomFull,
+            JoinFailure::Banned,
+            JoinFailure::Shadowed,
+            JoinFailure::NotOpen,
+            JoinFailure::PolicyChanged,
+            JoinFailure::TooLong(100),
+            JoinFailure::NoKey,
+            JoinFailure::NotReady,
+            JoinFailure::AlreadyMember,
+            JoinFailure::Internal("Err(Variant { x: 1 })".into()),
+        ] {
+            let m = f.message().to_lowercase();
+            for bad in [
+                "proof",
+                "hash",
+                "bits",
+                "pow",
+                "bytes",
+                "slots",
+                "join again",
+                "variant",
+                "{",
+            ] {
+                assert!(!m.contains(bad), "{f:?} says {bad:?}: {m}");
+            }
+        }
+    }
+
+    #[test]
     fn a_chosen_name_survives_a_cancel_and_ends_with_the_join() {
         let (a, mut m) = (vk(1), Machine::new());
         // The proof starts on interaction, before any message: the machine
@@ -1921,6 +1970,12 @@ mod tests {
         assert_eq!(m.chosen_nickname().as_deref(), Some("Quinn"));
         // A cancel forgets the key but not the name the visitor typed.
         m.cancel();
+        assert_eq!(m.chosen_nickname().as_deref(), Some("Quinn"));
+        // Switching to another room's join does not drop it either.
+        let Action::Solve(_) = m.start(a, fresh()) else {
+            panic!("start solves");
+        };
+        m.abandon();
         assert_eq!(m.chosen_nickname().as_deref(), Some("Quinn"));
         // A finished join and a closed viewer both end it.
         let Action::Solve(g2) = m.send(a, "hi", limits(), fresh()) else {

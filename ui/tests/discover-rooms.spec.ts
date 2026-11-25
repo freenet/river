@@ -1,5 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
-import { waitForApp, selectRoom, panicsOf } from "./example-room";
+import { closeViewer, waitForApp, selectRoom, panicsOf } from "./example-room";
 import { callRiverTest } from "./river-test";
 
 // freenet/river#975: the Discover Rooms view. The example build has no
@@ -280,7 +280,7 @@ test("browsing writes nothing: no delegate request, no change to the rooms, no b
   await openFromHeader(page);
   await page.getByTestId("discover-card").first().click();
   await expect(page.getByTestId("viewed-room-name")).toBeVisible();
-  await page.getByTestId("viewed-room-close").click();
+  await closeViewer(page);
   await expect(page.getByTestId("viewed-room")).toHaveCount(0);
 
   expect(await callRiverTest(page, "delegateRequestsSent")).toBe(delegate);

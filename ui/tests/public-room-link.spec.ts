@@ -1,5 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
-import { waitForApp, selectRoom, panicsOf } from "./example-room";
+import { closeViewer, waitForApp, selectRoom, panicsOf } from "./example-room";
 import { callRiverTest } from "./river-test";
 import { captureClipboardWrites, clipboardWrites } from "./clipboard";
 
@@ -100,7 +100,7 @@ test("the copy link round-trips: copied from a public room, it opens that room",
 test("closing the viewer returns to the user's own rooms", async ({ page }) => {
   const key = await keyOf(page, "public");
   await openLink(page, key);
-  await page.getByTestId("viewed-room-close").click();
+  await closeViewer(page);
   await expect(page.getByTestId("viewed-room")).toHaveCount(0);
   // The user's own rooms are untouched and open normally.
   await selectRoom(page, "Team Chat Room");

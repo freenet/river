@@ -21,6 +21,9 @@ use river_core::room_state::ChatRoomStateV1;
 use std::collections::HashMap;
 use std::time::UNIX_EPOCH;
 
+/// What every way of leaving a room you have not joined says.
+const CLOSE_LABEL: &str = "Close this room (you haven't joined)";
+
 /// Whether a load state is final for the viewer: anything but still loading
 /// or migrating. A failed load is final too, so a visitor can still view a room
 /// (the user's own rooms are not known then, but nothing more will arrive).
@@ -160,6 +163,8 @@ fn close_button() -> Element {
             r#type: "button",
             "data-testid": "viewed-room-close",
             class: "flex-shrink-0 px-3 py-2 bg-surface hover:bg-surface-hover border border-border rounded-lg text-text-muted hover:text-text text-sm transition-colors",
+            title: CLOSE_LABEL,
+            "aria-label": CLOSE_LABEL,
             onclick: move |_| close(),
             "Close"
         }
@@ -326,6 +331,7 @@ fn member_count_label(count: usize) -> String {
 /// room's state. A visitor is listed once their first message has landed.
 #[component]
 pub fn ViewedMemberList() -> Element {
+    crate::util::signal_guard::anchor();
     let viewed = match VIEWED_ROOM.try_read() {
         Ok(v) => v.clone(),
         Err(_) => {
@@ -386,6 +392,7 @@ pub fn ViewedMemberList() -> Element {
 /// saved. The x closes it.
 #[component]
 pub fn ViewedRailRow() -> Element {
+    crate::util::signal_guard::anchor();
     let viewed = match VIEWED_ROOM.try_read() {
         Ok(v) => v.clone(),
         Err(_) => {
@@ -411,16 +418,20 @@ pub fn ViewedRailRow() -> Element {
             "data-testid": "viewed-room-rail-row",
             class: "tooltip-frame rounded-lg select-none",
             div { class: "flex items-center",
-                span {
+                // On a phone the rail replaces the chat: tapping the row goes back to it.
+                button {
+                    r#type: "button",
+                    "data-testid": "viewed-room-rail-name",
                     class: "flex-1 min-w-0 text-left px-2.5 h-[34px] flex items-center rounded-lg text-[14.5px] bg-surface text-text font-semibold truncate",
+                    onclick: move |_| crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Chat),
                     "{name}"
                 }
                 button {
                     r#type: "button",
                     "data-testid": "viewed-room-close",
                     class: "flex-shrink-0 mx-1 w-7 h-7 rounded-lg text-text-muted hover:text-text hover:bg-surface transition-colors",
-                    title: "Close this room (you haven't joined)",
-                    "aria-label": "Close this room (you haven't joined)",
+                    title: CLOSE_LABEL,
+                    "aria-label": CLOSE_LABEL,
                     onclick: move |_| close(),
                     "\u{00d7}"
                 }
@@ -446,14 +457,20 @@ fn PublicRoomView(
     let rows = lines(&state);
     let can_join = offers_join(&state);
     let member_count = member_names(&state, owner_vk.as_ref()).len();
+    crate::util::signal_guard::anchor();
     let queued = match owner_vk {
-        Some(o) => JOIN
-            .try_read()
-            .ok()
-            .map(|j| j.queued_for(&o))
-            .unwrap_or_default(),
+        Some(o) => match JOIN.try_read() {
+            Ok(j) => j.queued_for(&o),
+            Err(_) => {
+                crate::util::signal_guard::schedule_nudge();
+                Vec::new()
+            }
+        },
         None => Vec::new(),
     };
+    // Bring the newest row (or the waiting message) into view when the rows
+    // change, as a joined room opens at its newest message.
+    let end_key = format!("end-{}-{}", rows.len(), queued.len());
 
     rsx! {
         div { class: "flex-shrink-0 px-3 md:pl-5 md:pr-3 py-3 border-b border-border bg-panel",
@@ -486,6 +503,17 @@ fn PublicRoomView(
                     class: "hidden md:inline flex-shrink-0 text-xs text-text-muted",
                     "data-testid": "viewed-room-member-count",
                     "{member_count_label(member_count)}"
+                }
+                // The rail is hidden on a phone; its x is the way out on a wide
+                // screen, this one on a narrow one.
+                button {
+                    r#type: "button",
+                    "data-testid": "viewed-room-close-narrow",
+                    class: "md:hidden flex-shrink-0 w-8 h-8 rounded-lg text-text-muted hover:text-text hover:bg-surface transition-colors",
+                    title: CLOSE_LABEL,
+                    "aria-label": CLOSE_LABEL,
+                    onclick: move |_| close(),
+                    "\u{00d7}"
                 }
             }
         }
@@ -525,14 +553,6 @@ fn PublicRoomView(
                         key: "pending-{i}",
                         class: "msg-row opacity-60",
                         "data-testid": "viewed-room-pending-message",
-                        // Bring the waiting message into view, as a sent one
-                        // would be in a joined room.
-                        onmounted: move |cx| {
-                            let element = cx.data();
-                            crate::util::safe_spawn_local(async move {
-                                let _ = element.scroll_to(ScrollBehavior::Instant).await;
-                            });
-                        },
                         div { class: "msg-gutter",
                             div { "aria-hidden": "true", class: "msg-avatar msg-avatar-self", "Y" }
                         }
@@ -548,6 +568,16 @@ fn PublicRoomView(
                             }
                         }
                     }
+                }
+                div {
+                    key: "{end_key}",
+                    "aria-hidden": "true",
+                    onmounted: move |cx| {
+                        let element = cx.data();
+                        crate::util::safe_spawn_local(async move {
+                            let _ = element.scroll_to(ScrollBehavior::Instant).await;
+                        });
+                    },
                 }
             }
         }
@@ -579,20 +609,29 @@ fn PublicRoomView(
     }
 }
 
+/// What a confirmed name means: the default itself, or nothing, is "no
+/// choice", so the join keeps whatever default its own key gives.
+fn name_choice(default: &str, typed: &str) -> Option<String> {
+    let typed = typed.trim();
+    if typed.is_empty() || typed == default {
+        None
+    } else {
+        Some(typed.to_string())
+    }
+}
+
 /// The prompt shown at a visitor's first message: one display name, filled
 /// with the generated default. Continue or Enter keeps what is in the box;
 /// Escape keeps the default. It never holds up the proof of work.
 #[component]
-fn NicknamePrompt(default: String, on_done: EventHandler<String>) -> Element {
+fn NicknamePrompt(default: String, on_done: EventHandler<Option<String>>) -> Element {
     let mut nickname = use_signal({
         let default = default.clone();
         move || default
     });
     let has_emoji = contains_hidden_chars(&nickname.read());
-    let ceiling = river_core::room_state::member_info::NICKNAME_CEILING;
-    let too_long = nickname.read().len() > ceiling;
+    let too_long = nickname.read().len() > river_core::room_state::member_info::NICKNAME_CEILING;
     let disabled = invitation_accept_disabled(&nickname.read(), None);
-    let default_for_esc = default.clone();
     rsx! {
         div {
             class: "fixed inset-0 z-50 flex items-center justify-center",
@@ -626,16 +665,16 @@ fn NicknamePrompt(default: String, on_done: EventHandler<String>) -> Element {
                             },
                             oninput: move |evt| nickname.set(evt.value()),
                             onkeydown: {
-                                let default_for_esc = default_for_esc.clone();
+                                let default = default.clone();
                                 move |evt: KeyboardEvent| {
-                                    if evt.key() == Key::Enter && !disabled {
-                                        evt.prevent_default();
-                                        let name = nickname.peek().clone();
-                                        on_done.call(name);
-                                    } else if evt.key() == Key::Escape {
-                                        evt.prevent_default();
-                                        on_done.call(default_for_esc.clone());
-                                    }
+                                if evt.key() == Key::Enter && !disabled {
+                                    evt.prevent_default();
+                                    let name = nickname.peek().clone();
+                                    on_done.call(name_choice(&default, &name));
+                                } else if evt.key() == Key::Escape {
+                                    evt.prevent_default();
+                                    on_done.call(None);
+                                }
                                 }
                             },
                             placeholder: "Your name (e.g. Alex)",
@@ -645,7 +684,7 @@ fn NicknamePrompt(default: String, on_done: EventHandler<String>) -> Element {
                         }
                         if too_long {
                             p { class: "mt-1 text-xs text-danger", role: "alert",
-                                "A display name can be at most {ceiling} bytes."
+                                "That display name is too long."
                             }
                         }
                     }
@@ -657,7 +696,7 @@ fn NicknamePrompt(default: String, on_done: EventHandler<String>) -> Element {
                             disabled,
                             onclick: move |_| {
                                 let name = nickname.peek().clone();
-                                on_done.call(name);
+                                on_done.call(name_choice(&default, &name));
                             },
                             "Continue"
                         }
@@ -680,9 +719,9 @@ pub(crate) fn JoinComposer(
 ) -> Element {
     let mut draft = use_signal(String::new);
     // The display-name prompt: `Some(default)` while it is open. Asked once
-    // per composer, at the first message. `hold_send` means the message waits
-    // for the answer (the proof is already done, so nothing is hidden behind
-    // the wait).
+    // per composer, at the first message. The message waits (`hold_send`) for
+    // the answer while the proof runs on behind the prompt, so nothing is
+    // posted under the default name before the visitor has answered.
     let mut nick_prompt = use_signal(|| None::<String>);
     let mut nick_asked = use_signal(|| false);
     let mut hold_send = use_signal(|| false);
@@ -732,29 +771,34 @@ pub(crate) fn JoinComposer(
         draft.set(String::new());
         crate::util::defer(move || public_join::send(owner_vk, text));
     };
-    let ready = matches!(phase, JoinPhase::Ready);
     let mut send = move || {
+        // The prompt is open: this Enter came before focus reached it. The
+        // text waits for the answer.
+        if nick_prompt.peek().is_some() {
+            return;
+        }
         if draft.peek().trim().is_empty() {
             return;
         }
         if !readmit && !*nick_asked.peek() {
+            // A failed or cancelled start leaves no key; make one so the
+            // prompt can be prefilled.
+            if public_join::default_nickname().is_none() {
+                public_join::ensure_started(owner_vk);
+            }
             if let Some(default) = public_join::default_nickname() {
                 nick_asked.set(true);
                 nick_prompt.set(Some(default));
-                if ready {
-                    hold_send.set(true);
-                    return;
-                }
+                // The proof keeps running behind the prompt; the text is not
+                // queued until it is answered, so a proof that finishes first
+                // cannot post under the default name.
+                hold_send.set(true);
+                return;
             }
         }
         do_send();
     };
-    let on_nickname = move |name: String| {
-        let name = if name.trim().is_empty() {
-            public_join::default_nickname().unwrap_or_default()
-        } else {
-            name
-        };
+    let on_nickname = move |name: Option<String>| {
         public_join::set_nickname(name);
         nick_prompt.set(None);
         if *hold_send.peek() {
@@ -898,6 +942,16 @@ pub(crate) fn JoinComposer(
 #[cfg(test)]
 mod view_tests {
     use super::*;
+
+    #[test]
+    fn the_default_or_nothing_is_no_choice() {
+        assert_eq!(name_choice("Vapor Daylight", "Vapor Daylight"), None);
+        assert_eq!(name_choice("Vapor Daylight", "  "), None);
+        assert_eq!(
+            name_choice("Vapor Daylight", " Quinn "),
+            Some("Quinn".into())
+        );
+    }
 
     #[test]
     fn the_member_count_reads_as_a_number_of_members() {
