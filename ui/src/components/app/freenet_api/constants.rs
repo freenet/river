@@ -74,6 +74,16 @@ pub const REPUT_DELAY_MS: u64 = 20000;
 /// Must be > Freenet's OPERATION_TTL (60s) to avoid premature retry.
 pub const INVITATION_TIMEOUT_MS: u64 = 90_000;
 
+/// Most GETs an accepted invitation sends on its own (the first one included)
+/// before it gives up and shows an error. With the NotFound backoff (3, 6, 12,
+/// then 20 s) the seventh goes out about 81 s after the first.
+pub const MAX_AUTO_INVITE_GETS: u32 = 7;
+
+/// Total time, from an invitation's FIRST GET, within which it may retry on
+/// its own. Retries do not move this start point. After it the invitation
+/// shows an error and waits for the user's Retry.
+pub const INVITE_GIVE_UP_MS: u64 = 2 * INVITATION_TIMEOUT_MS;
+
 // --- WebSocket liveness watchdog (freenet/river#382) ---
 
 /// How often the liveness watchdog wakes to evaluate connection health (ms).

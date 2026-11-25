@@ -16,7 +16,7 @@ use crate::components::app::notifications::mark_initial_sync_complete;
 use crate::components::app::sync_info::{RoomSyncStatus, SYNC_INFO};
 use crate::components::app::{CURRENT_ROOM, PENDING_INVITES, ROOMS, WEB_API};
 use crate::constants::ROOM_CONTRACT_WASM;
-use crate::invites::PendingRoomStatus;
+use crate::invites::{InviteNotFoundStep, PendingRoomStatus};
 use crate::room_data::RoomData;
 use crate::util::{
     from_cbor_slice, get_current_system_time, owner_vk_to_contract_key, to_cbor_vec,
@@ -1449,9 +1449,11 @@ pub(crate) fn request_seed_put(owner_vk: ed25519_dalek::VerifyingKey) {
 ///   generations (freenet/river#292), as an empty `GetResponse` already did:
 ///   a room imported after a re-key may live only under an older key.
 ///
-/// Every other GET (a pending invitation, a refresh) keeps its existing
-/// behaviour, which is to ignore a `NotFound` and let its own timeout handle
-/// it.
+/// * A pending invitation waiting on its GET retries it after a backoff,
+///   within a bounded GET budget, then shows an error (`schedule_invite_retry`).
+///
+/// Every other GET (a refresh) ignores a `NotFound` and lets its own timeout
+/// handle it.
 pub async fn handle_get_not_found(instance_id: ContractInstanceId) {
     // A pointer record not found is no signal (freenet/river#580); the next
     // check asks again.
@@ -1495,7 +1497,21 @@ pub async fn handle_get_not_found(instance_id: ContractInstanceId) {
         Some((state, owed, placeholder)) => (state, owed, placeholder),
         None => (ChatRoomStateV1::default(), None, false),
     };
-    match not_found_action(answers_subscribe_get, owed_merge, placeholder) {
+    // An accepted invitation whose GET is outstanding. Unreadable counts as
+    // not waiting; the invite's timeout backstop still retries it.
+    let invite_awaiting_get = PENDING_INVITES.try_read().is_ok_and(|pending| {
+        pending
+            .map
+            .get(&owner_vk)
+            .is_some_and(|join| matches!(join.status, PendingRoomStatus::Subscribing))
+    });
+    match not_found_action(
+        answers_subscribe_get,
+        owed_merge,
+        placeholder,
+        invite_awaiting_get,
+    ) {
+        NotFoundAction::RetryInvite => schedule_invite_retry(owner_vk),
         NotFoundAction::MergeThenSeed(owed) => {
             // The merge seeds the room once it has folded the older keys in.
             // If it already ran on this load, seed what we hold.
@@ -1546,6 +1562,11 @@ pub(crate) enum NotFoundAction {
     /// An imported room still holding its placeholder: probe the older
     /// generations, where it may be all there is (freenet/river#292).
     ProbePlaceholder,
+    /// An accepted invitation's GET found nothing: GET it again after
+    /// `invite_not_found_retry_delay_ms`. A just-created room is often not
+    /// yet findable from the invitee's node, and nothing else re-runs the
+    /// invite pass on a fresh profile.
+    RetryInvite,
     /// Any other GET: its own timeout handles it.
     Ignore,
 }
@@ -1554,13 +1575,134 @@ pub(crate) fn not_found_action(
     answers_subscribe_get: bool,
     owed_merge: Option<Vec<ContractInstanceId>>,
     placeholder: bool,
+    invite_awaiting_get: bool,
 ) -> NotFoundAction {
     match (answers_subscribe_get, owed_merge, placeholder) {
         (true, Some(owed), _) => NotFoundAction::MergeThenSeed(owed),
         (true, None, _) => NotFoundAction::Seed,
+        (false, _, _) if invite_awaiting_get => NotFoundAction::RetryInvite,
         (false, _, true) => NotFoundAction::ProbePlaceholder,
         (false, _, false) => NotFoundAction::Ignore,
     }
+}
+
+/// How long an invitation waits before re-GETting a room that came back
+/// `NotFound`: `POST_PUT_DELAY_MS` doubled per retry, capped at
+/// `REPUT_DELAY_MS`, so an absent room costs at most one GET per 20 s.
+pub(crate) fn invite_not_found_retry_delay_ms(retry_count: u32) -> u64 {
+    use crate::components::app::freenet_api::constants::{POST_PUT_DELAY_MS, REPUT_DELAY_MS};
+    POST_PUT_DELAY_MS
+        .saturating_mul(1u64 << retry_count.min(16))
+        .min(REPUT_DELAY_MS)
+}
+
+/// An invitation's GET found nothing. Within its GET budget, put it back to
+/// `PendingSubscription` after a backoff and run `ProcessRooms`, which sends
+/// the GET again; past the budget, show an error (`PendingRoomJoin::on_not_found`).
+/// Without this the invite stayed `Subscribing` until something else ran
+/// `process_rooms` past `INVITATION_TIMEOUT_MS`, which on a fresh profile
+/// nothing does.
+///
+/// A `NotFound` carries no request id, so it cannot be tied to the GET it
+/// answers. After the 91 s stuck check has re-sent, a late `NotFound` for
+/// the older GET is taken as the newer one's and can queue another GET while
+/// the newer is still in flight. Every GET is charged to the same budget, so
+/// that case still sends at most `MAX_AUTO_INVITE_GETS` (7) GETs per
+/// invitation within `INVITE_GIVE_UP_MS` (180 s) of the first; the
+/// slow-`NotFound` cases of `the_get_budget_holds_at_any_not_found_latency`
+/// run exactly this.
+fn schedule_invite_retry(owner_vk: ed25519_dalek::VerifyingKey) {
+    let tx = crate::components::app::SYNCHRONIZER
+        .read()
+        .get_message_sender();
+    crate::util::defer(move || {
+        let step = PENDING_INVITES.with_mut(|pending| {
+            invite_not_found_step(
+                pending,
+                owner_vk,
+                crate::components::app::sync_info::now_ms(),
+            )
+        });
+        match step {
+            InviteNotFoundStep::RetryAfter {
+                delay_ms,
+                generation,
+            } => {
+                info!(
+                    "NotFound for invited room {:?} — retrying its GET in {} ms",
+                    MemberId::from(owner_vk),
+                    delay_ms
+                );
+                crate::util::safe_spawn_local(async move {
+                    crate::util::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    crate::util::defer(move || {
+                        let fired = PENDING_INVITES.with_mut(|pending| {
+                            fire_invite_retry(
+                                pending,
+                                owner_vk,
+                                generation,
+                                crate::components::app::sync_info::now_ms(),
+                                &tx,
+                            )
+                        });
+                        if fired {
+                            SYNC_INFO.with_mut(|sync_info| {
+                                sync_info
+                                    .update_sync_status(&owner_vk, RoomSyncStatus::Disconnected);
+                            });
+                        }
+                    });
+                });
+            }
+            InviteNotFoundStep::GaveUp => warn!(
+                "Invited room {:?} still not found after its retries — showing an error",
+                MemberId::from(owner_vk)
+            ),
+            InviteNotFoundStep::NotWaiting => {}
+        }
+    });
+}
+
+/// The decision half of `schedule_invite_retry`: what a NotFound does to the
+/// invitation for `owner_vk`, using the backoff for its retry count.
+pub(crate) fn invite_not_found_step(
+    pending: &mut crate::invites::PendingInvites,
+    owner_vk: ed25519_dalek::VerifyingKey,
+    now: f64,
+) -> InviteNotFoundStep {
+    match pending.map.get_mut(&owner_vk) {
+        Some(join) => {
+            let delay = invite_not_found_retry_delay_ms(join.retry_count);
+            join.on_not_found(now, delay)
+        }
+        None => InviteNotFoundStep::NotWaiting,
+    }
+}
+
+/// A NotFound retry timer for `generation` fired: re-queue the invitation if
+/// it still waits on that GET, and ask the synchronizer to send it. Returns
+/// whether it did; a stale timer is a no-op and sends nothing.
+pub(crate) fn fire_invite_retry(
+    pending: &mut crate::invites::PendingInvites,
+    owner_vk: ed25519_dalek::VerifyingKey,
+    generation: u64,
+    now: f64,
+    tx: &futures::channel::mpsc::UnboundedSender<
+        crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage,
+    >,
+) -> bool {
+    let fired = pending
+        .map
+        .get_mut(&owner_vk)
+        .is_some_and(|join| join.fire_not_found_retry(generation, now));
+    if fired {
+        if let Err(e) = tx.unbounded_send(
+            crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage::ProcessRooms,
+        ) {
+            error!("Failed to request an invitation retry: {}", e);
+        }
+    }
+    fired
 }
 
 /// Adopt a backward-probe-recovered state (freenet/river#292, Task 3): the
@@ -2764,27 +2906,482 @@ mod tests {
         let prev = ContractInstanceId::new([7u8; 32]);
         let owed = || Some(vec![prev]);
         assert_eq!(
-            not_found_action(true, owed(), false),
+            not_found_action(true, owed(), false, false),
             NotFoundAction::MergeThenSeed(vec![prev])
         );
-        assert_eq!(not_found_action(true, None, false), NotFoundAction::Seed);
         assert_eq!(
-            not_found_action(false, None, true),
+            not_found_action(true, None, false, false),
+            NotFoundAction::Seed
+        );
+        assert_eq!(
+            not_found_action(false, None, true, false),
             NotFoundAction::ProbePlaceholder
         );
         assert_eq!(
-            not_found_action(false, owed(), true),
+            not_found_action(false, owed(), true, false),
             NotFoundAction::ProbePlaceholder
         );
         assert_eq!(
-            not_found_action(false, owed(), false),
+            not_found_action(false, owed(), false, false),
             NotFoundAction::Ignore
         );
-        assert_eq!(not_found_action(false, None, false), NotFoundAction::Ignore);
+        assert_eq!(
+            not_found_action(false, None, false, false),
+            NotFoundAction::Ignore
+        );
         // A placeholder never takes the subscribe-GET route (it GETs first),
         // and owes no merge (`owed_rekey_merge` excludes it); if one ever did
         // answer a subscribe GET, it seeds like any room, as before.
-        assert_eq!(not_found_action(true, None, true), NotFoundAction::Seed);
+        assert_eq!(
+            not_found_action(true, None, true, false),
+            NotFoundAction::Seed
+        );
+    }
+
+    /// Fresh-profile invite stall (2026-11-25 repro run 9): the invite's GET
+    /// was sent 0.7 s after Accept on a connected socket and came back
+    /// `NotFound` 5.8 s later. The handler logged "no subscribe GET
+    /// outstanding — ignoring", and the room never rendered. "Its own timeout"
+    /// is `INVITATION_TIMEOUT_MS`, which is only evaluated inside
+    /// `process_rooms`, and a fresh profile has nothing that runs it again.
+    /// A `NotFound` for an invite awaiting its GET must retry the invite.
+    #[test]
+    fn not_found_for_pending_invite_retries_it() {
+        assert_eq!(
+            not_found_action(false, None, false, true),
+            NotFoundAction::RetryInvite
+        );
+        // A placeholder probe or a subscribe-GET seed is not an invite; an
+        // invite's GET is a plain GET, so neither flag is set for it.
+        assert_eq!(
+            not_found_action(false, None, false, false),
+            NotFoundAction::Ignore
+        );
+        assert_eq!(
+            not_found_action(true, None, false, true),
+            NotFoundAction::Seed
+        );
+    }
+
+    fn pending_join(room: ed25519_dalek::VerifyingKey) -> crate::invites::PendingRoomJoin {
+        crate::invites::PendingRoomJoin {
+            authorized_member: AuthorizedMember {
+                member: Member {
+                    owner_member_id: MemberId::from(room),
+                    invited_by: MemberId::from(room),
+                    member_vk: room,
+                },
+                signature: ed25519_dalek::Signature::from_bytes(&[0; 64]),
+            },
+            invitee_signing_key: SigningKey::from_bytes(&[43u8; 32]),
+            preferred_nickname: "n".into(),
+            status: PendingRoomStatus::PendingSubscription,
+            subscribing_since: None,
+            retry_count: 0,
+            room_secrets: vec![],
+            get_budget: Default::default(),
+        }
+    }
+
+    type Tx = futures::channel::mpsc::UnboundedSender<
+        crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage,
+    >;
+
+    /// One simulated invitation run against a fake clock. It drives the real
+    /// transitions (`invite_not_found_step`, `fire_invite_retry`,
+    /// and the `PendingInvites` invite-pass methods `process_rooms` itself
+    /// calls: `reset_stuck`, `awaiting_get`, `begin_get`). Each GET arms its
+    /// own `INVITATION_TIMEOUT_MS + 1 s` check, as `process_rooms` does. Every
+    /// GET is answered `NotFound` after `latency_ms` (a deleted or
+    /// never-created room), or never answered when it is `None`.
+    /// Returns the time of every GET sent, per invitation.
+    fn simulate_not_found_invites(
+        n: u8,
+        latency_ms: Option<f64>,
+    ) -> (crate::invites::PendingInvites, Vec<Vec<f64>>) {
+        use crate::components::app::freenet_api::constants::INVITATION_TIMEOUT_MS;
+        use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage;
+        #[derive(Debug)]
+        enum Ev {
+            ProcessRooms,
+            NotFound(usize),
+            RetryTimer(usize, u64),
+        }
+        let rooms: Vec<_> = (0..n)
+            .map(|i| SigningKey::from_bytes(&[100 + i; 32]).verifying_key())
+            .collect();
+        let mut pending = crate::invites::PendingInvites::default();
+        for r in &rooms {
+            pending.map.insert(*r, pending_join(*r));
+        }
+        let (tx, mut rx): (Tx, _) = futures::channel::mpsc::unbounded();
+        let mut queue: Vec<(f64, Ev)> = vec![(0.0, Ev::ProcessRooms)];
+        let mut gets: Vec<Vec<f64>> = vec![Vec::new(); n as usize];
+        let mut steps = 0;
+        while !queue.is_empty() {
+            steps += 1;
+            assert!(steps < 10_000, "the simulation must terminate");
+            queue.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            let (now, ev) = queue.remove(0);
+            match ev {
+                Ev::ProcessRooms => {
+                    // The same three calls `process_rooms` makes, in order.
+                    pending.reset_stuck(now);
+                    for vk in pending.awaiting_get() {
+                        let i = rooms.iter().position(|r| *r == vk).unwrap();
+                        if pending.begin_get(&vk, now).is_none() {
+                            continue;
+                        }
+                        gets[i].push(now);
+                        if let Some(latency_ms) = latency_ms {
+                            queue.push((now + latency_ms, Ev::NotFound(i)));
+                        }
+                        queue.push((
+                            now + INVITATION_TIMEOUT_MS as f64 + 1000.0,
+                            Ev::ProcessRooms,
+                        ));
+                    }
+                }
+                Ev::NotFound(i) => {
+                    if let InviteNotFoundStep::RetryAfter {
+                        delay_ms,
+                        generation,
+                    } = invite_not_found_step(&mut pending, rooms[i], now)
+                    {
+                        queue.push((now + delay_ms as f64, Ev::RetryTimer(i, generation)));
+                    }
+                }
+                Ev::RetryTimer(i, generation) => {
+                    fire_invite_retry(&mut pending, rooms[i], generation, now, &tx);
+                }
+            }
+            while let Ok(msg) = rx.try_recv() {
+                assert!(matches!(msg, SynchronizerMessage::ProcessRooms));
+                queue.push((now, Ev::ProcessRooms));
+            }
+        }
+        (pending, gets)
+    }
+
+    /// A room that is never found costs exactly `MAX_AUTO_INVITE_GETS` (7)
+    /// GETs, all within 90 s of the first (0, 3.5, 10, 22.5, 43, 63.5, 84 s
+    /// at 0.5 s latency), then the invitation shows an error and nothing
+    /// more is sent: the simulation runs every pending timer to completion.
+    #[test]
+    fn a_never_found_invite_stops_after_its_get_budget() {
+        use crate::components::app::freenet_api::constants::{
+            INVITATION_TIMEOUT_MS, MAX_AUTO_INVITE_GETS,
+        };
+        let (pending, gets) = simulate_not_found_invites(1, Some(500.0));
+        assert_eq!(MAX_AUTO_INVITE_GETS, 7);
+        assert_eq!(gets[0].len(), 7, "GETs sent: {:?}", gets[0]);
+        assert_eq!(
+            gets[0],
+            vec![0.0, 3500.0, 10000.0, 22500.0, 43000.0, 63500.0, 84000.0]
+        );
+        assert!(
+            *gets[0].last().unwrap() < INVITATION_TIMEOUT_MS as f64,
+            "the retries run off the NotFound backoff, not the 91 s backstop"
+        );
+        let join = pending.map.values().next().unwrap();
+        assert_eq!(
+            join.status,
+            PendingRoomStatus::Error(crate::invites::INVITE_NOT_FOUND_ERROR.to_string())
+        );
+    }
+
+    /// N invitations for never-found rooms cost exactly N x 7 GETs: one
+    /// invitation's `ProcessRooms` sends nothing for another.
+    #[test]
+    fn many_never_found_invites_do_not_amplify() {
+        for n in [2u8, 5, 20] {
+            let (pending, gets) = simulate_not_found_invites(n, Some(500.0));
+            assert_eq!(gets.iter().map(Vec::len).sum::<usize>(), 7 * n as usize);
+            assert!(gets.iter().all(|g| g.len() == 7));
+            assert!(pending
+                .map
+                .values()
+                .all(|j| matches!(j.status, PendingRoomStatus::Error(_))));
+        }
+    }
+
+    /// The bound holds whatever the NotFound latency: a slow NotFound runs
+    /// into the 91 s stuck check and the 180 s total deadline instead.
+    #[test]
+    fn the_get_budget_holds_at_any_not_found_latency() {
+        for latency in [0.0, 500.0, 5_000.0, 30_000.0, 89_000.0, 120_000.0] {
+            let (pending, gets) = simulate_not_found_invites(1, Some(latency));
+            assert!(
+                (1..=7).contains(&gets[0].len()),
+                "latency {latency}: {:?}",
+                gets[0]
+            );
+            let first = gets[0][0];
+            assert!(gets[0].iter().all(|t| t - first <= 180_000.0));
+            assert!(matches!(
+                pending.map.values().next().unwrap().status,
+                PendingRoomStatus::Error(_)
+            ));
+        }
+    }
+
+    /// A GET that is never answered: the 91 s stuck check re-sends once, and
+    /// the next check (182 s, past the 180 s deadline) shows the error. Two
+    /// GETs in all, then nothing more.
+    #[test]
+    fn a_never_answered_invite_stops_at_its_deadline() {
+        let (pending, gets) = simulate_not_found_invites(1, None);
+        assert_eq!(gets[0], vec![0.0, 91_000.0]);
+        assert_eq!(
+            pending.map.values().next().unwrap().status,
+            PendingRoomStatus::Error(crate::invites::INVITE_NO_ANSWER_ERROR.to_string())
+        );
+    }
+
+    /// The error modal's Retry re-queues the invitation with a fresh budget
+    /// and requests exactly one synchronizer pass.
+    #[test]
+    fn retry_from_error_requests_one_pass() {
+        use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage;
+        let room = SigningKey::from_bytes(&[12u8; 32]).verifying_key();
+        let mut pending = crate::invites::PendingInvites::default();
+        pending.map.insert(room, pending_join(room));
+        for t in 0..7 {
+            pending.begin_get(&room, t as f64);
+        }
+        pending.map.get_mut(&room).unwrap().status = PendingRoomStatus::Error("x".into());
+        let (tx, mut rx): (Tx, _) = futures::channel::mpsc::unbounded();
+        assert!(pending.retry_from_error(&room, &tx));
+        let join = &pending.map[&room];
+        assert_eq!(join.status, PendingRoomStatus::PendingSubscription);
+        assert_eq!(join.get_budget.gets_sent, 0, "a fresh budget");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(SynchronizerMessage::ProcessRooms)
+        ));
+        assert!(rx.try_recv().is_err(), "exactly one pass per click");
+    }
+
+    /// A second Retry click that lands before the re-render finds the
+    /// invitation already retrying: it changes nothing and requests no pass.
+    #[test]
+    fn retry_from_error_ignores_an_invite_that_is_not_in_error() {
+        let room = SigningKey::from_bytes(&[13u8; 32]).verifying_key();
+        let mut pending = crate::invites::PendingInvites::default();
+        pending.map.insert(room, pending_join(room));
+        pending.begin_get(&room, 0.0);
+        let before = pending.map[&room].get_budget.clone();
+        let (tx, mut rx): (Tx, _) = futures::channel::mpsc::unbounded();
+        for status in [
+            PendingRoomStatus::Subscribing,
+            PendingRoomStatus::PendingSubscription,
+            PendingRoomStatus::Subscribed,
+        ] {
+            pending.map.get_mut(&room).unwrap().status = status.clone();
+            assert!(!pending.retry_from_error(&room, &tx));
+            assert_eq!(pending.map[&room].status, status);
+            assert_eq!(pending.map[&room].get_budget, before, "budget untouched");
+            assert!(rx.try_recv().is_err(), "no pass requested");
+        }
+    }
+
+    /// Generations never repeat, even for a re-accepted invitation whose
+    /// budget starts again from `Default`, so an old timer never matches.
+    #[test]
+    fn invite_get_generations_never_repeat() {
+        let mut old = crate::invites::InviteGetBudget::default();
+        let g1 = old.record_get_sent(0.0);
+        let mut reaccepted = crate::invites::InviteGetBudget::default();
+        let g2 = reaccepted.record_get_sent(0.0);
+        assert_ne!(g1, 0);
+        assert!(g2 > g1, "a re-accept draws a new generation");
+    }
+
+    /// A throttled or suspended tab can run a NotFound retry timer late. Past
+    /// the 180 s deadline, or with all 7 GETs spent, the timer shows the error
+    /// and requests nothing, and the next pass sends no GET.
+    #[test]
+    fn a_late_retry_timer_past_the_budget_shows_the_error() {
+        // (start of the budget, GETs already sent, when the timer fires)
+        for (gets_before, fire_at) in [(1u32, 181_000.0), (7, 50_000.0)] {
+            let room = SigningKey::from_bytes(&[14u8; 32]).verifying_key();
+            let mut pending = crate::invites::PendingInvites::default();
+            pending.map.insert(room, pending_join(room));
+            for t in 0..gets_before {
+                pending.begin_get(&room, t as f64).unwrap();
+            }
+            let generation = pending.map[&room].get_budget.generation;
+            // The timer was armed for this GET; the clock jumps before it fires.
+            let (tx, mut rx): (Tx, _) = futures::channel::mpsc::unbounded();
+            assert!(!fire_invite_retry(
+                &mut pending,
+                room,
+                generation,
+                fire_at,
+                &tx
+            ));
+            assert_eq!(
+                pending.map[&room].status,
+                PendingRoomStatus::Error(crate::invites::INVITE_NOT_FOUND_ERROR.to_string()),
+                "gets_before={gets_before}"
+            );
+            assert!(rx.try_recv().is_err(), "no pass requested");
+            assert!(pending.awaiting_get().is_empty(), "no GET is queued");
+        }
+    }
+
+    /// The send-time check: an invitation queued for a GET whose budget is
+    /// already spent sends nothing and shows the error.
+    #[test]
+    fn begin_get_refuses_a_spent_budget() {
+        for (gets_before, now) in [(1u32, 181_000.0), (7, 50_000.0)] {
+            let room = SigningKey::from_bytes(&[15u8; 32]).verifying_key();
+            let mut pending = crate::invites::PendingInvites::default();
+            pending.map.insert(room, pending_join(room));
+            for t in 0..gets_before {
+                pending.begin_get(&room, t as f64).unwrap();
+            }
+            pending.map.get_mut(&room).unwrap().status = PendingRoomStatus::PendingSubscription;
+            let sent_before = pending.map[&room].get_budget.gets_sent;
+            assert_eq!(pending.begin_get(&room, now), None);
+            let join = &pending.map[&room];
+            assert_eq!(join.get_budget.gets_sent, sent_before, "no GET charged");
+            assert!(matches!(join.status, PendingRoomStatus::Error(_)));
+        }
+    }
+
+    /// A retry timer armed for an older GET does nothing once a newer GET
+    /// is out, so two GETs for one invitation are never in flight.
+    #[test]
+    fn a_stale_invite_retry_timer_is_a_no_op() {
+        let room = SigningKey::from_bytes(&[9u8; 32]).verifying_key();
+        let mut pending = crate::invites::PendingInvites::default();
+        pending.map.insert(room, pending_join(room));
+        let join = pending.map.get_mut(&room).unwrap();
+        join.status = PendingRoomStatus::Subscribing;
+        join.get_budget.record_get_sent(0.0);
+        let InviteNotFoundStep::RetryAfter { generation, .. } =
+            invite_not_found_step(&mut pending, room, 100.0)
+        else {
+            panic!("first NotFound retries");
+        };
+        // Before the timer fires, the 90 s path (or a re-accept) sends a newer GET.
+        let join = pending.map.get_mut(&room).unwrap();
+        join.get_budget.record_get_sent(1_000.0);
+        let (tx, mut rx): (Tx, _) = futures::channel::mpsc::unbounded();
+        assert!(!fire_invite_retry(
+            &mut pending,
+            room,
+            generation,
+            1_000.0,
+            &tx
+        ));
+        assert_eq!(
+            pending.map[&room].status,
+            PendingRoomStatus::Subscribing,
+            "the newer GET is left alone"
+        );
+        assert!(rx.try_recv().is_err(), "a stale timer requests nothing");
+        // A timer for an invitation that already finished is a no-op too.
+        let current = pending.map[&room].get_budget.generation;
+        pending.map.get_mut(&room).unwrap().status = PendingRoomStatus::Subscribed;
+        assert!(!fire_invite_retry(
+            &mut pending,
+            room,
+            current,
+            1_000.0,
+            &tx
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// A live retry timer re-queues the invitation AND asks the synchronizer
+    /// for exactly one `ProcessRooms`; without that message the invitation
+    /// waits for the 91 s backstop.
+    #[test]
+    fn an_invite_retry_requests_process_rooms() {
+        use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage;
+        let room = SigningKey::from_bytes(&[10u8; 32]).verifying_key();
+        let mut pending = crate::invites::PendingInvites::default();
+        pending.map.insert(room, pending_join(room));
+        let join = pending.map.get_mut(&room).unwrap();
+        join.status = PendingRoomStatus::Subscribing;
+        let generation = join.get_budget.record_get_sent(0.0);
+        let (tx, mut rx): (Tx, _) = futures::channel::mpsc::unbounded();
+        assert!(fire_invite_retry(
+            &mut pending,
+            room,
+            generation,
+            3_000.0,
+            &tx
+        ));
+        assert_eq!(
+            pending.map[&room].status,
+            PendingRoomStatus::PendingSubscription
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(SynchronizerMessage::ProcessRooms)
+        ));
+        assert!(rx.try_recv().is_err(), "exactly one request");
+    }
+
+    /// Out of budget, a NotFound shows the error and arms nothing; a user
+    /// Retry starts a fresh budget.
+    #[test]
+    fn an_out_of_budget_not_found_shows_an_error_and_arms_nothing() {
+        let room = SigningKey::from_bytes(&[11u8; 32]).verifying_key();
+        let mut pending = crate::invites::PendingInvites::default();
+        pending.map.insert(room, pending_join(room));
+        let join = pending.map.get_mut(&room).unwrap();
+        join.status = PendingRoomStatus::Subscribing;
+        for t in 0..7 {
+            join.get_budget.record_get_sent(t as f64);
+        }
+        assert_eq!(
+            invite_not_found_step(&mut pending, room, 10.0),
+            InviteNotFoundStep::GaveUp
+        );
+        assert!(matches!(
+            pending.map[&room].status,
+            PendingRoomStatus::Error(_)
+        ));
+        // A second NotFound for the errored invitation does nothing.
+        assert_eq!(
+            invite_not_found_step(&mut pending, room, 11.0),
+            InviteNotFoundStep::NotWaiting
+        );
+        // Past the total deadline with budget left also gives up.
+        let join = pending.map.get_mut(&room).unwrap();
+        join.get_budget.restart();
+        join.status = PendingRoomStatus::Subscribing;
+        join.get_budget.record_get_sent(0.0);
+        assert_eq!(
+            invite_not_found_step(&mut pending, room, 179_000.0),
+            InviteNotFoundStep::GaveUp,
+            "a retry that would land past 180 s is not sent"
+        );
+    }
+
+    /// The invite retry backs off and is bounded: soon enough to beat the
+    /// 90 s backstop by a wide margin, never faster than `POST_PUT_DELAY_MS`,
+    /// never slower than `REPUT_DELAY_MS`, so a room that really is absent
+    /// costs at most one GET every 20 s.
+    #[test]
+    fn invite_not_found_retry_delay_backs_off_and_is_capped() {
+        use crate::components::app::freenet_api::constants::{
+            INVITATION_TIMEOUT_MS, POST_PUT_DELAY_MS, REPUT_DELAY_MS,
+        };
+        assert_eq!(invite_not_found_retry_delay_ms(0), POST_PUT_DELAY_MS);
+        let mut prev = 0;
+        for n in 0..64 {
+            let d = invite_not_found_retry_delay_ms(n);
+            assert!(d >= prev, "delay must not shrink (n={n})");
+            assert!((POST_PUT_DELAY_MS..=REPUT_DELAY_MS).contains(&d));
+            assert!(d < INVITATION_TIMEOUT_MS);
+            prev = d;
+        }
+        assert_eq!(invite_not_found_retry_delay_ms(63), REPUT_DELAY_MS);
     }
 
     /// freenet/river#757 safety net, source pin: a `NotFound` for a room whose
@@ -2822,10 +3419,16 @@ mod tests {
             not_found.contains(
                 "letanswers_subscribe_get=SYNC_INFO.with_mut(|sync_info|sync_info.subscribe_get_found_nothing(&owner_vk));"
             ) && not_found.contains(
-                "matchnot_found_action(answers_subscribe_get,owed_merge,placeholder){"
+                "matchnot_found_action(answers_subscribe_get,owed_merge,placeholder,invite_awaiting_get,){"
             ) && not_found.contains("NotFoundAction::Seed=>request_seed_put(owner_vk),"),
             "handle_get_not_found must request the seed PUT exactly when the \
              NotFound answers an outstanding subscribe GET"
+        );
+        // Fresh-profile invite stall: a NotFound for an invite waiting on its
+        // GET schedules a retry instead of being ignored.
+        assert!(
+            not_found.contains("NotFoundAction::RetryInvite=>schedule_invite_retry(owner_vk),"),
+            "handle_get_not_found must retry an invitation whose GET found nothing"
         );
         // freenet/river#769: a room that still owes a re-key merge folds the
         // older keys in before that seed, and seeds anyway if the merge already

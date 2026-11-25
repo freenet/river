@@ -24,6 +24,79 @@ impl PendingInvites {
     pub(crate) fn any_in_progress(&self) -> bool {
         self.map.values().any(|join| join.status.is_in_progress())
     }
+
+    /// The stuck-invite step of `process_rooms`: every invitation that has
+    /// waited `INVITATION_TIMEOUT_MS` on a GET is re-queued if its budget
+    /// allows (`true`) or shows an error (`false`).
+    pub(crate) fn reset_stuck(&mut self, now: f64) -> Vec<(VerifyingKey, bool)> {
+        use crate::components::app::freenet_api::constants::INVITATION_TIMEOUT_MS;
+        self.map
+            .iter_mut()
+            .filter(|(_, join)| {
+                matches!(join.status, PendingRoomStatus::Subscribing)
+                    && join
+                        .subscribing_since
+                        .is_none_or(|since| now - since > INVITATION_TIMEOUT_MS as f64)
+            })
+            .map(|(vk, join)| (*vk, join.on_stuck(now)))
+            .collect()
+    }
+
+    /// Invitations `process_rooms` should send a GET for.
+    pub(crate) fn awaiting_get(&self) -> Vec<VerifyingKey> {
+        self.map
+            .iter()
+            .filter(|(_, join)| matches!(join.status, PendingRoomStatus::PendingSubscription))
+            .map(|(vk, _)| *vk)
+            .collect()
+    }
+
+    /// `process_rooms` is sending the GET for `vk`: mark it `Subscribing` and
+    /// charge it to the GET budget. Returns the retry count, or `None` when
+    /// no GET may go out: the invitation is gone, or its budget is spent
+    /// (then it shows the error). The budget is checked here, at send time,
+    /// because a throttled or suspended tab can run a retry timer late.
+    pub(crate) fn begin_get(&mut self, vk: &VerifyingKey, now: f64) -> Option<u32> {
+        let join = self.map.get_mut(vk)?;
+        if !join.get_budget.may_retry(now, 0) {
+            join.status = PendingRoomStatus::Error(INVITE_NOT_FOUND_ERROR.to_string());
+            return None;
+        }
+        join.status = PendingRoomStatus::Subscribing;
+        join.subscribing_since = Some(now);
+        join.get_budget.record_get_sent(now);
+        Some(join.retry_count)
+    }
+
+    /// The error modal's Retry: re-queue the invitation with a fresh GET
+    /// budget and ask the synchronizer for one pass, which sends the GET.
+    /// On a fresh profile nothing else runs `process_rooms`, so without the
+    /// pass the invitation would sit at "Preparing to subscribe".
+    pub(crate) fn retry_from_error(
+        &mut self,
+        vk: &VerifyingKey,
+        tx: &futures::channel::mpsc::UnboundedSender<
+            crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage,
+        >,
+    ) -> bool {
+        // Only from Error: a second click that lands before the re-render
+        // finds the invitation already retrying and must not restart it.
+        let Some(join) = self
+            .map
+            .get_mut(vk)
+            .filter(|join| matches!(join.status, PendingRoomStatus::Error(_)))
+        else {
+            return false;
+        };
+        join.status = PendingRoomStatus::PendingSubscription;
+        join.get_budget.restart();
+        if let Err(e) = tx.unbounded_send(
+            crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage::ProcessRooms,
+        ) {
+            dioxus::logger::tracing::error!("Failed to request an invitation retry: {}", e);
+        }
+        true
+    }
     /*
         /// Adds a new pending room join request
         pub fn add(&mut self, owner_key: VerifyingKey, join_info: PendingRoomJoin) {
@@ -60,6 +133,132 @@ pub struct PendingRoomJoin {
     /// GET-response handler can seed them into `RoomData`. Empty for
     /// public rooms and pre-feature invitations.
     pub room_secrets: Vec<(u32, [u8; 32])>,
+    /// How many GETs this invitation has sent on its own, and since when.
+    pub get_budget: InviteGetBudget,
+}
+
+/// Bounds the GETs an invitation sends without the user asking: at most
+/// `MAX_AUTO_INVITE_GETS`, all within `INVITE_GIVE_UP_MS` of the first.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct InviteGetBudget {
+    /// When the first GET went out (ms since epoch). Retries do not move it.
+    pub first_get_at: Option<f64>,
+    /// GETs sent since the budget last started, the first one included.
+    pub gets_sent: u32,
+    /// The latest GET's id. Drawn from one process-wide counter, so it never
+    /// repeats, even across a re-accept of the same room, and a retry timer
+    /// armed for an older GET can tell it is stale.
+    pub generation: u64,
+}
+
+/// Source of `InviteGetBudget::generation`; starts at 1 so a fresh budget's
+/// 0 never matches a GET.
+static NEXT_INVITE_GET_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+impl InviteGetBudget {
+    /// Record a GET going out; returns its generation.
+    pub fn record_get_sent(&mut self, now: f64) -> u64 {
+        self.first_get_at.get_or_insert(now);
+        self.gets_sent += 1;
+        self.generation =
+            NEXT_INVITE_GET_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.generation
+    }
+
+    /// Whether one more automatic GET, sent `delay_ms` from `now`, fits.
+    pub fn may_retry(&self, now: f64, delay_ms: u64) -> bool {
+        use crate::components::app::freenet_api::constants::{
+            INVITE_GIVE_UP_MS, MAX_AUTO_INVITE_GETS,
+        };
+        self.gets_sent < MAX_AUTO_INVITE_GETS
+            && self
+                .first_get_at
+                .is_none_or(|first| now + delay_ms as f64 - first <= INVITE_GIVE_UP_MS as f64)
+    }
+
+    /// Start a fresh budget for a user-requested retry. The generation is
+    /// left alone; the next GET draws a new one.
+    pub fn restart(&mut self) {
+        self.first_get_at = None;
+        self.gets_sent = 0;
+    }
+}
+
+/// Shown (after "Failed to retrieve room: ") when the invitation's GETs keep
+/// coming back NotFound.
+pub const INVITE_NOT_FOUND_ERROR: &str =
+    "the room was not found on the network yet. Check the invitation, or try again.";
+
+/// Shown when the invitation's GETs keep going unanswered.
+pub const INVITE_NO_ANSWER_ERROR: &str =
+    "the network did not answer. Check your connection, or try again.";
+
+/// What an invitation does after its GET came back NotFound.
+#[derive(Debug, PartialEq)]
+pub enum InviteNotFoundStep {
+    /// GET again after `delay_ms`, if `generation` is still the latest GET.
+    RetryAfter { delay_ms: u64, generation: u64 },
+    /// Out of budget: the invitation now shows an error.
+    GaveUp,
+    /// The invitation was not waiting on a GET; nothing to do.
+    NotWaiting,
+}
+
+impl PendingRoomJoin {
+    /// A GET for this invitation came back NotFound.
+    pub fn on_not_found(&mut self, now: f64, delay_ms: u64) -> InviteNotFoundStep {
+        if !matches!(self.status, PendingRoomStatus::Subscribing) {
+            return InviteNotFoundStep::NotWaiting;
+        }
+        if self.get_budget.may_retry(now, delay_ms) {
+            InviteNotFoundStep::RetryAfter {
+                delay_ms,
+                generation: self.get_budget.generation,
+            }
+        } else {
+            self.status = PendingRoomStatus::Error(INVITE_NOT_FOUND_ERROR.to_string());
+            InviteNotFoundStep::GaveUp
+        }
+    }
+
+    /// A NotFound retry timer armed for `generation` fired. Re-queues the
+    /// invitation only if it is still waiting on that same GET; returns
+    /// whether it did. A newer GET or a finished invitation makes it a no-op.
+    /// The budget is checked again at `now`: a throttled or suspended tab can
+    /// fire the timer late, and past the budget the invitation shows the
+    /// error instead.
+    pub fn fire_not_found_retry(&mut self, generation: u64, now: f64) -> bool {
+        if matches!(self.status, PendingRoomStatus::Subscribing)
+            && self.get_budget.generation == generation
+        {
+            if !self.get_budget.may_retry(now, 0) {
+                self.status = PendingRoomStatus::Error(INVITE_NOT_FOUND_ERROR.to_string());
+                return false;
+            }
+            self.status = PendingRoomStatus::PendingSubscription;
+            self.subscribing_since = None;
+            self.retry_count += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The invitation has waited `INVITATION_TIMEOUT_MS` without an answer.
+    /// Re-queues it while the budget allows (returns `true`), otherwise shows
+    /// an error (returns `false`).
+    pub fn on_stuck(&mut self, now: f64) -> bool {
+        if self.get_budget.may_retry(now, 0) {
+            self.status = PendingRoomStatus::PendingSubscription;
+            self.subscribing_since = None;
+            self.retry_count += 1;
+            true
+        } else {
+            self.status = PendingRoomStatus::Error(INVITE_NO_ANSWER_ERROR.to_string());
+            false
+        }
+    }
 }
 
 /// Hand-written `Debug` that REDACTS `room_secrets` — the derived `Debug`
@@ -79,6 +278,7 @@ impl std::fmt::Debug for PendingRoomJoin {
                 "room_secrets",
                 &format_args!("<{} room secret(s) redacted>", self.room_secrets.len()),
             )
+            .field("get_budget", &self.get_budget)
             .finish()
     }
 }
