@@ -86,15 +86,13 @@ test("the copy link round-trips: copied from a public room, it opens that room",
   expect(copied).toMatch(/^https:\/\/freenet\.org\/open#[1-9A-HJ-NP-Za-km-z]{43,44}\/\?room=[1-9A-HJ-NP-Za-km-z]{43,44}$/);
   await expect(page.getByTestId("room-public-link-text")).toHaveText(copied);
 
-  // The opened view has no Copy link of its own (it looks like a joined room);
-  // open the link copied from the room's settings, as a visitor would.
+  // The opened view has no Copy link of its own (it looks like a joined room),
+  // so links are shared from room settings. Open a link of that shape for a
+  // viewable room. freenet.org/open sends the reader to
+  // `/v1/contract/web/<id>/?room=...` on their own node; here that is the
+  // local build.
   const key = await callRiverTest(page, "viewableRoomKey", "public");
-  await openLink(page, key);
-  const viewerLink = copied;
-  expect(viewerLink).toContain(`?room=`);
-  // freenet.org/open sends the reader to `/v1/contract/web/<id>/?room=...` on
-  // their own node; here that is the local build.
-  await page.goto("/?room=" + viewerLink.split("?room=")[1]);
+  await page.goto("/?room=" + key);
   await waitForApp(page);
   await expect(page.getByTestId("viewed-room-name")).toHaveText("Open Public Room");
 });

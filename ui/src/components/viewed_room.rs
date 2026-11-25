@@ -525,6 +525,14 @@ fn PublicRoomView(
                         key: "pending-{i}",
                         class: "msg-row opacity-60",
                         "data-testid": "viewed-room-pending-message",
+                        // Bring the waiting message into view, as a sent one
+                        // would be in a joined room.
+                        onmounted: move |cx| {
+                            let element = cx.data();
+                            crate::util::safe_spawn_local(async move {
+                                let _ = element.scroll_to(ScrollBehavior::Instant).await;
+                            });
+                        },
                         div { class: "msg-gutter",
                             div { "aria-hidden": "true", class: "msg-avatar msg-avatar-self", "Y" }
                         }

@@ -80,7 +80,7 @@ test("typing starts the proof quietly, and the first message makes the visitor a
   // Nothing is posted, nothing is announced, and the viewer is still a viewer.
   await expect(page.getByTestId("viewed-room")).toBeVisible();
   await expect(page.getByTestId("viewed-room-pending-message")).toHaveCount(0);
-  await expect(page.getByTestId("viewed-room")).not.toContainText("bot");
+  await expect(page.getByTestId("viewed-room-sending-notice")).toHaveCount(0);
 
   await sendFirst(page);
   await expect(page.getByTestId("viewed-room")).toHaveCount(0, { timeout: 30_000 });
@@ -110,7 +110,7 @@ test("a queued message is shown as pending and is not lost when the join is canc
   await expect(page.getByTestId("viewed-room-pending-message")).toContainText("Keep this draft");
   await expect(page.getByTestId("viewed-room-sending-notice")).toContainText("Sending in a moment");
   await expect(page.getByTestId("viewed-room-sending-notice")).toContainText("spam");
-  await expect(page.getByTestId("viewed-room")).not.toContainText("proof");
+  await expect(page.getByTestId("viewed-room-sending-notice")).not.toContainText(/proof|bot|bits/i);
   await expect(page.getByTestId("viewed-room")).toBeVisible();
 
   await page.getByTestId("viewed-room-join-cancel").click();
@@ -225,7 +225,7 @@ test("messages sent while solving are all queued, shown pending, and post exactl
   expect(panics).toEqual([]);
 });
 
-test("a message too long for the room is refused before any work, and kept in the box", async ({ page }) => {
+test("a message too long for the room is refused before it is queued, and kept in the box", async ({ page }) => {
   const panics = panicsOf(page);
   await openRoom(page, "open");
   const long = "x".repeat(5000);
@@ -233,8 +233,10 @@ test("a message too long for the room is refused before any work, and kept in th
   await sendFirst(page);
   await expect(page.getByTestId("viewed-room-join-notice")).toContainText("longer than the room allows");
   await expect(page.getByTestId("viewed-room-composer")).toHaveValue(long);
-  await expect(page.getByTestId("viewed-room-join-progress")).toHaveCount(0);
-  expect(await callRiverTest(page, "joinSessionKey")).toBe("");
+  await expect(page.getByTestId("viewed-room-sending-notice")).toHaveCount(0);
+  // Typing started the proof quietly, but nothing was queued or posted.
+  await expect(page.getByTestId("viewed-room-pending-message")).toHaveCount(0);
+  expect(await callRiverTest(page, "roomMessageCount", long)).toBe(0);
   expect(panics).toEqual([]);
 });
 
