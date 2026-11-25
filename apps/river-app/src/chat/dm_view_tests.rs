@@ -1771,6 +1771,43 @@ mod sending {
     }
 
     #[test]
+    fn a_box_made_read_only_by_a_send_is_not_focused_and_takes_the_keyboard_back_when_answered() {
+        use std::time::Instant;
+        let (mut rt, uid) = open_with("Jonas");
+        let focused = |rt: &Runtime<RiverApp>| {
+            rt.elements()
+                .into_iter()
+                .find(|e| e.focused)
+                .and_then(|e| e.key)
+        };
+        assert_eq!(focused(&rt).as_deref(), Some("dm-composer-field"));
+        type_text(&mut rt, "first");
+        assert!(rt.state.chat.dm_send_at(Instant::now()));
+        rt.invalidate();
+        rt.frame(0.2);
+        rt.frame(0.8);
+        assert!(
+            !rt.state.chat.dm.compose_edit_focused(),
+            "a read-only box does not count as focused"
+        );
+        assert_ne!(focused(&rt).as_deref(), Some("dm-composer-field"));
+        let Action::SendDm { ticket, .. } = sent(&rt)[0].1.clone() else {
+            panic!()
+        };
+        let u = uid.clone();
+        rt.update(move |s, _| {
+            s.chat.dm_sent(ROOM, &u, ticket, Ok(()));
+        });
+        rt.invalidate();
+        rt.frame(0.2);
+        rt.frame(0.8);
+        // The answer came: the user types on without a click.
+        assert_eq!(focused(&rt).as_deref(), Some("dm-composer-field"));
+        type_text(&mut rt, "second");
+        assert_eq!(the_box(&rt, ROOM, &uid), "second");
+    }
+
+    #[test]
     fn the_box_is_read_only_while_a_send_waits_and_editable_again_when_it_is_answered_or_times_out()
     {
         use std::time::Instant;

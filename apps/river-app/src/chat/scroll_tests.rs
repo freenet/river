@@ -222,6 +222,38 @@ fn up_and_down_scroll_a_direct_message_thread_after_a_click_on_text() {
 }
 
 #[test]
+fn a_thread_just_opened_is_scrolled_by_the_arrows_as_a_room_is() {
+    // As in a room, a focused composer owns the arrows (an editable member's box is focused when
+    // the thread opens, and the arrows stay in it until a click). A box that cannot take text
+    // holds no focus, so the arrows scroll the thread at once.
+    for member in [true, false] {
+        let (mut rt, _) = long_dm_with(member);
+        assert_eq!(rt.state.chat.dm.compose_edit().focused, member);
+        let before = dm_line_y(&rt);
+        key(&mut rt, Key::Up);
+        let moved = dm_line_y(&rt) > before + 20.0;
+        assert_eq!(moved, !member, "Up scrolled the thread (member: {member})");
+    }
+}
+
+#[test]
+fn a_box_that_turns_read_only_while_the_thread_is_open_gives_up_the_keyboard() {
+    let (mut rt, _) = long_dm_with(true);
+    assert!(rt.state.chat.dm.compose_edit().focused);
+    // The peer leaves the room.
+    rt.update(|s, _| s.chat.room_mut().unwrap().members[1].full_id = 1);
+    settle(&mut rt);
+    assert!(rt.state.chat.dm_block().is_some());
+    assert!(!rt.state.chat.dm.compose_edit().focused);
+    let (x, y) = text_at(&rt, "dm line number 38");
+    click(&mut rt, x, y);
+    assert_ne!(focused_key(&rt).as_deref(), Some("dm-composer-field"));
+    let before = dm_line_y(&rt);
+    key(&mut rt, Key::Up);
+    assert!(dm_line_y(&rt) > before + 20.0, "Up scrolled the thread");
+}
+
+#[test]
 fn the_arrows_stay_in_a_direct_message_box_that_has_text() {
     let (mut rt, _) = long_dm_with(true);
     rt.update(|s, _| s.chat.dm.compose_edit().replace_text("hi"));
