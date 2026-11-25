@@ -1,6 +1,7 @@
 //! The read-only pane for a room opened by `?room=` link (freenet/river#513).
 //! State and rules: [`crate::public_room`].
 
+use crate::components::app::chat_delegate::{RoomsLoadState, ROOMS_LOAD_STATE};
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
 use crate::components::app::{CURRENT_ROOM, ROOMS, SYNC_STATUS};
 use crate::components::room_list::edit_room_modal::CopyButton;
@@ -16,6 +17,15 @@ use river_core::room_state::member::MemberId;
 use river_core::room_state::ChatRoomStateV1;
 use std::collections::HashMap;
 use std::time::UNIX_EPOCH;
+
+/// Whether the user's rooms have loaded. A contended signal counts as loaded:
+/// `is_ours` then treats the room as theirs, which is the safe error.
+pub(crate) fn rooms_loaded() -> bool {
+    ROOMS_LOAD_STATE
+        .try_read()
+        .map(|s| *s == RoomsLoadState::Loaded)
+        .unwrap_or(true)
+}
 
 #[component]
 pub fn ViewedRoomPane() -> Element {
@@ -33,8 +43,16 @@ pub fn ViewedRoomPane() -> Element {
             }
         };
         let just_connected = connected && !last_connected.replace(connected);
-        if just_connected {
+        // Only the lookup's first connect: a reconnect is not part of its timing.
+        if just_connected && !asked.get() {
             crate::public_room::lookup_log("ws open");
+        }
+        if connected {
+            // Route an answer held while the user's rooms loaded; the redirect
+            // below opens it as theirs when it is.
+            if rooms_loaded() {
+                crate::public_room::release_held();
+            }
         }
         if !connected {
             last_connected.set(false);
@@ -140,9 +158,10 @@ fn Notice(status: ViewedRoomStatus, owner_vk: Option<ed25519_dalek::VerifyingKey
             let connected = SYNC_STATUS
                 .try_read()
                 .map(|s| matches!(&*s, SynchronizerStatus::Connected));
-            let hint = match connected {
-                Ok(c) => waiting_hint(c),
-                Err(_) => None,
+            let held = crate::public_room::ANSWER_HELD.try_read().map(|v| *v);
+            let hint = match (connected, held) {
+                (Ok(c), Ok(h)) => waiting_hint(c, h),
+                _ => None,
             };
             (
                 "viewed-room-loading",

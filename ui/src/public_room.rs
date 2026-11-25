@@ -229,8 +229,10 @@ pub enum FetchAction {
 
 /// What to send now: as soon as the socket is connected, without waiting for
 /// the user's own rooms to load, and never for a room already known to be
-/// theirs. A room that turns out to be theirs once the rooms load is handled
-/// at answer time (`route`'s `ours`) and by the pane's redirect effect.
+/// theirs. The ANSWER is not routed until the rooms have loaded (`deliver`
+/// holds it, `release_held` routes it), so a room that turns out to be the
+/// user's own is recognised by `route`'s `ours` and opens as theirs through
+/// the pane's redirect effect, never as a visitor's view.
 pub fn fetch_action(
     connected: bool,
     just_connected: bool,
@@ -248,15 +250,77 @@ pub fn fetch_action(
     }
 }
 
-/// The line shown while the pane is `Loading` but no GET can be sent yet
-/// because the socket is not connected. `None` once connected, so the pane's
-/// usual text applies. Pure, so it is unit-tested.
-pub fn waiting_hint(connected: bool) -> Option<&'static str> {
-    if connected {
-        None
-    } else {
+/// The line shown while the pane is `Loading` and nothing can be shown yet:
+/// the socket is not connected, or an answer has arrived and is held until the
+/// user's own rooms have loaded. `None` otherwise, so the pane's usual text
+/// applies. Pure, so it is unit-tested.
+pub fn waiting_hint(connected: bool, answer_held: bool) -> Option<&'static str> {
+    if !connected {
         Some("Connecting to Freenet\u{2026}")
+    } else if answer_held {
+        Some("Loading your rooms\u{2026}")
+    } else {
+        None
     }
+}
+
+/// An answer for the viewed contract that arrived before the user's rooms had
+/// loaded, kept so `route`'s `ours` check can run once they have.
+enum Held {
+    State(Vec<u8>),
+    NotFound,
+}
+
+static HELD: Mutex<Option<(ContractInstanceId, Held)>> = Mutex::new(None);
+
+/// Whether an answer is being held, for the pane's hint.
+pub static ANSWER_HELD: GlobalSignal<bool> = Global::new(|| false);
+
+/// Whether the user's rooms have loaded. A contended signal counts as loaded:
+/// `is_ours` then treats the room as theirs, which is the safe error.
+fn rooms_ready() -> bool {
+    crate::components::viewed_room::rooms_loaded()
+}
+
+/// Whether an answer must wait for the rooms: it is the viewer's (asked for,
+/// same contract), carries the room's state or absence, and the viewer does not
+/// show the room yet.
+fn should_hold(
+    m: Option<&Mirror>,
+    id: &ContractInstanceId,
+    rooms_ready: bool,
+    answer: &Answer,
+) -> bool {
+    !rooms_ready
+        && !matches!(answer, Answer::Delta)
+        && m.is_some_and(|m| {
+            &m.id == id && m.requested && !matches!(m.status, ViewedRoomStatus::Public(_))
+        })
+}
+
+fn set_answer_held(held: bool) {
+    crate::util::defer(move || {
+        if ANSWER_HELD.try_read().map(|v| *v) != Ok(held) {
+            *ANSWER_HELD.write() = held;
+        }
+    });
+}
+
+/// Route the answer held while the user's rooms loaded, now that they have. A
+/// room that is the user's own is then not claimed, and the pane's redirect
+/// effect opens it as theirs. Called from the pane's effect.
+pub fn release_held() {
+    if !rooms_ready() {
+        return;
+    }
+    let taken = HELD.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let Some((id, held)) = taken else { return };
+    set_answer_held(false);
+    let answer = match &held {
+        Held::State(bytes) => Answer::State(bytes),
+        Held::NotFound => Answer::NotFound,
+    };
+    deliver_now(&id, answer);
 }
 
 /// A network answer about the viewed contract.
@@ -477,6 +541,8 @@ pub fn close() {
     crate::util::defer(|| {
         crate::public_join::reset();
         set_mirror(None);
+        *HELD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        set_answer_held(false);
         let showing = VIEWED_ROOM.try_read().ok().is_some_and(|v| v.is_some());
         if showing {
             *VIEWED_ROOM.write() = None;
@@ -569,30 +635,93 @@ pub fn lookup_log(event: &str) {
 /// waiting for an answer. Pure, so it is unit-tested.
 #[cfg_attr(feature = "no-sync", allow(dead_code))]
 fn lookup_still_waiting(m: Option<&Mirror>, owner_vk: &VerifyingKey, current: bool) -> bool {
-    current && m.is_some_and(|m| &m.owner_vk == owner_vk && m.status == ViewedRoomStatus::Loading)
+    current
+        && m.is_some_and(|m| {
+            &m.owner_vk == owner_vk && m.requested && m.status == ViewedRoomStatus::Loading
+        })
 }
 
-/// Whether an error from the node is the failure of the viewer's own GET: the
-/// viewer asked, is still waiting, and the error names its contract.
-pub fn error_is_for_viewer(m: Option<&Mirror>, error_text: &str) -> bool {
-    m.is_some_and(|m| {
-        m.requested
-            && m.status == ViewedRoomStatus::Loading
-            && error_text.contains(&m.id.to_string())
-    })
+/// What to do with an error from the node.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ErrorAction {
+    /// Not about the viewer's lookup.
+    Ignore,
+    /// A first failure: send the one retry now instead of waiting for it.
+    Retry,
+    /// The retry has been sent already: offer Try again.
+    GiveUp,
 }
 
-/// Route an error the node sent. A refused GET for the viewed room shows
-/// "No answer yet" with Try again now, not after the timeout.
+/// Classify an error: it counts when the viewer asked, is still waiting, the
+/// contract is not the user's own, and the error names the contract. Pure, so
+/// it is unit-tested.
+pub fn error_action(
+    m: Option<&Mirror>,
+    error_text: &str,
+    ours: bool,
+    retried: bool,
+) -> ErrorAction {
+    let for_viewer = !ours
+        && m.is_some_and(|m| {
+            m.requested
+                && m.status == ViewedRoomStatus::Loading
+                && error_text.contains(&m.id.to_string())
+        });
+    match (for_viewer, retried) {
+        (false, _) => ErrorAction::Ignore,
+        (true, false) => ErrorAction::Retry,
+        (true, true) => ErrorAction::GiveUp,
+    }
+}
+
+/// Set once the lookup's one retry has been sent, by the timer or by an error.
+static LOOKUP_RETRIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Route an error the node sent. A first failure sends the retry at once; a
+/// failure after it shows "No answer yet" with Try again now, not after the
+/// timeout. A later successful answer is still accepted.
 pub fn deliver_error(error_text: &str) {
+    use std::sync::atomic::Ordering;
     let m = mirror();
-    if error_is_for_viewer(m.as_ref(), error_text) {
-        if let Some(m) = m {
+    let ours = m.as_ref().is_some_and(|m| is_ours(&m.owner_vk, &m.id));
+    let retried = LOOKUP_RETRIED.load(Ordering::SeqCst);
+    let Some(m) = m.as_ref() else { return };
+    match error_action(Some(m), error_text, ours, retried) {
+        ErrorAction::Ignore => {}
+        ErrorAction::Retry => {
+            if !LOOKUP_RETRIED.swap(true, Ordering::SeqCst) {
+                lookup_log("error (transient), retry sent");
+                send_lookup_get(m.owner_vk);
+            }
+        }
+        ErrorAction::GiveUp => {
             lookup_log("answer/error (error)");
             set_status(m.owner_vk, ViewedRoomStatus::TimedOut);
         }
     }
 }
+
+#[cfg(not(feature = "no-sync"))]
+fn send_lookup_get(owner_vk: VerifyingKey) {
+    use crate::components::app::WEB_API;
+    use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
+    crate::util::safe_spawn_local(async move {
+        let request = ClientRequest::ContractOp(ContractRequest::Get {
+            key: *crate::util::owner_vk_to_contract_key(&owner_vk).id(),
+            return_contract_code: false,
+            subscribe: false,
+            blocking_subscribe: false,
+        });
+        if let Some(web_api) = WEB_API.write().as_mut() {
+            if let Err(e) = web_api.send(request).await {
+                dioxus::logger::tracing::warn!("public room: fetch failed to send: {e}");
+            }
+        }
+    });
+}
+
+#[cfg(feature = "no-sync")]
+fn send_lookup_get(_owner_vk: VerifyingKey) {}
 
 /// Ask the network for the room (not subscribed: it may be private), retry
 /// once if nothing has answered after `LOOKUP_RETRY_AFTER`, and start the
@@ -600,31 +729,19 @@ pub fn deliver_error(error_text: &str) {
 /// GET being sent, as it always has.
 #[cfg(not(feature = "no-sync"))]
 pub fn request_fetch(owner_vk: VerifyingKey) {
-    use crate::components::app::WEB_API;
-    use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
     use std::sync::atomic::Ordering;
     with_mirror(|m| m.requested = true);
     let generation = LOOKUP_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    LOOKUP_RETRIED.store(false, Ordering::SeqCst);
     let current = move || LOOKUP_GEN.load(Ordering::SeqCst) == generation;
     crate::util::safe_spawn_local(async move {
-        let send_get = || async move {
-            let request = ClientRequest::ContractOp(ContractRequest::Get {
-                key: *crate::util::owner_vk_to_contract_key(&owner_vk).id(),
-                return_contract_code: false,
-                subscribe: false,
-                blocking_subscribe: false,
-            });
-            if let Some(web_api) = WEB_API.write().as_mut() {
-                if let Err(e) = web_api.send(request).await {
-                    dioxus::logger::tracing::warn!("public room: fetch failed to send: {e}");
-                }
-            }
-        };
-        send_get().await;
+        send_lookup_get(owner_vk);
         lookup_log("GET sent");
         crate::util::sleep(LOOKUP_RETRY_AFTER).await;
-        if lookup_still_waiting(mirror().as_ref(), &owner_vk, current()) {
-            send_get().await;
+        if lookup_still_waiting(mirror().as_ref(), &owner_vk, current())
+            && !LOOKUP_RETRIED.swap(true, Ordering::SeqCst)
+        {
+            send_lookup_get(owner_vk);
             lookup_log("retry sent");
         }
         crate::util::sleep(FETCH_TIMEOUT - LOOKUP_RETRY_AFTER).await;
@@ -740,6 +857,21 @@ fn deliver_with(
 }
 
 fn deliver(id: &ContractInstanceId, answer: Answer) -> bool {
+    let m = mirror();
+    if should_hold(m.as_ref(), id, rooms_ready(), &answer) {
+        let held = match &answer {
+            Answer::State(bytes) => Held::State(bytes.to_vec()),
+            _ => Held::NotFound,
+        };
+        *HELD.lock().unwrap_or_else(|e| e.into_inner()) = Some((*id, held));
+        set_answer_held(true);
+        lookup_log("answer held until your rooms load");
+        return true;
+    }
+    deliver_now(id, answer)
+}
+
+fn deliver_now(id: &ContractInstanceId, answer: Answer) -> bool {
     let m = mirror();
     let ours = m.as_ref().is_some_and(|m| is_ours(&m.owner_vk, id));
     deliver_with(m.as_ref(), ours, id, answer, &mut Live)
@@ -1019,9 +1151,79 @@ mod tests {
     }
 
     #[test]
-    fn waiting_hint_only_while_not_connected() {
-        assert_eq!(waiting_hint(false), Some("Connecting to Freenet\u{2026}"));
-        assert_eq!(waiting_hint(true), None);
+    fn waiting_hint_names_what_is_held_back() {
+        assert_eq!(
+            waiting_hint(false, false),
+            Some("Connecting to Freenet\u{2026}")
+        );
+        assert_eq!(
+            waiting_hint(false, true),
+            Some("Connecting to Freenet\u{2026}")
+        );
+        assert_eq!(waiting_hint(true, true), Some("Loading your rooms\u{2026}"));
+        assert_eq!(waiting_hint(true, false), None);
+    }
+
+    #[test]
+    fn an_answer_before_the_rooms_load_is_held_not_claimed_as_a_visitors() {
+        let vk = key();
+        let loading = mirror_for(&vk, true, ViewedRoomStatus::Loading);
+        let id = loading.id;
+        let bytes = state_bytes(PrivacyMode::Public);
+        // Rooms not loaded: held, so `route` never sees a room that may be theirs.
+        assert!(should_hold(
+            Some(&loading),
+            &id,
+            false,
+            &Answer::State(&bytes)
+        ));
+        assert!(should_hold(Some(&loading), &id, false, &Answer::NotFound));
+        // Loaded: routed.
+        assert!(!should_hold(
+            Some(&loading),
+            &id,
+            true,
+            &Answer::State(&bytes)
+        ));
+        // Not the viewer's, not asked, a delta, or a view already shown.
+        let other = SigningKey::from_bytes(&[9u8; 32]).verifying_key();
+        let other_id = *owner_vk_to_contract_key(&other).id();
+        assert!(!should_hold(
+            Some(&loading),
+            &other_id,
+            false,
+            &Answer::NotFound
+        ));
+        let unasked = mirror_for(&vk, false, ViewedRoomStatus::Loading);
+        assert!(!should_hold(Some(&unasked), &id, false, &Answer::NotFound));
+        assert!(!should_hold(Some(&loading), &id, false, &Answer::Delta));
+        let shown = mirror_for(
+            &vk,
+            true,
+            ViewedRoomStatus::Public(Box::new(state_with(PrivacyMode::Public))),
+        );
+        assert!(!should_hold(Some(&shown), &id, false, &Answer::NotFound));
+        // Released after the rooms loaded and the room is theirs: not claimed,
+        // nothing written, so the pane's redirect opens the member room.
+        let mut fx = Recorder::default();
+        assert!(!deliver_with(
+            Some(&loading),
+            true,
+            &id,
+            Answer::State(&bytes),
+            &mut fx
+        ));
+        assert!(fx.statuses.is_empty() && fx.subscribed == 0);
+        // Released and not theirs: shown as a visitor's view and subscribed.
+        let mut fx = Recorder::default();
+        assert!(deliver_with(
+            Some(&loading),
+            false,
+            &id,
+            Answer::State(&bytes),
+            &mut fx
+        ));
+        assert_eq!(fx.subscribed, 1);
     }
 
     #[test]
@@ -1056,24 +1258,88 @@ mod tests {
     }
 
     #[test]
-    fn an_error_naming_the_viewed_contract_ends_the_wait() {
+    fn an_error_retries_once_then_ends_the_wait() {
         let vk = key();
         let loading = mirror_for(&vk, true, ViewedRoomStatus::Loading);
         let text = format!("request failed for contract {}: refused", loading.id);
-        assert!(error_is_for_viewer(Some(&loading), &text));
-        assert!(!error_is_for_viewer(Some(&loading), "some other failure"));
-        assert!(!error_is_for_viewer(None, &text));
+        assert_eq!(
+            error_action(Some(&loading), &text, false, false),
+            ErrorAction::Retry
+        );
+        assert_eq!(
+            error_action(Some(&loading), &text, false, true),
+            ErrorAction::GiveUp
+        );
+        assert_eq!(
+            error_action(Some(&loading), "other", false, false),
+            ErrorAction::Ignore
+        );
+        assert_eq!(error_action(None, &text, false, false), ErrorAction::Ignore);
+        assert_eq!(
+            error_action(Some(&loading), &text, true, false),
+            ErrorAction::Ignore,
+            "the user's own room"
+        );
         let unasked = mirror_for(&vk, false, ViewedRoomStatus::Loading);
-        assert!(!error_is_for_viewer(Some(&unasked), &text), "never asked");
+        assert_eq!(
+            error_action(Some(&unasked), &text, false, false),
+            ErrorAction::Ignore
+        );
         let shown = mirror_for(
             &vk,
             true,
             ViewedRoomStatus::Public(Box::new(state_with(PrivacyMode::Public))),
         );
-        assert!(
-            !error_is_for_viewer(Some(&shown), &text),
-            "a good view stays"
+        assert_eq!(
+            error_action(Some(&shown), &text, false, false),
+            ErrorAction::Ignore
         );
+        // A later good answer is still accepted after the wait ended.
+        let timed_out = mirror_for(&vk, true, ViewedRoomStatus::TimedOut);
+        let bytes = state_bytes(PrivacyMode::Public);
+        assert!(
+            route(
+                Some(&timed_out),
+                &timed_out.id,
+                false,
+                Answer::State(&bytes)
+            )
+            .claimed
+        );
+    }
+
+    #[test]
+    fn a_reopened_unrequested_lookup_is_not_driven_by_an_old_timer() {
+        let vk = key();
+        let reopened = mirror_for(&vk, false, ViewedRoomStatus::Loading);
+        assert!(!lookup_still_waiting(Some(&reopened), &vk, true));
+    }
+
+    #[test]
+    fn the_lookup_wiring_is_pinned_by_source() {
+        let sync = handler_source("components/app/freenet_api/freenet_synchronizer.rs");
+        let err_at = sync
+            .find("Received error in API response")
+            .expect("error arm");
+        let hook_at = sync
+            .find("public_room::deliver_error(")
+            .expect("deliver_error hook");
+        assert!(hook_at > err_at, "deliver_error runs in the error arm");
+        let room = handler_source("public_room.rs");
+        let fetch = &room[room
+            .find("pub fn request_fetch(owner_vk: VerifyingKey) {\n    use std")
+            .expect("request_fetch")..];
+        let fetch = &fetch[..fetch.find("\n}\n").expect("end")];
+        assert!(fetch.contains("LOOKUP_GEN") && fetch.contains("lookup_still_waiting("));
+        assert_eq!(
+            fetch.matches("lookup_still_waiting(").count(),
+            2,
+            "retry and timeout both check"
+        );
+        let deliver = &room[room.find("fn deliver(id").expect("deliver")..];
+        assert!(deliver[..deliver.find("fn deliver_now").unwrap()].contains("should_hold("));
+        let pane = handler_source("components/viewed_room.rs");
+        assert!(pane.contains("waiting_hint(") && pane.contains("release_held()"));
     }
 
     #[test]

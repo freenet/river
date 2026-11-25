@@ -796,22 +796,27 @@ impl RoomData {
             .filter(|name| !name.is_empty())
     }
 
+    /// Whether this room still holds the stand-in state (a default
+    /// configuration, whose owner id is not the owner's). A field comparison,
+    /// not `is_awaiting_initial_sync`'s serialize-and-verify, because the name
+    /// is read in render paths.
+    pub fn has_placeholder_state(&self) -> bool {
+        self.room_state.configuration.configuration.owner_member_id
+            != river_core::room_state::member::MemberId::from(self.owner_vk)
+    }
+
     /// The room name; "Loading room…" until the room's state has arrived (its
     /// stand-in state would otherwise show the `Default` name, "Default Room
     /// Name"); or the encrypted placeholder until its secret is available.
     pub fn display_name(&self) -> String {
-        select_display_name(
-            self.is_awaiting_initial_sync(),
-            self.decrypted_name(),
-            || {
-                self.room_state
-                    .configuration
-                    .configuration
-                    .display
-                    .name
-                    .to_string_lossy()
-            },
-        )
+        select_display_name(self.has_placeholder_state(), self.decrypted_name(), || {
+            self.room_state
+                .configuration
+                .configuration
+                .display
+                .name
+                .to_string_lossy()
+        })
     }
 
     /// Get the current (latest) secret for encryption/decryption
