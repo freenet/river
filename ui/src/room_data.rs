@@ -562,6 +562,18 @@ pub(crate) fn merge_converging(
     Ok(())
 }
 
+/// What a room is called while it is shown. Pure, so it is unit-tested.
+pub(crate) fn select_display_name(
+    awaiting_state: bool,
+    decrypted: Option<String>,
+    raw: impl FnOnce() -> String,
+) -> String {
+    if awaiting_state {
+        return "Loading room\u{2026}".to_string();
+    }
+    decrypted.unwrap_or_else(raw)
+}
+
 impl RoomData {
     /// Apply this member's purge `envelope` (signed on this device, purging
     /// `tokens`) to the room, and record the tokens as this device's own, so
@@ -784,16 +796,22 @@ impl RoomData {
             .filter(|name| !name.is_empty())
     }
 
-    /// The room name, or the encrypted placeholder until its secret is available.
+    /// The room name; "Loading room…" until the room's state has arrived (its
+    /// stand-in state would otherwise show the `Default` name, "Default Room
+    /// Name"); or the encrypted placeholder until its secret is available.
     pub fn display_name(&self) -> String {
-        self.decrypted_name().unwrap_or_else(|| {
-            self.room_state
-                .configuration
-                .configuration
-                .display
-                .name
-                .to_string_lossy()
-        })
+        select_display_name(
+            self.is_awaiting_initial_sync(),
+            self.decrypted_name(),
+            || {
+                self.room_state
+                    .configuration
+                    .configuration
+                    .display
+                    .name
+                    .to_string_lossy()
+            },
+        )
     }
 
     /// Get the current (latest) secret for encryption/decryption
@@ -6629,7 +6647,18 @@ mod tests {
     fn display_name_covers_public_private_and_missing_secret() {
         let mut rng = rand::thread_rng();
         let public_room = test_minimal_room_data(SigningKey::generate(&mut rng).verifying_key());
-        assert_eq!(public_room.display_name(), "Default Room Name");
+        // A stand-in state (no state from the network yet) is not named
+        // "Default Room Name".
+        assert_eq!(public_room.display_name(), "Loading room\u{2026}");
+        assert_eq!(
+            select_display_name(true, Some("Real".into()), || "raw".into()),
+            "Loading room\u{2026}"
+        );
+        assert_eq!(
+            select_display_name(false, Some("Real".into()), || "raw".into()),
+            "Real"
+        );
+        assert_eq!(select_display_name(false, None, || "raw".into()), "raw");
 
         let owner_sk = SigningKey::generate(&mut rng);
         let member_sk = SigningKey::generate(&mut rng);
@@ -6638,8 +6667,13 @@ mod tests {
             .get_secret()
             .map(|(s, v)| (*s, v))
             .expect("fixture seeds a secret");
-        room.room_state.configuration.configuration.display.name =
-            seal_bytes(b"Secret Room", &secret, version);
+        let mut config = room.room_state.configuration.configuration.clone();
+        config.display.name = seal_bytes(b"Secret Room", &secret, version);
+        // Signed by the owner, as real state from the network is.
+        room.room_state.configuration =
+            river_core::room_state::configuration::AuthorizedConfigurationV1::new(
+                config, &owner_sk,
+            );
         assert_eq!(room.display_name(), "Secret Room");
 
         room.secrets.clear();

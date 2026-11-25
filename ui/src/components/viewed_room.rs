@@ -1,14 +1,13 @@
 //! The read-only pane for a room opened by `?room=` link (freenet/river#513).
 //! State and rules: [`crate::public_room`].
 
-use crate::components::app::chat_delegate::{RoomsLoadState, ROOMS_LOAD_STATE};
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
 use crate::components::app::{CURRENT_ROOM, ROOMS, SYNC_STATUS};
 use crate::components::room_list::edit_room_modal::CopyButton;
 use crate::public_join::{self, offers_join, JoinPhase, JOIN};
 use crate::public_room::{
     close, composer_note, fetch_action, public_room_link, request_fetch, request_subscribe, retry,
-    FetchAction, ViewedRoom, ViewedRoomStatus, VIEWED_ROOM,
+    waiting_hint, FetchAction, ViewedRoom, ViewedRoomStatus, VIEWED_ROOM,
 };
 use crate::room_data::CurrentRoom;
 use crate::util::display_name::display_nickname;
@@ -33,14 +32,10 @@ pub fn ViewedRoomPane() -> Element {
                 return;
             }
         };
-        let rooms_loaded = match ROOMS_LOAD_STATE.try_read() {
-            Ok(s) => *s == RoomsLoadState::Loaded,
-            Err(_) => {
-                crate::util::signal_guard::schedule_nudge();
-                return;
-            }
-        };
         let just_connected = connected && !last_connected.replace(connected);
+        if just_connected {
+            crate::public_room::lookup_log("ws open");
+        }
         if !connected {
             last_connected.set(false);
         }
@@ -63,14 +58,7 @@ pub fn ViewedRoomPane() -> Element {
                 true
             }
         };
-        match fetch_action(
-            connected,
-            just_connected,
-            asked.get(),
-            rooms_loaded,
-            ours,
-            status,
-        ) {
+        match fetch_action(connected, just_connected, asked.get(), ours, status) {
             Some(FetchAction::Get) => {
                 asked.set(true);
                 request_fetch(owner_vk);
@@ -146,11 +134,23 @@ fn close_button() -> Element {
 #[component]
 fn Notice(status: ViewedRoomStatus, owner_vk: Option<ed25519_dalek::VerifyingKey>) -> Element {
     let (testid, title, body) = match &status {
-        ViewedRoomStatus::Loading => (
-            "viewed-room-loading",
-            "Looking for this room".to_string(),
-            "Asking the network for the room. This can take a few seconds.".to_string(),
-        ),
+        ViewedRoomStatus::Loading => {
+            // Before the GET is sent the pane is waiting on the connection.
+            // An unreadable signal falls back to the usual text.
+            let connected = SYNC_STATUS
+                .try_read()
+                .map(|s| matches!(&*s, SynchronizerStatus::Connected));
+            let hint = match connected {
+                Ok(c) => waiting_hint(c),
+                Err(_) => None,
+            };
+            (
+                "viewed-room-loading",
+                "Looking for this room".to_string(),
+                hint.unwrap_or("Asking the network for the room. This can take a few seconds.")
+                    .to_string(),
+            )
+        }
         ViewedRoomStatus::NotFound => (
             "viewed-room-not-found",
             "Room not found".to_string(),
