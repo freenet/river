@@ -655,6 +655,31 @@ pub(crate) fn fresh_rekey_merge(
 /// on the node and the node's own upstream one. The reply is a `GetResponse`
 /// (completed in `handle_get_response`) or, when no peer has the contract, a
 /// `NotFound` (which re-seeds with [`seed_put_request`]).
+/// Run `ProcessRooms` once `INVITATION_TIMEOUT_MS` has passed since an
+/// invitation's GET went out, so the stuck-invite reset in `process_rooms`
+/// actually gets evaluated. That reset is only checked when something runs
+/// `process_rooms`, and on a fresh profile with one pending invite nothing
+/// else does: a GET that never answers left the invite `Subscribing` for the
+/// rest of the session. One check per GET sent, so it is bounded.
+fn schedule_invite_timeout_check() {
+    crate::util::safe_spawn_local(async move {
+        crate::util::sleep(std::time::Duration::from_millis(
+            INVITATION_TIMEOUT_MS + 1000,
+        ))
+        .await;
+        crate::util::defer(|| {
+            let tx = crate::components::app::SYNCHRONIZER
+                .read()
+                .get_message_sender();
+            if let Err(e) =
+                tx.unbounded_send(super::freenet_synchronizer::SynchronizerMessage::ProcessRooms)
+            {
+                error!("Failed to schedule invitation timeout check: {}", e);
+            }
+        });
+    });
+}
+
 pub(crate) fn subscribe_get_request(owner_vk: &VerifyingKey) -> ContractRequest<'static> {
     ContractRequest::Get {
         key: *owner_vk_to_contract_key(owner_vk).id(),
@@ -793,6 +818,7 @@ impl RoomSynchronizer {
                     match web_api.send(client_request).await {
                         Ok(_) => {
                             info!("Sent GetRequest for room {:?}", MemberId::from(owner_vk));
+                            schedule_invite_timeout_check();
                         }
                         Err(e) => {
                             error!(
@@ -2565,6 +2591,33 @@ mod tests {
         assert!(
             put > route + get_arm.len(),
             "the seed PUT must be the fallthrough after the GET arm"
+        );
+    }
+
+    #[test]
+    fn an_invitation_get_arms_its_own_timeout_check() {
+        // Fresh-profile invite stall: the stuck-invite reset only runs inside
+        // `process_rooms`, so sending the invite's GET must schedule the
+        // `ProcessRooms` that evaluates it.
+        let body = process_rooms_source();
+        assert!(
+            body.contains(
+                "Ok(_)=>{info!(\"SentGetRequestforroom{:?}\",MemberId::from(owner_vk));schedule_invite_timeout_check();}"
+            ),
+            "a sent invitation GET must arm the invitation timeout check"
+        );
+        let src: String = crate::util::strip_comments(include_str!("room_synchronizer.rs"))
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let helper = &src[src
+            .find("fnschedule_invite_timeout_check(){")
+            .expect("helper exists")..];
+        let helper = &helper[..helper.find("pub(crate)fnsubscribe_get_request(").unwrap()];
+        assert!(
+            helper.contains("from_millis(INVITATION_TIMEOUT_MS+1000")
+                && helper.contains("SynchronizerMessage::ProcessRooms"),
+            "the check runs ProcessRooms after INVITATION_TIMEOUT_MS"
         );
     }
 
