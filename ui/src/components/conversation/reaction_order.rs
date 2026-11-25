@@ -7,10 +7,10 @@ use crate::components::app::notifications::extract_action_content;
 use river_core::room_state::content::{ACTION_TYPE_REACTION, ACTION_TYPE_REMOVE_REACTION};
 use river_core::room_state::member::MemberId;
 use river_core::room_state::message::{MessageId, MessagesV1};
+use river_core::SignedTime;
 use std::collections::HashMap;
-use std::time::SystemTime;
 
-type EmojiRanks = HashMap<String, SystemTime>;
+type EmojiRanks = HashMap<String, SignedTime>;
 type ReactionRanks = HashMap<MessageId, EmojiRanks>;
 
 /// Earliest still-standing add for each emoji. Replay only when order can
@@ -51,7 +51,7 @@ pub(super) fn reaction_ranks_for(
     if targets.is_empty() {
         return HashMap::new();
     }
-    let mut standing: HashMap<(MessageId, String, MemberId), SystemTime> = HashMap::new();
+    let mut standing: HashMap<(MessageId, String, MemberId), SignedTime> = HashMap::new();
     for message in &messages.messages {
         let Some(action) = extract_action_content(&message.message.content, secrets) else {
             continue;
@@ -67,7 +67,7 @@ pub(super) fn reaction_ranks_for(
             // A duplicate does not restart an interval; another emoji by the
             // same member does not terminate this one. The contract allows it.
             ACTION_TYPE_REACTION => {
-                standing.entry(key).or_insert(message.message.time.into());
+                standing.entry(key).or_insert(message.message.time);
             }
             ACTION_TYPE_REMOVE_REACTION => {
                 standing.remove(&key);
@@ -349,7 +349,7 @@ mod tests {
         let target = text();
         let id = target.id();
         let secrets = HashMap::new();
-        let at = |second| UNIX_EPOCH + Duration::from_secs(second);
+        let at = |second| SignedTime::new(second, 0).unwrap();
         let first = add(2, 5, &id, "z");
         let absent = MessageId(freenet_scaffold::util::FastHash(88));
         let malformed = ActionContentV1 {

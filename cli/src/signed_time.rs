@@ -1,11 +1,10 @@
 //! Timestamps that get signed.
 //!
-//! River signs the CBOR of structs holding a `SystemTime` (`MessageV1.time`, `UserBan.banned_at`,
-//! `SecretVersionRecordV1.created_at`). A verifier decodes the struct and serialises it again to
-//! check the signature. On Windows a `SystemTime` has 100 ns resolution, so a timestamp whose
-//! nanosecond field is not a multiple of 100 changes when it is decoded there, the bytes differ and
-//! the signature fails (freenet/river#971). Every time this crate signs is therefore a whole
-//! millisecond, the precision the web UI stamps and one every platform keeps exactly.
+//! River signs the CBOR of structs holding a `SignedTime` (`MessageV1.time`, `UserBan.banned_at`,
+//! `SecretVersionRecordV1.created_at`). `SignedTime` keeps the exact `(secs, nanos)` pair, so a
+//! verifier's decode and re-encode returns the signed bytes on every platform, Windows included
+//! (freenet/river#971, #1018). The whole-millisecond rounding here is therefore no longer needed
+//! for signatures to verify; it keeps stamps compatible with the web UI's millisecond precision.
 //!
 //! Never apply this to a timestamp that is already signed: it would change the signed bytes.
 
@@ -30,6 +29,39 @@ pub fn now() -> SystemTime {
     whole_millis(SystemTime::now())
 }
 
+/// `t` as a `chrono` time, for display. A time past chrono's range (a peer can sign any
+/// `u64` of seconds) becomes the latest time chrono holds: `DateTime::from(SystemTime)`
+/// panics there.
+pub fn utc_datetime(t: river_core::SignedTime) -> chrono::DateTime<chrono::Utc> {
+    let secs = i64::try_from(t.secs()).unwrap_or(i64::MAX);
+    chrono::DateTime::from_timestamp(secs, t.nanos())
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+}
+
+#[cfg(test)]
+mod utc_datetime_tests {
+    use super::utc_datetime;
+    use river_core::SignedTime;
+
+    #[test]
+    fn out_of_range_times_clamp_instead_of_panicking() {
+        for t in [
+            SignedTime::MAX,
+            SignedTime::new(1 << 63, 0).unwrap(),
+            SignedTime::new(i64::MAX as u64, 5).unwrap(),
+        ] {
+            assert_eq!(utc_datetime(t), chrono::DateTime::<chrono::Utc>::MAX_UTC);
+        }
+        let t = SignedTime::new(1_700_000_000, 123_456_789).unwrap();
+        assert_eq!(utc_datetime(t).timestamp(), 1_700_000_000);
+        assert_eq!(utc_datetime(t).timestamp_subsec_nanos(), 123_456_789);
+        assert_eq!(utc_datetime(SignedTime::UNIX_EPOCH).timestamp(), 0);
+        // In chrono's range: exact.
+        let far = SignedTime::new(u32::MAX as u64 * 1000, 0).unwrap();
+        assert_eq!(utc_datetime(far).timestamp(), u32::MAX as i64 * 1000);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -37,12 +69,6 @@ mod tests {
     use river_core::room_state::ban::{AuthorizedUserBan, UserBan};
     use river_core::room_state::member::MemberId;
     use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
-
-    /// A decode on Windows: the nanosecond field keeps only whole 100 ns units.
-    fn windows_decode(t: SystemTime) -> SystemTime {
-        let d = t.duration_since(UNIX_EPOCH).unwrap();
-        UNIX_EPOCH + Duration::new(d.as_secs(), d.subsec_nanos() / 100 * 100)
-    }
 
     /// Not a multiple of 100 ns, as `SystemTime::now()` is on Linux and macOS.
     fn awkward() -> SystemTime {
@@ -89,18 +115,14 @@ mod tests {
         out
     }
 
-    /// What a verifier does: decode the signed bytes into the real struct. On Windows that decode
-    /// floors the time to 100 ns by itself; elsewhere `windows_decode` does what it does, so the
-    /// check fails for the same reason on every platform.
+    /// What a verifier does: decode the signed bytes into the real struct.
     fn decoded_message(bytes: &[u8], sig: ed25519_dalek::Signature) -> AuthorizedMessageV1 {
-        let mut m: MessageV1 = ciborium::de::from_reader(bytes).unwrap();
-        m.time = windows_decode(m.time.into()).into();
+        let m: MessageV1 = ciborium::de::from_reader(bytes).unwrap();
         AuthorizedMessageV1::with_signature(m, sig)
     }
 
     fn decoded_ban(bytes: &[u8], by: MemberId, sig: ed25519_dalek::Signature) -> AuthorizedUserBan {
-        let mut b: UserBan = ciborium::de::from_reader(bytes).unwrap();
-        b.banned_at = windows_decode(b.banned_at.into()).into();
+        let b: UserBan = ciborium::de::from_reader(bytes).unwrap();
         AuthorizedUserBan::with_signature(b, by, sig)
     }
 
@@ -133,20 +155,20 @@ mod tests {
     }
 
     #[test]
-    fn a_time_with_nanoseconds_signed_by_another_platform_fails_after_decode() {
+    fn a_time_with_nanoseconds_signed_by_another_platform_verifies_after_decode() {
         // 123_456_789 ns is what `SystemTime::now()` gives on Linux, not a multiple of 100.
         let (sk, m, ms, b, bs) = signed_raw(123_456_789);
         let me = MemberId::from(sk.verifying_key());
-        assert!(decoded_message(&m, ms)
+        decoded_message(&m, ms)
             .validate(&sk.verifying_key())
-            .is_err());
-        assert!(decoded_ban(&b, me, bs)
+            .unwrap();
+        decoded_ban(&b, me, bs)
             .verify_signature(&sk.verifying_key())
-            .is_err());
+            .unwrap();
     }
 
     #[test]
-    fn a_whole_millisecond_signed_the_same_way_verifies_after_decode() {
+    fn a_whole_millisecond_verifies_after_decode() {
         let (sk, m, ms, b, bs) = signed_raw(123_000_000);
         let me = MemberId::from(sk.verifying_key());
         decoded_message(&m, ms)

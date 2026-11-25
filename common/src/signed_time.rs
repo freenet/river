@@ -34,15 +34,21 @@ pub struct SignedTime {
 impl SignedTime {
     pub const UNIX_EPOCH: SignedTime = SignedTime { secs: 0, nanos: 0 };
 
+    /// The latest time that can be held.
+    pub const MAX: SignedTime = SignedTime {
+        secs: u64::MAX,
+        nanos: NANOS_PER_SEC - 1,
+    };
+
     /// Builds the time, carrying nanoseconds of a second or more into the seconds.
     ///
-    /// Returns `None` where `SystemTime`'s deserializer returns an error: when the result
-    /// would not fit an `i64` of seconds.
+    /// Returns `None` only when the carry overflows `u64` seconds. Any `u64` of seconds is
+    /// accepted, as serde's `SystemTime` decoder accepts it on wasm32 (where `SystemTime` is a
+    /// plain `Duration`): the contract and UI run there, so a record the old build decoded
+    /// must still decode. Native platforms hold fewer seconds, which only matters at
+    /// [`SignedTime::to_system_time`].
     pub fn new(secs: u64, nanos: u32) -> Option<Self> {
         let secs = secs.checked_add(u64::from(nanos / NANOS_PER_SEC))?;
-        if secs > i64::MAX as u64 {
-            return None;
-        }
         Some(SignedTime {
             secs,
             nanos: nanos % NANOS_PER_SEC,
@@ -130,9 +136,112 @@ fn clamped_system_time(d: Duration, add: impl Fn(Duration) -> Option<SystemTime>
         }
     }
     let whole = Duration::from_secs(lo);
-    add(whole + Duration::from_nanos(u64::from(NANOS_PER_SEC - 1)))
+    whole
+        .checked_add(Duration::from_nanos(u64::from(NANOS_PER_SEC - 1)))
+        .and_then(&add)
         .or_else(|| add(whole))
         .unwrap_or(UNIX_EPOCH)
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    fn t(secs: u64, nanos: u32) -> SignedTime {
+        SignedTime::new(secs, nanos).unwrap()
+    }
+
+    #[test]
+    fn new_carries_nanos_and_rejects_only_overflow() {
+        assert_eq!(t(5, 2_500_000_000), t(7, 500_000_000));
+        assert_eq!(t(5, 1_000_000_000).nanos(), 0);
+        assert_eq!(t(5, 1_000_000_000).secs(), 6);
+        assert_eq!(t(u64::MAX, 999_999_999), SignedTime::MAX);
+        assert!(SignedTime::new(u64::MAX, 1_000_000_000).is_none());
+        assert!(SignedTime::new(u64::MAX - 1, 2_000_000_000).is_none());
+        assert_eq!(t(u64::MAX - 1, 1_999_999_999).secs(), u64::MAX);
+        // Past i64::MAX is accepted, as SystemTime accepts it on wasm32.
+        assert_eq!(t(1 << 63, 0).secs(), 1 << 63);
+    }
+
+    #[test]
+    fn checked_add_carries_and_overflows() {
+        assert_eq!(
+            t(1, 900_000_000).checked_add(Duration::new(2, 200_000_000)),
+            Some(t(4, 100_000_000))
+        );
+        assert_eq!(SignedTime::MAX.checked_add(Duration::new(0, 1)), None);
+        assert_eq!(t(u64::MAX, 0).checked_add(Duration::new(1, 0)), None);
+        assert_eq!(
+            t(u64::MAX - 1, 999_999_999).checked_add(Duration::new(0, 1)),
+            Some(t(u64::MAX, 0))
+        );
+    }
+
+    #[test]
+    fn checked_sub_borrows_and_underflows() {
+        assert_eq!(
+            t(4, 100_000_000).checked_sub(Duration::new(2, 200_000_000)),
+            Some(t(1, 900_000_000))
+        );
+        assert_eq!(
+            t(4, 300_000_000).checked_sub(Duration::new(2, 200_000_000)),
+            Some(t(2, 100_000_000))
+        );
+        assert_eq!(t(0, 5).checked_sub(Duration::new(0, 6)), None);
+        assert_eq!(t(1, 5).checked_sub(Duration::new(2, 0)), None);
+        assert_eq!(t(1, 5).checked_sub(Duration::new(1, 5)), Some(t(0, 0)));
+    }
+
+    #[test]
+    fn operators_saturate_instead_of_panicking() {
+        assert_eq!(SignedTime::MAX + Duration::from_secs(1), SignedTime::MAX);
+        assert_eq!(
+            SignedTime::UNIX_EPOCH - Duration::from_secs(1),
+            SignedTime::UNIX_EPOCH
+        );
+        let mut x = t(10, 0);
+        x += Duration::from_secs(1);
+        x -= Duration::from_secs(2);
+        assert_eq!(x, t(9, 0));
+    }
+
+    #[test]
+    fn duration_since_is_none_when_earlier_is_later() {
+        assert_eq!(
+            t(5, 0).duration_since(t(3, 500_000_000)),
+            Some(Duration::new(1, 500_000_000))
+        );
+        assert_eq!(t(3, 0).duration_since(t(3, 1)), None);
+    }
+
+    #[test]
+    fn whole_millis_truncates_and_is_idempotent() {
+        let x = t(1_700_000_000, 123_456_789).whole_millis();
+        assert_eq!(x, t(1_700_000_000, 123_000_000));
+        assert_eq!(x.whole_millis(), x);
+        assert_eq!(SignedTime::MAX.whole_millis(), t(u64::MAX, 999_000_000));
+        assert_eq!(SignedTime::now().nanos() % 1_000_000, 0);
+    }
+
+    #[test]
+    fn nothing_panics_at_the_extremes() {
+        for x in [
+            SignedTime::UNIX_EPOCH,
+            t(1 << 63, 0),
+            t(i64::MAX as u64 + 1, 1),
+            SignedTime::MAX,
+        ] {
+            let _ = format!("{x:?}");
+            let _ = SystemTime::from(x);
+            let _ = x.cmp(&SignedTime::MAX);
+            let _ = x + Duration::from_secs(1);
+            let _ = x - Duration::from_secs(1);
+            let _ = x.whole_millis();
+            let _ = x.since_epoch();
+            assert!(SignedTime::from(x.to_system_time()) <= x);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -176,14 +285,11 @@ impl Default for SignedTime {
 }
 
 /// A time before the epoch becomes the epoch: `SystemTime` cannot serialize one either, so no
-/// signable value is lost. A time past the `i64` seconds range saturates likewise.
+/// signable value is lost. A `SystemTime` always fits, so nothing else saturates.
 impl From<SystemTime> for SignedTime {
     fn from(t: SystemTime) -> Self {
         match t.duration_since(UNIX_EPOCH) {
-            Ok(d) => SignedTime::new(d.as_secs(), d.subsec_nanos()).unwrap_or(SignedTime {
-                secs: i64::MAX as u64,
-                nanos: NANOS_PER_SEC - 1,
-            }),
+            Ok(d) => SignedTime::new(d.as_secs(), d.subsec_nanos()).unwrap_or(SignedTime::MAX),
             Err(_) => SignedTime::UNIX_EPOCH,
         }
     }
@@ -195,18 +301,19 @@ impl From<SignedTime> for SystemTime {
     }
 }
 
+/// Saturates at [`SignedTime::MAX`] instead of panicking: times come from peers.
 impl Add<Duration> for SignedTime {
     type Output = SignedTime;
     fn add(self, d: Duration) -> SignedTime {
-        self.checked_add(d).expect("overflow adding to SignedTime")
+        self.checked_add(d).unwrap_or(SignedTime::MAX)
     }
 }
 
+/// Saturates at the epoch instead of panicking: times come from peers.
 impl Sub<Duration> for SignedTime {
     type Output = SignedTime;
     fn sub(self, d: Duration) -> SignedTime {
-        self.checked_sub(d)
-            .expect("overflow subtracting from SignedTime")
+        self.checked_sub(d).unwrap_or(SignedTime::UNIX_EPOCH)
     }
 }
 
@@ -271,12 +378,9 @@ impl<'de> Deserialize<'de> for SignedTime {
         const FIELDS: &[&str] = &["secs_since_epoch", "nanos_since_epoch"];
 
         fn build<E: de::Error>(secs: u64, nanos: u32) -> Result<SignedTime, E> {
-            // `SystemTime` rejects an overflowing carry, then a sum past its range.
-            if secs.checked_add(u64::from(nanos / NANOS_PER_SEC)).is_none() {
-                return Err(E::custom("overflow deserializing SystemTime epoch offset"));
-            }
+            // serde's `Duration` decoder rejects only an overflowing carry.
             SignedTime::new(secs, nanos)
-                .ok_or_else(|| E::custom("overflow deserializing SystemTime"))
+                .ok_or_else(|| E::custom("overflow deserializing SystemTime epoch offset"))
         }
 
         struct TimeVisitor;

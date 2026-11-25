@@ -1519,3 +1519,36 @@ let id = ar"\"; // n();
         );
     }
 }
+
+/// `t` as a `chrono` time, for display. A time past chrono's range (a peer can sign any
+/// `u64` of seconds) becomes the latest time chrono holds: `DateTime::from(SystemTime)`
+/// panics there.
+pub fn utc_datetime(t: river_core::SignedTime) -> chrono::DateTime<chrono::Utc> {
+    let secs = i64::try_from(t.secs()).unwrap_or(i64::MAX);
+    chrono::DateTime::from_timestamp(secs, t.nanos())
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+}
+
+#[cfg(test)]
+mod utc_datetime_tests {
+    use super::utc_datetime;
+    use river_core::SignedTime;
+
+    #[test]
+    fn out_of_range_times_clamp_instead_of_panicking() {
+        for t in [
+            SignedTime::MAX,
+            SignedTime::new(1 << 63, 0).unwrap(),
+            SignedTime::new(i64::MAX as u64, 5).unwrap(),
+        ] {
+            assert_eq!(utc_datetime(t), chrono::DateTime::<chrono::Utc>::MAX_UTC);
+        }
+        let t = SignedTime::new(1_700_000_000, 123_456_789).unwrap();
+        assert_eq!(utc_datetime(t).timestamp(), 1_700_000_000);
+        assert_eq!(utc_datetime(t).timestamp_subsec_nanos(), 123_456_789);
+        assert_eq!(utc_datetime(SignedTime::UNIX_EPOCH).timestamp(), 0);
+        // In chrono's range: exact.
+        let far = SignedTime::new(u32::MAX as u64 * 1000, 0).unwrap();
+        assert_eq!(utc_datetime(far).timestamp(), u32::MAX as i64 * 1000);
+    }
+}

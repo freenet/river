@@ -1966,7 +1966,7 @@ pub(crate) fn message_event_json(
         .canonical(msg.message.author)
         .map(|info| unseal_nickname_display(&info.member_info.preferred_nickname, secrets));
 
-    let datetime: DateTime<Utc> = msg.message.time.to_system_time().into();
+    let datetime: DateTime<Utc> = crate::signed_time::utc_datetime(msg.message.time);
 
     // Get display content (handles edits and non-text public content like join
     // events; `secrets` decrypts private-room bodies — only a body whose secret
@@ -2028,7 +2028,7 @@ pub(crate) fn reaction_event_json(
         .member_info
         .canonical(msg.message.author)
         .map(|info| unseal_nickname_display(&info.member_info.preferred_nickname, secrets));
-    let datetime: DateTime<Utc> = msg.message.time.to_system_time().into();
+    let datetime: DateTime<Utc> = crate::signed_time::utc_datetime(msg.message.time);
 
     let reactions_map: std::collections::HashMap<String, usize> = reactions
         .map(|r| r.iter().map(|(k, v)| (k.clone(), v.len())).collect())
@@ -2082,7 +2082,7 @@ pub(crate) fn deletion_event_json(
         .member_info
         .canonical(msg.message.author)
         .map(|info| unseal_nickname_display(&info.member_info.preferred_nickname, secrets));
-    let datetime: DateTime<Utc> = msg.message.time.to_system_time().into();
+    let datetime: DateTime<Utc> = crate::signed_time::utc_datetime(msg.message.time);
 
     json!({
         "type": "delete",
@@ -6111,7 +6111,7 @@ impl ApiClient {
                 let msg_id = msg.id();
                 let reactions = room_state.recent_messages.reactions(&msg_id);
                 let author_str = msg.message.author.to_string();
-                let datetime: DateTime<Utc> = msg.message.time.to_system_time().into();
+                let datetime: DateTime<Utc> = crate::signed_time::utc_datetime(msg.message.time);
                 let local_time: DateTime<Local> = datetime.into();
                 let display_name = room_state
                     .member_info
@@ -6184,7 +6184,7 @@ impl ApiClient {
         Ok(match format {
             OutputFormat::Human => {
                 let author_str = msg.message.author.to_string();
-                let datetime: DateTime<Utc> = msg.message.time.to_system_time().into();
+                let datetime: DateTime<Utc> = crate::signed_time::utc_datetime(msg.message.time);
                 let local_time: DateTime<Local> = datetime.into();
                 let display_name = room_state
                     .member_info
@@ -6279,7 +6279,7 @@ impl ApiClient {
                     })
                     .unwrap_or(author_short);
 
-                let datetime: DateTime<Utc> = msg.message.time.to_system_time().into();
+                let datetime: DateTime<Utc> = crate::signed_time::utc_datetime(msg.message.time);
                 let local_time: DateTime<Local> = datetime.into();
 
                 let edited_indicator = if edited { " (edited)" } else { "" };

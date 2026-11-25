@@ -729,7 +729,7 @@ fn group_messages(
     for message in messages_state.display_messages() {
         let author_id = message.message.author;
         let message_id = message.id();
-        let raw_time = DateTime::<Utc>::from(message.message.time.to_system_time());
+        let raw_time = crate::util::utc_datetime(message.message.time);
         let sent_ms = raw_time.timestamp_millis();
         // Clamp target: when we first saw it, else the pass-wide "now".
         let clamp_to = clock.clamp_target(&message_id);

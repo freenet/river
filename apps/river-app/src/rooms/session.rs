@@ -69,9 +69,7 @@
 //!   ([`super::rekey`]).
 //! - **What can't be shown.** A room whose update from the network could not be applied, a
 //!   stored room this computer cannot read, and a node with no chat delegate under the key
-//!   this build carries are all said on screen ([`Issues`]). A stored room can be unreadable
-//!   on Windows alone: a message time past what Windows' clock type holds (about the year
-//!   30828) fails to decode there.
+//!   this build carries are all said on screen ([`Issues`]).
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;

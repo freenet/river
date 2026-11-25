@@ -403,8 +403,6 @@ fn a_time_with_nanoseconds_off_the_100ns_grid_survives_a_decode() {
     assert_eq!(new.time.nanos(), 123_456_789);
     assert_ne!(new.time.nanos() % 100, 0);
     assert_eq!(cbor(&new), bytes);
-    // Converting to the platform time at the edge is the lossy step, and it is never signed.
-    assert!(windows_floor(new.time.to_system_time()) <= new.time.to_system_time());
 }
 
 #[test]
@@ -452,23 +450,106 @@ fn raw_timestamps_encode_exactly() {
 
 /// Display conversion must never panic, whatever the signed value, and must leave it alone.
 #[test]
-fn display_conversion_clamps_instead_of_panicking() {
+fn display_conversion_clamps_without_changing_the_signed_value() {
     for t in [
         SignedTime::new(i64::MAX as u64, 999_999_999).unwrap(),
+        SignedTime::new(1 << 63, 0).unwrap(),
+        SignedTime::MAX,
         SignedTime::new(u32::MAX as u64, 7).unwrap(),
         SignedTime::new(1_700_000_000, 123_456_789).unwrap(),
         SignedTime::UNIX_EPOCH,
     ] {
+        let before = cbor(&t);
         let st: SystemTime = t.into();
-        assert!(st >= UNIX_EPOCH);
-        // The signed value is untouched by the conversion.
-        assert_eq!(t, t.clone());
-        if let Some(exact) = UNIX_EPOCH.checked_add(t.since_epoch()) {
-            assert_eq!(st, exact);
-        } else {
-            // Out of platform range: clamped to the latest time the clock can hold.
-            assert!(UNIX_EPOCH.checked_add(t.since_epoch()).is_none());
-            assert!(st < UNIX_EPOCH + Duration::from_secs(i64::MAX as u64));
+        assert_eq!(cbor(&t), before);
+        match UNIX_EPOCH.checked_add(t.since_epoch()) {
+            Some(exact) => assert_eq!(st, exact),
+            // Out of platform range: clamped to a time the clock holds, never beyond the value.
+            None => assert!(st.duration_since(UNIX_EPOCH).unwrap() < t.since_epoch()),
         }
     }
+}
+
+#[derive(Serialize)]
+struct RawTime {
+    secs_since_epoch: u64,
+    nanos_since_epoch: u32,
+}
+
+/// What a wasm32 `SystemTime` (a plain `Duration`) accepted, so the old contract and UI held
+/// these in signed records. The new decoder must take them and write the same bytes back.
+#[test]
+fn times_past_i64_max_seconds_decode_and_reencode_byte_for_byte() {
+    for (secs, nanos) in [
+        (1u64 << 63, 0u32),
+        (u64::MAX, 999_999_999),
+        (u64::MAX - 1, 5),
+    ] {
+        let raw = RawTime {
+            secs_since_epoch: secs,
+            nanos_since_epoch: nanos,
+        };
+        let c = cbor(&raw);
+        let t: SignedTime = from_cbor(&c);
+        assert_eq!((t.secs(), t.nanos()), (secs, nanos));
+        assert_eq!(cbor(&t), c);
+        let j = json(&raw);
+        let t: SignedTime = serde_json::from_str(&j).unwrap();
+        assert_eq!(json(&t), j);
+        let b = bin(&raw);
+        let t: SignedTime = bincode::deserialize(&b).unwrap();
+        assert_eq!((t.secs(), t.nanos()), (secs, nanos));
+        assert_eq!(bin(&t), b);
+    }
+}
+
+/// Everything that decodes `SignedTime` from the formats River uses rejects exactly the carry
+/// overflow, in sequence (bincode) and map (CBOR, JSON) form.
+#[test]
+fn decode_rejection_is_only_the_carry_overflow_in_every_format() {
+    let bad = RawTime {
+        secs_since_epoch: u64::MAX,
+        nanos_since_epoch: 1_000_000_000,
+    };
+    assert!(ciborium::de::from_reader::<SignedTime, _>(cbor(&bad).as_slice()).is_err());
+    assert!(serde_json::from_str::<SignedTime>(&json(&bad)).is_err());
+    assert!(bincode::deserialize::<SignedTime>(&bin(&bad)).is_err());
+    // A short bincode sequence and an unknown CBOR field are rejected too.
+    assert!(bincode::deserialize::<SignedTime>(&bin(&5u64)).is_err());
+    #[derive(Serialize)]
+    struct Extra {
+        secs_since_epoch: u64,
+        nanos_since_epoch: u32,
+        extra: u8,
+    }
+    let extra = cbor(&Extra {
+        secs_since_epoch: 5,
+        nanos_since_epoch: 6,
+        extra: 1,
+    });
+    assert!(ciborium::de::from_reader::<SignedTime, _>(extra.as_slice()).is_err());
+    // A carrying value decodes to the canonical pair.
+    let carry = cbor(&RawTime {
+        secs_since_epoch: 5,
+        nanos_since_epoch: 1_500_000_000,
+    });
+    let t: SignedTime = from_cbor(&carry);
+    assert_eq!((t.secs(), t.nanos()), (6, 500_000_000));
+}
+
+/// Messages that differ by under 100 ns keep their order: a Windows `SystemTime` would tie them.
+#[test]
+fn times_under_100ns_apart_sort_distinctly() {
+    let mut times = [
+        SignedTime::new(1_700_000_000, 123_456_789).unwrap(),
+        SignedTime::new(1_700_000_000, 123_456_701).unwrap(),
+        SignedTime::new(1_700_000_000, 123_456_750).unwrap(),
+    ];
+    times.sort();
+    let nanos: Vec<u32> = times.iter().map(|t| t.nanos()).collect();
+    assert_eq!(nanos, vec![123_456_701, 123_456_750, 123_456_789]);
+    assert_eq!(
+        windows_floor(times[0].to_system_time()),
+        windows_floor(times[2].to_system_time())
+    );
 }
