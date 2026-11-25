@@ -423,35 +423,6 @@ pub(crate) fn handle_contract_notification(
         return Ok(vec![]);
     }
 
-    // Already distributed: if the current secret version already has a blob
-    // for exactly the current members (owner aside), a rotation was already
-    // published for this member set, whatever the local cache says. This
-    // bounds re-rotation when the cache cannot be written (see the end of
-    // this function). Version 0 never counts, so a new private room still
-    // gets its first rotation.
-    if new_state.secrets.current_version > 0 {
-        let owner_id = MemberId::from(&owner_vk);
-        let holders: std::collections::BTreeSet<MemberId> = new_state
-            .secrets
-            .encrypted_secrets
-            .iter()
-            .filter(|s| s.secret.secret_version == new_state.secrets.current_version)
-            .map(|s| s.secret.member_id)
-            .filter(|id| *id != owner_id)
-            .collect();
-        let members: std::collections::BTreeSet<MemberId> = current_members
-            .iter()
-            .copied()
-            .filter(|id| *id != owner_id)
-            .collect();
-        if holders == members {
-            logging::info(
-                "Current secret version already covers exactly the current members — no rotation",
-            );
-            return Ok(vec![]);
-        }
-    }
-
     // Determine the new version. We always derive from the notification's
     // current_version + 1 so concurrent rotations across replicas at least
     // converge on the highest observed version+1; at a version both paths
@@ -596,19 +567,20 @@ pub(crate) fn handle_contract_notification(
 
     // The rotation is returned whatever happens to the two local writes
     // below: it is the step that cuts a removed member off, and it must not
-    // depend on a host that refuses writes. Neither write is read to decide
-    // whether to publish this update.
+    // depend on a host that refuses writes. A refused write is logged as a
+    // WARNING (room and version only, never the secret bytes) so it is
+    // visible; it changes nothing else.
     //
     // - The secret copy is never read back (`secret_keys::secret` has no
     //   reader); the owner recovers every version from the room's own blob.
-    //   A refused write is logged (version and room only, never the bytes).
-    // - The member-set cache only stops the NEXT notification from rotating
-    //   again. If it is refused, the next notification would rotate again,
-    //   and because our own update raises a notification, that could repeat
-    //   on every round trip. The "already distributed" check above bounds
-    //   that: once the published rotation is in the room state, the current
-    //   version's blob holders equal the current members, so it rotates no
-    //   more, whether or not the cache ever persisted.
+    // - The member-set cache only stops the NEXT notification re-rotating.
+    //   If its write is refused, the next notification rotates again, and
+    //   since our own update raises a notification that can repeat on each
+    //   one while the writes stay refused. That is left as is, the same as
+    //   before this change. No state-only check can bound it safely: room
+    //   state erases a removed member's blobs, so the blob holders equal
+    //   the remaining members after any removal, and a check built on that
+    //   would suppress exactly the rotation that cuts them off.
     //
     // Both values are deterministic for `(seed, owner, version)` and the
     // member set, so a retry stores the same bytes.

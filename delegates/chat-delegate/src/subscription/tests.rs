@@ -1242,22 +1242,135 @@ fn writes_refused_every_time_still_publish_on_each_notification_and_do_not_wedge
     assert!(!store.map.contains_key(&secret_keys::secret(&room, 1)));
 }
 
-#[test]
-fn a_cache_that_never_persists_does_not_re_rotate_once_the_rotation_is_applied() {
-    let (mut store, n, room) = rotation_fixture();
-    store.refuse_prefixes = vec![secret_keys::member_set(&room)];
+/// Rotate a private room with members {A, B} (B invited by A) through the
+/// delegate, apply the rotation to the state, and return the store (cache now
+/// holds {A, B}), the rotated state and the keys.
+fn rotated_room_ab() -> (
+    RefusingStore,
+    ContractNotification,
+    ChatRoomStateV1,
+    [SigningKey; 3],
+) {
+    let owner_sk = SigningKey::generate(&mut OsRng);
+    let a_sk = SigningKey::generate(&mut OsRng);
+    let b_sk = SigningKey::generate(&mut OsRng);
+    let owner_id = MemberId::from(&owner_sk.verifying_key());
+    let mut state = private_room_state(&owner_sk, &[&a_sk]);
+    state.members.members.push(AuthorizedMember::new(
+        Member {
+            owner_member_id: owner_id,
+            invited_by: MemberId::from(&a_sk.verifying_key()),
+            member_vk: b_sk.verifying_key(),
+        },
+        &a_sk,
+    ));
+    let owner_vk = owner_sk.verifying_key().to_bytes();
+    let cid = [9u8; 32];
+    let room_b58 = room_owner_b58(&owner_vk);
+    let mut store = RefusingStore::default();
+    for (k, v) in
+        ensure_subscription_writes(ORIGIN_B58, owner_vk, cid, KeyCheck::Unavailable).unwrap()
+    {
+        store.map.insert(k, v);
+    }
+    store.map.insert(
+        signing_key_secret_key(ORIGIN_B58, &room_b58),
+        owner_sk.to_bytes().to_vec(),
+    );
+    let n = ContractNotification {
+        contract_id: ContractInstanceId::new(cid),
+        new_state: freenet_stdlib::prelude::WrappedState::new(cbor(&state)),
+        context: Default::default(),
+    };
     let out = handle_contract_notification(&mut store, n.clone()).unwrap();
     assert!(has_update(&out));
-    // Our own update raises the next notification; with no cache it must
-    // not rotate to v2, or every round trip would publish another version.
-    let n2 = apply_rotation(&n, &out);
-    for _ in 0..3 {
-        let out2 = handle_contract_notification(&mut store, n2.clone()).unwrap();
-        assert!(
-            !has_update(&out2),
-            "bounded: no re-rotation for the same member set"
-        );
-    }
+    let rotated = apply_rotation(&n, &out);
+    let state: ChatRoomStateV1 = ciborium::from_reader(rotated.new_state.as_ref()).unwrap();
+    assert_eq!(state.secrets.current_version, 1);
+    (store, rotated, state, [owner_sk, a_sk, b_sk])
+}
+
+/// Removing a member erases their blobs, so afterwards the current version's
+/// blob holders equal the remaining members. The delegate must still rotate:
+/// a skip based on "blobs cover exactly the members" would leave the removed
+/// member able to read.
+fn assert_removal_rotates(ban_by: usize, banned: usize, expect_members: usize) {
+    use freenet_scaffold::ComposableState;
+    use river_core::room_state::ban::{AuthorizedUserBan, UserBan};
+    use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
+
+    let (mut store, rotated, state, keys) = rotated_room_ab();
+    let owner_id = MemberId::from(&keys[0].verifying_key());
+    let ban = AuthorizedUserBan::new(
+        UserBan {
+            owner_member_id: owner_id,
+            banned_at: std::time::SystemTime::now().into(),
+            banned_user: MemberId::from(&keys[banned].verifying_key()),
+        },
+        MemberId::from(&keys[ban_by].verifying_key()),
+        &keys[ban_by],
+    );
+    let params = ChatRoomParametersV1 {
+        owner: keys[0].verifying_key(),
+    };
+    let mut after = state.clone();
+    after
+        .apply_delta(
+            &state,
+            &params,
+            &Some(ChatRoomStateV1Delta {
+                bans: Some(vec![ban]),
+                ..Default::default()
+            }),
+        )
+        .expect("the ban applies");
+    assert_eq!(after.members.members.len(), expect_members);
+
+    // The premise: the removed member's blob is gone, so holders == members.
+    let banned_id = MemberId::from(&keys[banned].verifying_key());
+    assert!(!after
+        .secrets
+        .encrypted_secrets
+        .iter()
+        .any(|s| s.secret.member_id == banned_id));
+    let holders: std::collections::BTreeSet<MemberId> = after
+        .secrets
+        .encrypted_secrets
+        .iter()
+        .filter(|s| s.secret.secret_version == after.secrets.current_version)
+        .map(|s| s.secret.member_id)
+        .filter(|id| *id != owner_id)
+        .collect();
+    let members: std::collections::BTreeSet<MemberId> = after
+        .members
+        .members
+        .iter()
+        .map(|m| MemberId::from(&m.member.member_vk))
+        .collect();
+    assert_eq!(holders, members);
+
+    let n = ContractNotification {
+        new_state: freenet_stdlib::prelude::WrappedState::new(cbor(&after)),
+        ..rotated
+    };
+    let out = handle_contract_notification(&mut store, n).unwrap();
+    assert!(has_update(&out), "a removal must rotate the secret");
+}
+
+#[test]
+fn an_owner_ban_of_a_member_rotates_the_secret() {
+    assert_removal_rotates(0, 2, 1);
+}
+
+#[test]
+fn a_deputy_banning_the_member_it_invited_rotates_the_secret() {
+    assert_removal_rotates(1, 2, 1);
+}
+
+#[test]
+fn banning_a_deputy_removes_its_invitee_too_and_rotates_the_secret() {
+    // Owner bans A; B, invited by A, is dropped with it.
+    assert_removal_rotates(0, 1, 0);
 }
 
 #[test]
