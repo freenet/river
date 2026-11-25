@@ -314,11 +314,39 @@ A public room can let newcomers in by proof of work instead of an invitation.
   `--admission-listed`. `--public-admission false` turns it off and clears
   the room's open members and bans.
 
+## Short room handles
+
+A room's share link normally carries the owner's 43-character key. A short
+handle (21 or 22 characters) stands for the same key: it is the first 16 bytes
+of `BLAKE3("freenet-shortkey/v1" || owner key)` in base58. A small resolver
+contract (`freenet/freenet-shortkey`, generation 1) maps a handle to the key.
+The handle is not a name and cannot be chosen.
+
+- `riverctl room short-link <room>` prints the full link (the canonical one to
+  share; it needs no resolver), the handle, the optional short link
+  (`https://freenet.org/open#<River>/?room=<handle>`, which opens only in a River
+  release with short-link support) and whether the resolver entry exists yet.
+  `--publish` creates the entry if it is missing; running it again does
+  nothing. Anyone can publish it, since the contract only accepts a key that
+  hashes to the handle. Use this for rooms that already exist.
+- `room config --public-admission true` does not publish anything. Short links
+  are optional, so publishing is always an explicit `room short-link --publish`.
+- `riverctl room resolve-handle <handle>` fetches the entry, checks that the
+  key hashes back to the handle and prints the full key. It fails with a clear
+  message if the entry does not exist, the node cannot be reached, the lookup
+  times out, the state is malformed, or the returned key does not match.
+  A handle is a 128-bit truncation of the key hash; the full key printed is what
+  to trust.
+
+All three use `--node-url`. A handle has 128 bits, so a deliberate collision
+costs about 2^64 work; for a room whose full key you already know (the Official
+room), compare the resolved key with it.
+
 ## Command reference
 
 | Group      | Commands                                                                |
 |------------|-------------------------------------------------------------------------|
-| `room`     | `create`, `list`, `join`, `leave`, `republish`, `config`                |
+| `room`     | `create`, `list`, `join`, `leave`, `republish`, `config`, `short-link`, `resolve-handle` |
 | `message`  | `send`, `list`, `stream`, `edit`, `delete`, `react`, `unreact`, `reply` |
 | `member`   | `list`, `set-nickname`, `ban`, `deputize`, `revoke-deputy`, `deputies`, `deputized-by` |
 | `invite`   | `create`, `accept`                                                      |

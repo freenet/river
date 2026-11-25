@@ -171,6 +171,30 @@ pub enum RoomCommands {
         #[arg(long)]
         admission_listed: Option<bool>,
     },
+
+    /// Show a room's short handle and short share link; optionally publish the
+    /// resolver entry that makes the handle work.
+    ///
+    /// The handle is the first 16 bytes of BLAKE3("freenet-shortkey/v1" ||
+    /// owner key), written as 21-22 base58 characters. Anyone can publish the
+    /// entry, because the resolver contract rejects a key that does not hash to
+    /// the handle. The full link stays the canonical one to share; the short link
+    /// is optional and needs the entry published (`--publish`).
+    ShortLink {
+        /// Room owner key (base58)
+        room_id: String,
+
+        /// Publish the resolver entry to the node's network if it does not exist
+        #[arg(long)]
+        publish: bool,
+    },
+
+    /// Resolve a short handle to the room's full owner key, checking that the
+    /// key hashes back to the handle
+    ResolveHandle {
+        /// Short handle (21-22 base58 characters)
+        handle: String,
+    },
 }
 
 /// Build the JSON payload emitted by `room join --format json`.
@@ -743,13 +767,11 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
                             }
                         }
                         OutputFormat::Json => {
-                            println!(
-                                "{}",
-                                serde_json::json!({
-                                    "status": "success",
-                                    "room_id": room_id,
-                                })
-                            );
+                            let out = serde_json::json!({
+                                "status": "success",
+                                "room_id": room_id,
+                            });
+                            println!("{out}");
                         }
                     }
                     Ok(())
@@ -759,6 +781,103 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
                     Err(e)
                 }
             }
+        }
+        RoomCommands::ShortLink { room_id, publish } => {
+            let vk = crate::shortkey::parse_owner_key(&room_id)?;
+            crate::shortkey::validate_owner_key(&vk)?;
+            let handle = crate::shortkey::ShortHandle::derive(&vk);
+            let published = if publish {
+                Some(api.short_handle_publish(&vk).await?)
+            } else {
+                None
+            };
+            // Without --publish, look the entry up so the output says whether it works yet.
+            let exists = match published {
+                Some(_) => Some(true),
+                None => match api.short_handle_lookup(&handle).await {
+                    crate::shortkey::Lookup::Found(state) => {
+                        crate::shortkey::resolve_state(&handle, &state)?;
+                        Some(true)
+                    }
+                    crate::shortkey::Lookup::NotFound(_) => Some(false),
+                    crate::shortkey::Lookup::TimedOut => None,
+                    crate::shortkey::Lookup::Error(why) => {
+                        anyhow::bail!(
+                            "could not look up the resolver entry: {why}. Check the node \
+                             connection (--node-url) and retry"
+                        )
+                    }
+                },
+            };
+            let short = crate::shortkey::short_link(&handle);
+            let long = crate::shortkey::long_link(&vk);
+            match format {
+                OutputFormat::Human => {
+                    println!("Full link:  {long}");
+                    println!("Handle:     {handle}");
+                    println!("Short link (optional): {short}");
+                    if !crate::shortkey::UI_RESOLVES_SHORT_LINKS {
+                        println!(
+                            "Note: short links open only in a River release with short-link \
+                             support. Share the full link."
+                        );
+                    }
+                    match (published, exists) {
+                        (Some(crate::shortkey::Published::Created), _) => {
+                            println!("Resolver entry: published")
+                        }
+                        (Some(crate::shortkey::Published::AlreadyPublished), _) => {
+                            println!("Resolver entry: already published")
+                        }
+                        (None, Some(true)) => println!("Resolver entry: exists"),
+                        (None, Some(false)) => println!(
+                            "Resolver entry: not found; run with --publish so the short link works"
+                        ),
+                        (None, None) => println!(
+                            "Resolver entry: unknown (the lookup timed out); run with --publish to make sure"
+                        ),
+                    }
+                }
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "status": "success",
+                            "room_id": room_id,
+                            "handle": handle.to_base58(),
+                            "short_link": short,
+                            "long_link": long,
+                            "short_link_opens_in_current_ui": crate::shortkey::UI_RESOLVES_SHORT_LINKS,
+                            "entry_exists": exists,
+                            "published": published.map(|p| p == crate::shortkey::Published::Created),
+                        })
+                    );
+                }
+            }
+            Ok(())
+        }
+        RoomCommands::ResolveHandle { handle } => {
+            let parsed = crate::shortkey::ShortHandle::from_base58(&handle)?;
+            let vk = api.short_handle_resolve(&parsed).await?;
+            let key = crate::shortkey::owner_key_b58(&vk);
+            match format {
+                OutputFormat::Human => {
+                    println!("{key}");
+                    eprintln!(
+                        "note: a handle is a 128-bit truncation of the key hash; the full key \
+                         above is what is trusted."
+                    );
+                }
+                OutputFormat::Json => println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "success",
+                        "handle": handle,
+                        "room_id": key,
+                    })
+                ),
+            }
+            Ok(())
         }
         RoomCommands::Republish { room_id } => {
             // Parse the room owner key
