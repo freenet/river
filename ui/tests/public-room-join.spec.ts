@@ -260,9 +260,12 @@ test("a full room says so, offers a retry later, and keeps the draft", async ({ 
   await expect(page.getByTestId("viewed-room")).toBeVisible();
   await expect(page.getByTestId("viewed-room-pending-message")).toHaveCount(0);
   expect(await callRiverTest(page, "joinSessionKey")).toBe("");
-  // Try again is offered, and the room being still full says so again.
+  // Try again is offered and starts over (the error clears); sending the kept
+  // text into the still-full room says so again, with the text kept.
   await page.getByTestId("viewed-room-join").click();
-  await expect(page.getByTestId("viewed-room-join-error")).toContainText("no free spot");
+  await expect(page.getByTestId("viewed-room-join-error")).toHaveCount(0);
+  await page.getByTestId("viewed-room-send").click();
+  await expect(page.getByTestId("viewed-room-join-error")).toContainText("no free spot", { timeout: 30_000 });
   await expect(page.getByTestId("viewed-room-composer")).toHaveValue("Too late");
   expect(panics).toEqual([]);
 });
