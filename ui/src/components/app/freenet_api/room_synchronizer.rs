@@ -758,14 +758,9 @@ impl RoomSynchronizer {
                     contract_key.id()
                 );
 
-                // Use with_mut to scope the borrow properly and avoid AlreadyBorrowed errors
-                SYNC_INFO.with_mut(|sync_info| {
-                    sync_info.register_new_room(owner_vk);
-                    sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Subscribing);
-                });
-
                 // Update pending invite status to prevent re-processing on concurrent calls
-                // and read the retry count to decide whether to request contract code
+                // and read the retry count. A refused invitation (budget spent) sends
+                // nothing and is not marked Subscribing in SYNC_INFO.
                 let Some(retry_count) =
                     PENDING_INVITES.with_mut(|pending| pending.begin_get(&owner_vk, now_ms()))
                 else {
@@ -775,6 +770,12 @@ impl RoomSynchronizer {
                     );
                     continue;
                 };
+
+                // Use with_mut to scope the borrow properly and avoid AlreadyBorrowed errors
+                SYNC_INFO.with_mut(|sync_info| {
+                    sync_info.register_new_room(owner_vk);
+                    sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Subscribing);
+                });
 
                 // Always request contract code so the node caches the WASM locally.
                 // Without cached WASM, subsequent Subscribe requests will be rejected
@@ -2591,10 +2592,27 @@ mod tests {
         for call in [
             "PENDING_INVITES.with_mut(|pending|pending.reset_stuck(now_ms()))",
             "PENDING_INVITES.read().awaiting_get()",
-            ".with_mut(|pending|pending.begin_get(&owner_vk,now_ms()))",
         ] {
             assert!(body.contains(call), "process_rooms must call {call}");
         }
+        // A refused GET (budget spent) is skipped, and only an accepted one
+        // marks the room Subscribing in SYNC_INFO.
+        let gate = body
+            .find("letSome(retry_count)=PENDING_INVITES.with_mut(|pending|pending.begin_get(&owner_vk,now_ms()))else{")
+            .expect("process_rooms must gate the invite GET on begin_get");
+        let after = &body[gate..];
+        let else_end = after.find("};").expect("the else block ends");
+        assert!(
+            after[..else_end].contains("continue;"),
+            "a refused invite GET must be skipped"
+        );
+        let register = body
+            .find("sync_info.register_new_room(owner_vk);sync_info.update_sync_status(&owner_vk,RoomSyncStatus::Subscribing);")
+            .expect("process_rooms registers the invited room");
+        assert!(
+            gate < register,
+            "SYNC_INFO is set only after begin_get accepts"
+        );
         let src: String = crate::util::strip_comments(include_str!("room_synchronizer.rs"))
             .chars()
             .filter(|c| !c.is_whitespace())

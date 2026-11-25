@@ -59,7 +59,7 @@ impl PendingInvites {
     pub(crate) fn begin_get(&mut self, vk: &VerifyingKey, now: f64) -> Option<u32> {
         let join = self.map.get_mut(vk)?;
         if !join.get_budget.may_retry(now, 0) {
-            join.status = PendingRoomStatus::Error(INVITE_NOT_FOUND_ERROR.to_string());
+            join.status = PendingRoomStatus::Error(join.get_budget.refusal_text().to_string());
             return None;
         }
         join.status = PendingRoomStatus::Subscribing;
@@ -149,6 +149,9 @@ pub struct InviteGetBudget {
     /// repeats, even across a re-accept of the same room, and a retry timer
     /// armed for an older GET can tell it is stale.
     pub generation: u64,
+    /// Whether the latest GET was answered NotFound (as opposed to not
+    /// answered yet), so a refusal can say which.
+    pub last_not_found: bool,
 }
 
 /// Source of `InviteGetBudget::generation`; starts at 1 so a fresh budget's
@@ -161,6 +164,7 @@ impl InviteGetBudget {
     pub fn record_get_sent(&mut self, now: f64) -> u64 {
         self.first_get_at.get_or_insert(now);
         self.gets_sent += 1;
+        self.last_not_found = false;
         self.generation =
             NEXT_INVITE_GET_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.generation
@@ -175,6 +179,16 @@ impl InviteGetBudget {
             && self
                 .first_get_at
                 .is_none_or(|first| now + delay_ms as f64 - first <= INVITE_GIVE_UP_MS as f64)
+    }
+
+    /// The error to show when the budget refuses a GET: NotFound if that is
+    /// how the latest GET was answered, otherwise no answer.
+    pub fn refusal_text(&self) -> &'static str {
+        if self.last_not_found {
+            INVITE_NOT_FOUND_ERROR
+        } else {
+            INVITE_NO_ANSWER_ERROR
+        }
     }
 
     /// Start a fresh budget for a user-requested retry. The generation is
@@ -211,6 +225,7 @@ impl PendingRoomJoin {
         if !matches!(self.status, PendingRoomStatus::Subscribing) {
             return InviteNotFoundStep::NotWaiting;
         }
+        self.get_budget.last_not_found = true;
         if self.get_budget.may_retry(now, delay_ms) {
             InviteNotFoundStep::RetryAfter {
                 delay_ms,
