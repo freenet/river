@@ -322,3 +322,21 @@ jobs:
 
       - name: Fresh-node end-to-end
         run: FREENET_BIN="$RUNNER_TEMP/freenet/freenet" ./scripts/fresh-node-e2e.sh "$RUNNER_TEMP/e2e"
+
+      # The script prints the ends of the node logs and their delegate lines; a failure
+      # may need all of it (#1017: the info lines that name the delegate request were not
+      # in the output). Also on cancel, which is how a hang that reaches the job's
+      # timeout ends.
+      - name: Upload node logs
+        uses: actions/upload-artifact@v4
+        if: failure() || cancelled()
+        with:
+          name: fresh-node-e2e-logs-${{ matrix.freenet }}
+          path: |
+            ${{ runner.temp }}/e2e/gw/stdout.log
+            ${{ runner.temp }}/e2e/gw/log/
+            ${{ runner.temp }}/e2e/peer/stdout.log
+            ${{ runner.temp }}/e2e/peer/log/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 14
