@@ -43,6 +43,7 @@ use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessag
 use river_core::room_state::privacy::PrivacyMode;
 use river_core::room_state::provisional::{
     AdmissionEvidence, AuthorizedProvisionalMember, ProvisionalMember,
+    PROVISIONAL_MESSAGES_PER_AUTHOR,
 };
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
 use std::sync::Mutex;
@@ -683,8 +684,13 @@ impl Machine {
             if self.queue.len() + self.in_flight.len() >= limits.max_queued {
                 self.give_back(owner, text);
                 self.notice = Some(format!(
-                    "You can queue {} messages before you are admitted. Wait for admission to send more.",
-                    limits.max_queued
+                    "You can queue {} {} before you are admitted. Wait for admission to send more.",
+                    limits.max_queued,
+                    if limits.max_queued == 1 {
+                        "message"
+                    } else {
+                        "messages"
+                    }
                 ));
                 return Action::Nothing;
             }
@@ -1176,6 +1182,13 @@ pub fn start_readmit(owner_vk: VerifyingKey) {
     act(action, owner_vk);
 }
 
+/// How many messages a visitor may queue before admission: the room's
+/// newcomer quota, but never more than one author keeps (the room drops the
+/// oldest beyond that), and at least one.
+pub(crate) fn queue_limit(room_quota: u32) -> usize {
+    (room_quota as usize).clamp(1, PROVISIONAL_MESSAGES_PER_AUTHOR)
+}
+
 /// Send pressed with `text`: queue it, and start admission or post it.
 pub fn send(owner_vk: VerifyingKey, text: String) {
     let (plan, state) = plan_for(&owner_vk);
@@ -1187,7 +1200,7 @@ pub fn send(owner_vk: VerifyingKey, text: String) {
                 .configuration
                 .public_admission
                 .as_ref()
-                .map_or(1, |p| (p.max_provisional_messages as usize).max(1)),
+                .map_or(1, |p| queue_limit(p.max_provisional_messages)),
         },
         None => Limits {
             max_message_size: usize::MAX,
@@ -2703,6 +2716,39 @@ mod tests {
         m.solved(g, some_entry());
         m.succeed(g);
         assert_eq!(m.take_carried(&a), None);
+    }
+
+    #[test]
+    fn the_queue_never_exceeds_what_one_author_keeps() {
+        assert_eq!(queue_limit(0), 1);
+        assert_eq!(queue_limit(1), 1);
+        assert_eq!(
+            queue_limit(PROVISIONAL_MESSAGES_PER_AUTHOR as u32),
+            PROVISIONAL_MESSAGES_PER_AUTHOR
+        );
+        assert_eq!(queue_limit(20), PROVISIONAL_MESSAGES_PER_AUTHOR);
+        assert_eq!(queue_limit(u32::MAX), PROVISIONAL_MESSAGES_PER_AUTHOR);
+    }
+
+    #[test]
+    fn a_message_over_the_queue_limit_is_refused_with_the_real_number() {
+        let mut m = Machine::default();
+        let a = vk(60);
+        let lim = Limits {
+            max_message_size: 100,
+            max_queued: queue_limit(20),
+        };
+        let _ = m.send(a, "one", lim, fresh());
+        let _ = m.send(a, "two", lim, fresh());
+        let _ = m.send(a, "three", lim, fresh());
+        let notice = m.notice_for(&a).expect("a notice");
+        assert!(
+            notice.contains(&format!(
+                "You can queue {PROVISIONAL_MESSAGES_PER_AUTHOR} messages"
+            )),
+            "{notice}"
+        );
+        assert_eq!(returned(&mut m, &a), "three", "the refused text goes back");
     }
 
     #[test]
