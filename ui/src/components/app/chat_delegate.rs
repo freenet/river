@@ -6814,12 +6814,15 @@ mod tests {
     /// Updated for V40 (the room subscription record requires the room
     /// owner's signing key): a check in `subscription.rs`. V40 (`4fbc0f3a…`)
     /// is the outgoing generation.
+    ///
+    /// Updated for V41 (the signature crates built optimised, which the
+    /// delegate links): V41 (`110b4dff…`) is the outgoing generation.
     #[test]
     fn chat_delegate_wasm_is_byte_identical() {
         let bytes = include_bytes!("../../../public/contracts/chat_delegate.wasm");
         assert_eq!(
             blake3::hash(bytes).to_hex().as_str(),
-            "110b4dff1fcacd8658ea7a464ff9591508b056721c1bff5d06ba45bfa5931e2c",
+            "000af8378877c99bbed73a4c7aa7a3b28a5a688ede119cb2d1cdf7440a07c162",
             "chat_delegate.wasm changed, which re-keys the delegate; if the change is \
              intentional, follow .claude/rules/delegate-migration.md \
              (add-migration BEFORE rebuilding) and update this pin in the same commit"
