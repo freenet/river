@@ -327,6 +327,11 @@ fn forged_records_are_rejected() {
 /// result never passes `validate_state`: the update returns an error, or an
 /// output that `validate_state` (which the host runs on every result) refuses.
 /// None of these panics, in assume mode or in the cleanup cross-check.
+///
+/// Under the `update_validates` opt-in, core commits an `Ok` output without
+/// running `validate_state` on it. So this test states the residual: an `Ok`
+/// from a corrupted stored state is not a guarantee, and its protection is
+/// core's once-per-process validation of the stored state, not this contract.
 #[test]
 fn a_corrupted_stored_state_never_yields_a_validating_output() {
     let (f, p, _) = fixture(8);

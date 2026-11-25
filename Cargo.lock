@@ -2336,8 +2336,7 @@ dependencies = [
 [[package]]
 name = "freenet-macros"
 version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6447ac80d17ad1a22d87f470d1c170ca3cfa976a433883de6472c1ede381e525"
+source = "git+https://github.com/freenet/freenet-stdlib?rev=6bd4398c7cad8b6ce08d52007be7c28254e1c1a9#6bd4398c7cad8b6ce08d52007be7c28254e1c1a9"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2454,8 +2453,7 @@ dependencies = [
 [[package]]
 name = "freenet-stdlib"
 version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d1d34436ce7088f277e65a616951ab8ea43091e04bb18f9af562651019b656f"
+source = "git+https://github.com/freenet/freenet-stdlib?rev=6bd4398c7cad8b6ce08d52007be7c28254e1c1a9#6bd4398c7cad8b6ce08d52007be7c28254e1c1a9"
 dependencies = [
  "bincode",
  "blake3",

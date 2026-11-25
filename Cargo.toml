@@ -144,3 +144,9 @@ toolchain = "nightly"
 # https://github.com/freenet/markdown-rs/commits/freenet/panic-fixes
 [patch.crates-io]
 markdown = { git = "https://github.com/freenet/markdown-rs", rev = "4dcf957506808e39dbbd42aed8cfc874415ebc36" }
+# UNREVIEWED stdlib branch feat/contract-update-validates (base 7782c17, still
+# versioned 0.12.1): adds `#[contract(update_validates)]`. A [patch], never a
+# plain git dependency: freenet-migrate pulls stdlib from crates.io, and two
+# stdlib copies clash on the `__frnt_set_id` no_mangle symbol. Remove this patch
+# and bump the requirement above once stdlib 0.12.2 is released.
+freenet-stdlib = { git = "https://github.com/freenet/freenet-stdlib", rev = "6bd4398c7cad8b6ce08d52007be7c28254e1c1a9" }
