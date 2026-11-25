@@ -670,14 +670,18 @@ fn NicknamePrompt(default: String, on_done: EventHandler<NameAnswer>) -> Element
     let disabled = invitation_accept_disabled(&nickname.read(), None);
     rsx! {
         div {
-            class: "fixed inset-0 z-50 flex items-center justify-center",
-            div { class: "absolute inset-0 bg-black/50" }
+            // The layer scrolls and the dialog centres with `m-auto`, which
+            // centres when it fits and top-aligns when it does not, so on a
+            // short screen (a phone with the keyboard up) every control can
+            // be scrolled to and tapped instead of being clipped.
+            class: "fixed inset-0 z-50 flex overflow-y-auto overscroll-contain p-4",
+            div { class: "fixed inset-0 bg-black/50" }
             div {
                 "data-testid": "viewed-room-nickname-modal",
                 role: "dialog",
                 "aria-modal": "true",
                 "aria-labelledby": "viewed-room-nickname-text",
-                class: "relative z-10 w-full max-w-md mx-4 bg-panel rounded-xl shadow-xl border border-border",
+                class: "relative z-10 w-full max-w-md m-auto bg-panel rounded-xl shadow-xl border border-border",
                 // Escape cancels (nothing is sent), wherever focus is; Tab stays
                 // inside the dialog.
                 onkeydown: {

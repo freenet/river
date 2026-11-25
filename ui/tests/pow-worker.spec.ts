@@ -20,9 +20,7 @@ async function hooksReady(page: Page) {
 // not asked. Takes a page or a frame locator.
 async function sendFirst(root: Page | FrameLocator) {
   await root.getByTestId("viewed-room-send").click();
-  // Enter rather than a click: in the sandboxed iframe on a phone-sized page the
-  // Continue button can be below the page's viewport.
-  await root.getByTestId("viewed-room-nickname-input").press("Enter");
+  await root.getByTestId("viewed-room-nickname-continue").click();
   await expect(root.getByTestId("viewed-room-nickname-modal")).toHaveCount(0);
 }
 
@@ -154,7 +152,7 @@ test("a join solves in Web Workers inside the gateway's sandboxed iframe", async
   const key = await callRiverTest(page, "viewableRoomKey", "open");
 
   await page.setContent(
-    `<iframe id="app" src="${base}/?room=${key}" sandbox="allow-scripts allow-forms allow-popups" style="width:1000px;height:700px"></iframe>`,
+    `<iframe id="app" src="${base}/?room=${key}" sandbox="allow-scripts allow-forms allow-popups" style="width:100vw;height:100vh;border:0"></iframe>`,
   );
   const frame = page.frameLocator("#app");
   await expect(frame.getByTestId("viewed-room-name")).toBeVisible({ timeout: 30_000 });
