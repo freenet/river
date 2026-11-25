@@ -257,15 +257,6 @@ impl Chat {
         self.dm_send_at(Instant::now())
     }
 
-    /// The open thread's box holds no text.
-    pub(super) fn dm_draft_is_empty(&self) -> bool {
-        self.dm
-            .open
-            .as_ref()
-            .and_then(|key| self.dm.compose.drafts.get(key))
-            .is_none_or(|d| d.text.is_empty())
-    }
-
     /// Whether the open thread's Send is waiting for the user to confirm: a send of this very
     /// text was not answered in time, so sending again may deliver it twice.
     pub fn dm_needs_confirm(&self) -> bool {

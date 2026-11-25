@@ -119,6 +119,9 @@ pub struct DmUi {
     pub at_bottom: bool,
     /// The composer had the keyboard when the thread opened: Back gives it back.
     restore_focus: bool,
+    /// The box had the keyboard when a send made it read-only: it takes it back when the answer
+    /// comes.
+    refocus_after_send: bool,
     /// Deleting the peer's messages ([`super::dm_purge`]).
     pub(super) purge: super::dm_purge::DmPurgeUi,
     /// Invitations: Accept on a card and the "Share an invite" dialog ([`super::dm_invite`]).
@@ -776,10 +779,13 @@ impl Chat {
         self.composer.focused = false;
         self.dm.open = Some((room.to_owned(), uid.to_owned()));
         self.dm.at_bottom = true;
-        // The thread's own box takes the keyboard, with the draft it kept.
+        // The thread's own box takes the keyboard, with the draft it kept, if it can take text.
+        // A box that cannot (the peer left the room) has no edit handler, so rune could never
+        // clear the flag again: a click in the thread would leave it focused (#1022).
         let open = self.dm.open.clone();
         self.dm.compose.tidy(open.as_ref());
-        self.dm.compose_edit().focused = true;
+        let can_type = self.dm_block().is_none();
+        self.dm.compose_edit().focused = can_type;
         true
     }
 
@@ -814,6 +820,26 @@ impl Chat {
     /// in front. Run every frame.
     pub fn dm_sync(&mut self, foreground: bool) {
         self.dm.mark_read(foreground);
+        self.sync_box_focus();
+    }
+
+    /// A box that cannot take text does not count as focused. It has no edit handler, so rune
+    /// could not clear the flag when a click took the keyboard elsewhere (#1022). A box made
+    /// read-only by a send takes the keyboard back once it can type again (a click in the thread meanwhile is not
+    /// seen here, so it is taken back too).
+    fn sync_box_focus(&mut self) {
+        let Some(key) = self.dm.open.clone() else {
+            self.dm.refocus_after_send = false;
+            return;
+        };
+        let sending = self.dm.compose.is_sending_in(&key);
+        if sending || self.dm_block().is_some() {
+            if std::mem::take(&mut self.dm.compose_edit().focused) && sending {
+                self.dm.refocus_after_send = true;
+            }
+        } else if std::mem::take(&mut self.dm.refocus_after_send) {
+            self.dm.compose_edit().focused = true;
+        }
     }
 
     /// The room whose conversation is on screen: none while a direct-message thread covers it.

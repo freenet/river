@@ -108,6 +108,9 @@ pub(super) struct RowTarget {
     /// The message is the reader's own (the sheet offers Edit and Delete).
     /// Shown from this; checked again against the room when an action runs.
     pub(super) own: bool,
+    /// The author is a newcomer the reader may ban (the sheet offers Ban
+    /// newcomer). Checked again against the room when the action runs.
+    pub(super) can_ban_newcomer: bool,
     /// The reader's own reaction on it, as its footer renders it (pending
     /// ones included). Only marks the current choice: the pending-aware
     /// toggle decides from the room itself.
