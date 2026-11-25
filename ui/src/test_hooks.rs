@@ -221,7 +221,7 @@ pub fn install_test_hooks() {
                     &owner_vk,
                     ProvisionalBan {
                         banned_by: MemberId::from(&owner_vk),
-                        banned_at: crate::util::get_current_system_time(),
+                        banned_at: crate::util::get_current_system_time().into(),
                         target: MemberId::from(&vk),
                     },
                     &owner_sk,
@@ -1432,7 +1432,7 @@ fn signed_message(
             room_owner: MemberId::from(room_key),
             author: MemberId::from(&sk.verifying_key()),
             content,
-            time,
+            time: time.into(),
         },
         sk,
     )

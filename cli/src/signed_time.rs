@@ -3,8 +3,11 @@
 //! River signs the CBOR of structs holding a `SignedTime` (`MessageV1.time`, `UserBan.banned_at`,
 //! `SecretVersionRecordV1.created_at`). `SignedTime` keeps the exact `(secs, nanos)` pair, so a
 //! verifier's decode and re-encode returns the signed bytes on every platform, Windows included
-//! (freenet/river#971, #1018). The whole-millisecond rounding here is therefore no longer needed
-//! for signatures to verify; it keeps stamps compatible with the web UI's millisecond precision.
+//! (freenet/river#971, #1018). For stamps this build makes, the whole-millisecond rounding here is
+//! therefore no longer needed for signatures to verify. It stays for two reasons: it keeps stamps
+//! compatible with the web UI's millisecond precision, and older Windows builds of riverctl and the
+//! desktop app (which floor decoded times to 100ns) can only verify stamps that are whole
+//! milliseconds.
 //!
 //! Never apply this to a timestamp that is already signed: it would change the signed bytes.
 
@@ -38,9 +41,44 @@ pub fn utc_datetime(t: river_core::SignedTime) -> chrono::DateTime<chrono::Utc> 
         .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
 }
 
+/// `unix_secs` (seconds since the epoch, e.g. a DM timestamp) as a UTC datetime. Values beyond
+/// chrono's range clamp to `MAX_UTC` instead of panicking in `DateTime::from(SystemTime)`.
+pub fn utc_datetime_from_unix_secs(unix_secs: u64) -> chrono::DateTime<chrono::Utc> {
+    let secs = i64::try_from(unix_secs).unwrap_or(i64::MAX);
+    chrono::DateTime::from_timestamp(secs, 0).unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+}
+
 #[cfg(test)]
 mod utc_datetime_tests {
-    use super::utc_datetime;
+    use super::{utc_datetime, utc_datetime_from_unix_secs};
+    use chrono::{DateTime, Local, Utc};
+
+    #[test]
+    fn unix_secs_clamp_instead_of_panicking() {
+        for secs in [u64::MAX, 1 << 63, i64::MAX as u64, u32::MAX as u64 * 1000] {
+            let dt = utc_datetime_from_unix_secs(secs);
+            let local: DateTime<Local> = dt.into();
+            assert!(!local.format("%Y-%m-%d %H:%M:%S").to_string().is_empty());
+        }
+        assert_eq!(
+            utc_datetime_from_unix_secs(u64::MAX),
+            DateTime::<Utc>::MAX_UTC
+        );
+        assert_eq!(
+            utc_datetime_from_unix_secs(1_700_000_000).timestamp(),
+            1_700_000_000
+        );
+    }
+
+    #[test]
+    fn max_utc_converts_to_local_and_formats() {
+        // The CLI's display paths (api.rs, commands/message.rs) do exactly this.
+        let local: DateTime<Local> = utc_datetime(river_core::SignedTime::MAX).into();
+        assert!(!local.format("%Y-%m-%d %H:%M:%S").to_string().is_empty());
+        let local: DateTime<Local> = DateTime::<Utc>::MAX_UTC.into();
+        assert!(!local.to_rfc3339().is_empty());
+    }
+
     use river_core::SignedTime;
 
     #[test]
