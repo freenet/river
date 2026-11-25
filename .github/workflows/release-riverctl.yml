@@ -44,6 +44,8 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
+      - name: Refuse a git freenet-stdlib/macros (the WASM hash would differ from the released crate)
+        run: ./scripts/check-no-git-stdlib.sh
       - name: Verify tag matches cli/Cargo.toml and commit is on main
         id: check
         run: |

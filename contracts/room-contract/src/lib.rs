@@ -13,9 +13,12 @@ use river_core::ChatRoomStateV1;
 struct Contract;
 
 // `update_validates` is a promise to freenet-core: `update_state`, given a state
-// this node stored, treats every update as untrusted input and returns `Err`
-// unless its output passes `validate_state` (the whole-state check at the end
-// of `update_state`). Core then skips its own `validate_state` of the result.
+// this node stored, treats every update (including a whole `State`) as
+// untrusted input and returns `Err` unless its output passes `validate_state`
+// (the whole-state check at the end of `update_state`). A core release that
+// honours the marker (none does yet) may then skip its own `validate_state`
+// both before (of an incoming `State`) and after (of the result), and skip the
+// recovery that replaces a stored state failing `validate_state`.
 #[contract(update_validates)]
 impl ContractInterface for Contract {
     fn validate_state(
@@ -72,15 +75,17 @@ impl ContractInterface for Contract {
             // is not (disk damage) seeds its bad signatures as good, and
             // the output check below cannot see them.
             //
-            // This contract opts in to `update_validates`. On a host that
-            // already holds a state for this key, freenet-core therefore
-            // does NOT run its own `validate_state` on the result, and relies
-            // on the whole-state check at the end of this function. A corrupted
-            // stored state can thus yield an `Ok` output that fails
-            // `validate_state`, and core commits it. What protects the host
-            // is that core (separately) validates a key's stored state once
-            // per process before it honours the opt-in. A seeding error (a
-            // structural fault in the stored state) continues unseeded.
+            // This contract opts in to `update_validates`. When a core
+            // release honours that opt-in (not yet released), core will skip
+            // its own `validate_state` on hosts that already hold a state
+            // for this key, and rely on the whole-state check at the end of
+            // this function. Then a corrupted stored state can yield an `Ok`
+            // output that fails `validate_state`, and core would commit it.
+            // The opt-in is sound only if core first validates a key's stored
+            // state before trusting it (once per process); that is a
+            // precondition core is expected to provide, planned and not yet
+            // built. A seeding error (a structural fault in the stored state)
+            // continues unseeded.
             // `seed_from` is called from here and nowhere else.
             let _ = river_core::room_state::sigcheck::seed_from(|| {
                 chat_state.verify(&chat_state, &parameters)

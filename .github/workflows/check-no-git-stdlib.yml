@@ -1,0 +1,21 @@
+name: Check No Git Stdlib
+
+# Runs only on PRs targeting main, so chain PRs (whose base is another branch)
+# may carry the temporary freenet-stdlib git patch. See
+# scripts/check-no-git-stdlib.sh.
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check-no-git-stdlib:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test the guard
+        run: ./scripts/tests/check-no-git-stdlib-test.sh
+      - name: freenet-stdlib and freenet-macros must not come from git
+        run: ./scripts/check-no-git-stdlib.sh

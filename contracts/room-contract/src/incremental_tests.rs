@@ -323,17 +323,18 @@ fn forged_records_are_rejected() {
 }
 
 /// A stored state with a bad signature (disk damage) cannot be told apart by
-/// seeding, which takes the stored state on trust. What holds is that the
-/// result never passes `validate_state`: the update returns an error, or an
-/// output that `validate_state` (which the host runs on every result) refuses.
-/// None of these panics, in assume mode or in the cleanup cross-check.
+/// seeding, which takes the stored state on trust. An update from it returns
+/// an error or an output that `validate_state` refuses (checked here by
+/// running `validate_state` ourselves). None of these panics, in assume mode
+/// or in the cleanup cross-check.
 ///
-/// Under the `update_validates` opt-in, core commits an `Ok` output without
-/// running `validate_state` on it. So this test states the residual: an `Ok`
-/// from a corrupted stored state is not a guarantee, and its protection is
-/// core's once-per-process validation of the stored state, not this contract.
+/// This is the residual of the `update_validates` opt-in: a core that honours
+/// it will commit an `Ok` output without running `validate_state` on it, so
+/// the refusal above is not something the host would enforce. What would
+/// refuse such a state is core validating the stored state first (a planned
+/// precondition, not built), not this contract.
 #[test]
-fn a_corrupted_stored_state_never_yields_a_validating_output() {
+fn a_corrupted_stored_state_yields_an_error_or_an_invalid_output() {
     let (f, p, _) = fixture(8);
     type Mutate = fn(&mut ChatRoomStateV1);
     let corruptions: Vec<(&str, Mutate)> = vec![
