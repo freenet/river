@@ -41,6 +41,7 @@ use river_core::ChatRoomStateV1;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, UNIX_EPOCH};
 
+use crate::handlers::{put_secret, SecretStore};
 use crate::utils::create_app_response;
 
 /// Secret-store key prefixes for delegate-managed subscription state.
@@ -257,7 +258,7 @@ pub(crate) fn handle_ensure_room_subscription(
         Err(e) => return ok_response(room_owner_vk, request_id, Err(e)),
     };
     for (key, value) in &writes {
-        if !ctx_set_secret(ctx, key, value) {
+        if !SecretStore::set_secret(ctx, key, value) {
             return ok_response(
                 room_owner_vk,
                 request_id,
@@ -290,7 +291,7 @@ pub(crate) fn handle_ensure_room_subscription(
 /// identical notification retries the rotation rather than silently
 /// declaring "members unchanged" forever.
 pub(crate) fn handle_contract_notification(
-    ctx: &mut DelegateCtx,
+    ctx: &mut impl SecretStore,
     notification: ContractNotification,
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
     let cid_bytes: [u8; 32] = {
@@ -359,7 +360,11 @@ pub(crate) fn handle_contract_notification(
     // costs nothing.
     if new_state.configuration.configuration.privacy_mode != PrivacyMode::Private {
         logging::info("Notification for non-private room — no rotation needed");
-        update_member_set_cache(ctx, &room_b58, &new_state);
+        // A stale cache only causes one extra rotation if the room turns
+        // private, so a refused write is logged and not an error.
+        if let Err(e) = update_member_set_cache(ctx, &room_b58, &new_state) {
+            logging::info(&format!("Public room member-set cache not stored: {e:?}"));
+        }
         return Ok(vec![]);
     }
 
@@ -560,22 +565,42 @@ pub(crate) fn handle_contract_notification(
     );
     update_req.context = DelegateContext::default();
 
-    // Cache the freshly derived secret so future operations (e.g. UI
-    // requests for the current secret) can find it without re-derivation.
-    let _ = ctx_set_secret(ctx, &secret_keys::secret(&room_b58, new_version), &secret);
-
-    // Now — and only now — update the member-set cache. The
-    // UpdateContractRequest is fully built and ready to emit; if it round-
-    // trips the contract and gets rejected (duplicate version, etc.) the
-    // contract's CRDT dedup absorbs it. If the rotation succeeds, the cache
-    // reflects the new member set so we don't spuriously re-rotate on the
-    // next notification.
-    update_member_set_cache(ctx, &room_b58, &new_state);
+    // Both writes happen BEFORE the update is handed back, so a refusal
+    // publishes nothing and advances nothing. The secret is a local copy
+    // (the owner can also recover it from the room's own blob), so this is
+    // a choice: a host that refuses writes pauses rotation, which resumes
+    // at the next notification (a room update), not on a timer. The
+    // member-set cache stops the next notification re-rotating, so it
+    // advances only once the rotation is certain to be emitted. The secret
+    // is deterministic for `(seed, owner, version)`: a retry stores the
+    // same bytes.
+    put_secret(
+        ctx,
+        &secret_keys::secret(&room_b58, new_version),
+        &secret,
+        "rotated room secret",
+    )
+    .map_err(|e| {
+        logging::info(&format!(
+            "Rotation of room {room_b58} to v{new_version} abandoned: {e:?}"
+        ));
+        e
+    })?;
+    update_member_set_cache(ctx, &room_b58, &new_state).map_err(|e| {
+        logging::info(&format!(
+            "Rotation of room {room_b58} to v{new_version} abandoned: {e:?}"
+        ));
+        e
+    })?;
 
     Ok(vec![OutboundDelegateMsg::UpdateContractRequest(update_req)])
 }
 
-fn update_member_set_cache(ctx: &mut DelegateCtx, room_b58: &str, new_state: &ChatRoomStateV1) {
+fn update_member_set_cache(
+    ctx: &mut impl SecretStore,
+    room_b58: &str,
+    new_state: &ChatRoomStateV1,
+) -> Result<(), DelegateError> {
     let current_members: std::collections::BTreeSet<MemberId> = new_state
         .members
         .members
@@ -591,23 +616,14 @@ fn update_member_set_cache(ctx: &mut DelegateCtx, room_b58: &str, new_state: &Ch
     // notification?". So the eq-on-bytes check we perform after decoding
     // (`previous_members.as_ref() == Some(&current_members)`) is safe even
     // under non-canonical encodings, because we decode before comparing.
-    if let Ok(b) = cbor_encode(&current_members) {
-        let _ = ctx_set_secret(ctx, &secret_keys::member_set(room_b58), &b);
-    }
-}
-
-/// `set_secret` returns `true` on the WASM target and `false` in non-WASM
-/// tests; this helper centralises that quirk so call-sites stay readable.
-fn ctx_set_secret(ctx: &mut DelegateCtx, key: &[u8], value: &[u8]) -> bool {
-    #[cfg(target_family = "wasm")]
-    {
-        ctx.set_secret(key, value)
-    }
-    #[cfg(not(target_family = "wasm"))]
-    {
-        let _ = ctx.set_secret(key, value);
-        true
-    }
+    let b = cbor_encode(&current_members)
+        .map_err(|e| DelegateError::Other(format!("Failed to encode member set: {e}")))?;
+    put_secret(
+        ctx,
+        &secret_keys::member_set(room_b58),
+        &b,
+        "room member set",
+    )
 }
 
 fn cbor_encode<T: Serialize>(value: &T) -> Result<Vec<u8>, ciborium::ser::Error<std::io::Error>> {

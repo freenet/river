@@ -120,7 +120,7 @@ The node then sends the delegate a `ContractNotification` whenever that room con
 It derives the next secret with `derive_room_secret` at `current_version + 1`, and signs a `SecretVersionRecordV1` with the owner's key.
 With the shared `build_rotation_encrypted_secrets`, it encrypts each secret version a current member or the owner is missing.
 It emits one `UpdateContractRequest` whose delta carries only the secrets.
-It updates the member-set cache only after it has built that update, so a failed rotation is retried on the next notification.
+It stores the new secret and the member-set cache before it returns the update. A refused write returns an error and publishes nothing, so the rotation is retried on the next notification.
 
 The UI's fast path, `RoomData::rotate_secret`, calls the same two functions with the same inputs.
 Both paths therefore emit byte-identical secrets and encrypted blobs.
