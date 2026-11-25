@@ -766,9 +766,15 @@ impl RoomSynchronizer {
 
                 // Update pending invite status to prevent re-processing on concurrent calls
                 // and read the retry count to decide whether to request contract code
-                let retry_count = PENDING_INVITES
-                    .with_mut(|pending| pending.begin_get(&owner_vk, now_ms()))
-                    .unwrap_or(0);
+                let Some(retry_count) =
+                    PENDING_INVITES.with_mut(|pending| pending.begin_get(&owner_vk, now_ms()))
+                else {
+                    warn!(
+                        "Invitation for {:?} out of retries, showing an error",
+                        MemberId::from(owner_vk)
+                    );
+                    continue;
+                };
 
                 // Always request contract code so the node caches the WASM locally.
                 // Without cached WASM, subsequent Subscribe requests will be rejected

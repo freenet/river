@@ -1637,7 +1637,13 @@ fn schedule_invite_retry(owner_vk: ed25519_dalek::VerifyingKey) {
                     crate::util::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     crate::util::defer(move || {
                         let fired = PENDING_INVITES.with_mut(|pending| {
-                            fire_invite_retry(pending, owner_vk, generation, &tx)
+                            fire_invite_retry(
+                                pending,
+                                owner_vk,
+                                generation,
+                                crate::components::app::sync_info::now_ms(),
+                                &tx,
+                            )
                         });
                         if fired {
                             SYNC_INFO.with_mut(|sync_info| {
@@ -1680,6 +1686,7 @@ pub(crate) fn fire_invite_retry(
     pending: &mut crate::invites::PendingInvites,
     owner_vk: ed25519_dalek::VerifyingKey,
     generation: u64,
+    now: f64,
     tx: &futures::channel::mpsc::UnboundedSender<
         crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage,
     >,
@@ -1687,7 +1694,7 @@ pub(crate) fn fire_invite_retry(
     let fired = pending
         .map
         .get_mut(&owner_vk)
-        .is_some_and(|join| join.fire_not_found_retry(generation));
+        .is_some_and(|join| join.fire_not_found_retry(generation, now));
     if fired {
         if let Err(e) = tx.unbounded_send(
             crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage::ProcessRooms,
@@ -3022,7 +3029,9 @@ mod tests {
                     pending.reset_stuck(now);
                     for vk in pending.awaiting_get() {
                         let i = rooms.iter().position(|r| *r == vk).unwrap();
-                        pending.begin_get(&vk, now).unwrap();
+                        if pending.begin_get(&vk, now).is_none() {
+                            continue;
+                        }
                         gets[i].push(now);
                         if let Some(latency_ms) = latency_ms {
                             queue.push((now + latency_ms, Ev::NotFound(i)));
@@ -3043,7 +3052,7 @@ mod tests {
                     }
                 }
                 Ev::RetryTimer(i, generation) => {
-                    fire_invite_retry(&mut pending, rooms[i], generation, &tx);
+                    fire_invite_retry(&mut pending, rooms[i], generation, now, &tx);
                 }
             }
             while let Ok(msg) = rx.try_recv() {
@@ -3188,6 +3197,59 @@ mod tests {
         assert!(g2 > g1, "a re-accept draws a new generation");
     }
 
+    /// A throttled or suspended tab can run a NotFound retry timer late. Past
+    /// the 180 s deadline, or with all 7 GETs spent, the timer shows the error
+    /// and requests nothing, and the next pass sends no GET.
+    #[test]
+    fn a_late_retry_timer_past_the_budget_shows_the_error() {
+        // (start of the budget, GETs already sent, when the timer fires)
+        for (gets_before, fire_at) in [(1u32, 181_000.0), (7, 50_000.0)] {
+            let room = SigningKey::from_bytes(&[14u8; 32]).verifying_key();
+            let mut pending = crate::invites::PendingInvites::default();
+            pending.map.insert(room, pending_join(room));
+            for t in 0..gets_before {
+                pending.begin_get(&room, t as f64).unwrap();
+            }
+            let generation = pending.map[&room].get_budget.generation;
+            // The timer was armed for this GET; the clock jumps before it fires.
+            let (tx, mut rx): (Tx, _) = futures::channel::mpsc::unbounded();
+            assert!(!fire_invite_retry(
+                &mut pending,
+                room,
+                generation,
+                fire_at,
+                &tx
+            ));
+            assert_eq!(
+                pending.map[&room].status,
+                PendingRoomStatus::Error(crate::invites::INVITE_NOT_FOUND_ERROR.to_string()),
+                "gets_before={gets_before}"
+            );
+            assert!(rx.try_recv().is_err(), "no pass requested");
+            assert!(pending.awaiting_get().is_empty(), "no GET is queued");
+        }
+    }
+
+    /// The send-time check: an invitation queued for a GET whose budget is
+    /// already spent sends nothing and shows the error.
+    #[test]
+    fn begin_get_refuses_a_spent_budget() {
+        for (gets_before, now) in [(1u32, 181_000.0), (7, 50_000.0)] {
+            let room = SigningKey::from_bytes(&[15u8; 32]).verifying_key();
+            let mut pending = crate::invites::PendingInvites::default();
+            pending.map.insert(room, pending_join(room));
+            for t in 0..gets_before {
+                pending.begin_get(&room, t as f64).unwrap();
+            }
+            pending.map.get_mut(&room).unwrap().status = PendingRoomStatus::PendingSubscription;
+            let sent_before = pending.map[&room].get_budget.gets_sent;
+            assert_eq!(pending.begin_get(&room, now), None);
+            let join = &pending.map[&room];
+            assert_eq!(join.get_budget.gets_sent, sent_before, "no GET charged");
+            assert!(matches!(join.status, PendingRoomStatus::Error(_)));
+        }
+    }
+
     /// A retry timer armed for an older GET does nothing once a newer GET
     /// is out, so two GETs for one invitation are never in flight.
     #[test]
@@ -3207,7 +3269,13 @@ mod tests {
         let join = pending.map.get_mut(&room).unwrap();
         join.get_budget.record_get_sent(1_000.0);
         let (tx, mut rx): (Tx, _) = futures::channel::mpsc::unbounded();
-        assert!(!fire_invite_retry(&mut pending, room, generation, &tx));
+        assert!(!fire_invite_retry(
+            &mut pending,
+            room,
+            generation,
+            1_000.0,
+            &tx
+        ));
         assert_eq!(
             pending.map[&room].status,
             PendingRoomStatus::Subscribing,
@@ -3217,7 +3285,13 @@ mod tests {
         // A timer for an invitation that already finished is a no-op too.
         let current = pending.map[&room].get_budget.generation;
         pending.map.get_mut(&room).unwrap().status = PendingRoomStatus::Subscribed;
-        assert!(!fire_invite_retry(&mut pending, room, current, &tx));
+        assert!(!fire_invite_retry(
+            &mut pending,
+            room,
+            current,
+            1_000.0,
+            &tx
+        ));
         assert!(rx.try_recv().is_err());
     }
 
@@ -3234,7 +3308,13 @@ mod tests {
         join.status = PendingRoomStatus::Subscribing;
         let generation = join.get_budget.record_get_sent(0.0);
         let (tx, mut rx): (Tx, _) = futures::channel::mpsc::unbounded();
-        assert!(fire_invite_retry(&mut pending, room, generation, &tx));
+        assert!(fire_invite_retry(
+            &mut pending,
+            room,
+            generation,
+            3_000.0,
+            &tx
+        ));
         assert_eq!(
             pending.map[&room].status,
             PendingRoomStatus::PendingSubscription

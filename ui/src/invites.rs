@@ -52,10 +52,16 @@ impl PendingInvites {
     }
 
     /// `process_rooms` is sending the GET for `vk`: mark it `Subscribing` and
-    /// charge it to the GET budget. Returns the retry count, or `None` for an
-    /// invitation that is gone.
+    /// charge it to the GET budget. Returns the retry count, or `None` when
+    /// no GET may go out: the invitation is gone, or its budget is spent
+    /// (then it shows the error). The budget is checked here, at send time,
+    /// because a throttled or suspended tab can run a retry timer late.
     pub(crate) fn begin_get(&mut self, vk: &VerifyingKey, now: f64) -> Option<u32> {
         let join = self.map.get_mut(vk)?;
+        if !join.get_budget.may_retry(now, 0) {
+            join.status = PendingRoomStatus::Error(INVITE_NOT_FOUND_ERROR.to_string());
+            return None;
+        }
         join.status = PendingRoomStatus::Subscribing;
         join.subscribing_since = Some(now);
         join.get_budget.record_get_sent(now);
@@ -219,10 +225,17 @@ impl PendingRoomJoin {
     /// A NotFound retry timer armed for `generation` fired. Re-queues the
     /// invitation only if it is still waiting on that same GET; returns
     /// whether it did. A newer GET or a finished invitation makes it a no-op.
-    pub fn fire_not_found_retry(&mut self, generation: u64) -> bool {
+    /// The budget is checked again at `now`: a throttled or suspended tab can
+    /// fire the timer late, and past the budget the invitation shows the
+    /// error instead.
+    pub fn fire_not_found_retry(&mut self, generation: u64, now: f64) -> bool {
         if matches!(self.status, PendingRoomStatus::Subscribing)
             && self.get_budget.generation == generation
         {
+            if !self.get_budget.may_retry(now, 0) {
+                self.status = PendingRoomStatus::Error(INVITE_NOT_FOUND_ERROR.to_string());
+                return false;
+            }
             self.status = PendingRoomStatus::PendingSubscription;
             self.subscribing_since = None;
             self.retry_count += 1;
