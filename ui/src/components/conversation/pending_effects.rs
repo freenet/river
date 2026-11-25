@@ -132,6 +132,7 @@ mod tests {
             author_badge: None,
             author_impersonation: None,
             is_self: true,
+            can_ban_newcomer: false,
             first_time: DateTime::<Utc>::UNIX_EPOCH,
             messages,
         })]

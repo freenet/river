@@ -50,6 +50,7 @@ mod mobile_message_actions;
 mod mobile_message_sheet;
 mod mobile_sheet_drag;
 mod mobile_surface;
+pub(crate) mod newcomer_ban;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use self::mobile_surface::any_open as mobile_surface_is_open;
 mod pending_effects;
@@ -280,6 +281,9 @@ struct MessageGroup {
     /// `a_shield_and_a_warning_can_both_render` pins the co-occurrence.
     author_impersonation: Option<ImpersonationWarning>,
     is_self: bool,
+    /// The menu offers "Ban newcomer" for this author (set after grouping, from
+    /// the room: [`newcomer_ban::can_ban_newcomer`]).
+    can_ban_newcomer: bool,
     /// The first message's time, for the day separators. The header's time is
     /// NOT this: it describes the first message still rendered, which a
     /// pending delete can change (see [`header_time_labels`]).
@@ -860,6 +864,7 @@ fn group_messages(
                 author_badge: deputy_badges.get(&author_id).cloned(),
                 author_impersonation,
                 is_self,
+                can_ban_newcomer: false,
                 first_time: message_time,
                 messages: vec![grouped_message],
             }));
@@ -1882,6 +1887,19 @@ pub fn Conversation() -> Element {
                         fallback_now: Utc::now(),
                     },
                 );
+                // Which authors the reader may ban as newcomers. One context
+                // per pass; a reader who may not ban builds nothing per group.
+                if let Ok(ctx) = newcomer_ban::BanContext::new(
+                    room_state,
+                    &key,
+                    room_data.self_verifying_key().as_ref(),
+                ) {
+                    for item in groups.iter_mut() {
+                        if let DisplayItem::Messages(group) = item {
+                            group.can_ban_newcomer = ctx.can_ban(group.author_id);
+                        }
+                    }
+                }
                 // The user's own edits, deletes and reactions still being
                 // signed show at once (`pending_effects.rs`). A contended
                 // read shows the committed state for this pass and nudges.
@@ -2446,7 +2464,12 @@ pub fn Conversation() -> Element {
                 MobileAction::Delete if group.is_self => {
                     on_group_request_delete.call(msg.message_id.clone());
                 }
-                MobileAction::Edit | MobileAction::Delete => {}
+                MobileAction::BanNewcomer if group.can_ban_newcomer => {
+                    if let Some(room) = CURRENT_ROOM.peek().owner_key {
+                        newcomer_ban::request_ban(room, group.author_id, group.author_name.clone());
+                    }
+                }
+                MobileAction::Edit | MobileAction::Delete | MobileAction::BanNewcomer => {}
             }
         },
     );
@@ -3533,6 +3556,7 @@ pub fn Conversation() -> Element {
                 }
             }
 
+            newcomer_ban::NewcomerBanDialog {}
             // Delete confirmation modal
             if pending_delete.read().is_some() {
                 div {
@@ -4253,6 +4277,7 @@ fn MessageGroupComponent(
     let avatar_style = avatar::avatar_style(author_hue);
     let author_is_owner = group.author_id == owner_id;
     let author_id = group.author_id;
+    let can_ban_newcomer = group.can_ban_newcomer;
     let open_author_info = move |_: MouseEvent| {
         crate::util::defer(move || {
             MEMBER_INFO_MODAL.with_mut(|signal| signal.member = Some(author_id));
@@ -4294,6 +4319,7 @@ fn MessageGroupComponent(
                             row: msg.id.clone(),
                             message: msg.message_id.clone(),
                             own: is_self,
+                            can_ban_newcomer,
                             current: user_reaction.clone(),
                         };
                         let tap_target = sheet_target.clone();
@@ -4731,6 +4757,7 @@ fn MessageGroupComponent(
                                         let reply_preview_source = msg.content_text.clone();
                                         let reply_preview_names = preview_names.clone();
                                         let reply_author_name = group.author_name.clone();
+                                        let ban_author_name = group.author_name.clone();
 
                                         let invoker_target = sheet_target.clone();
 
@@ -5057,6 +5084,25 @@ fn MessageGroupComponent(
                                                             crate::util::defer(move || on_reply.call(ctx));
                                                         },
                                                         {line_icon(REPLY_ICON_PATH, 18)}
+                                                    }
+                                                    if can_ban_newcomer {
+                                                        button {
+                                                            r#type: "button",
+                                                            "data-testid": "message-ban-newcomer-button",
+                                                            class: "msg-action",
+                                                            title: "Ban newcomer",
+                                                            "aria-label": "Ban newcomer",
+                                                            onclick: move |_| {
+                                                                if let Some(room) = CURRENT_ROOM.peek().owner_key {
+                                                                    newcomer_ban::request_ban(
+                                                                        room,
+                                                                        author_id,
+                                                                        ban_author_name.clone(),
+                                                                    );
+                                                                }
+                                                            },
+                                                            {line_icon(BAN_ICON_PATH, 17)}
+                                                        }
                                                     }
                                                     if is_self {
                                                         button {

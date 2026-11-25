@@ -7463,7 +7463,7 @@ fn provisional_ban_refusal(room_state: &ChatRoomStateV1) -> Option<String> {
         river_core::room_state::provisional::bans_cap(&room_state.configuration.configuration);
     (cap == 0).then(|| {
         "This room's max_provisional_bans is 0, so it holds no provisional bans. Set it \
-         (`room config --max-provisional-bans N`, 1 to 16) before banning an open-admission \
+         (`room config --max-provisional-bans N`, 1 to 24) before banning an open-admission \
          member."
             .to_string()
     })

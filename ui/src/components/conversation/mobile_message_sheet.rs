@@ -15,7 +15,8 @@
 //!   one row that scrolls sideways. A tap reacts, or on the reader's current
 //!   reaction removes it, and closes the sheet. It takes focus when the sheet
 //!   opens (the current reaction, centred in the row, else the first).
-//! - **Actions.** Reply, and Edit and Delete on your own message. Each closes
+//! - **Actions.** Reply, Ban newcomer on a newcomer's message when the reader
+//!   may ban one, and Edit and Delete on your own message. Each closes
 //!   the sheet first and then hands over to the existing flow (the composer's
 //!   reply, the inline editor via `edit_trigger`, the delete confirmation),
 //!   which takes focus. What an action does is decided when it runs, from the
@@ -28,7 +29,9 @@
 use super::emoji_picker::FREQUENT_EMOJIS;
 use super::mobile_surface::{dom, SHEET_ID, SHEET_TITLE};
 use super::reaction_picker::{choice_label, ReactionSurfaces};
-use crate::components::icons::{line_icon, DELETE_ICON_PATH, EDIT_ICON_PATH, REPLY_ICON_PATH};
+use crate::components::icons::{
+    line_icon, BAN_ICON_PATH, DELETE_ICON_PATH, EDIT_ICON_PATH, REPLY_ICON_PATH,
+};
 use dioxus::prelude::*;
 use river_core::room_state::message::MessageId;
 use std::cell::Cell;
@@ -47,6 +50,7 @@ pub(super) enum MobileAction {
     Reply,
     Edit,
     Delete,
+    BanNewcomer,
 }
 
 /// The conversation's one mobile message sheet. Rendered once by
@@ -61,6 +65,7 @@ pub(super) fn MobileMessageSheet(
     let opening = surfaces.mobile_for_render();
     let target = opening.as_ref().map(|o| &o.target);
     let own = target.is_some_and(|t| t.own);
+    let can_ban_newcomer = target.is_some_and(|t| t.can_ban_newcomer);
     let current = target.and_then(|t| t.current.clone());
     let target_row = target.map(|t| t.row.clone()).unwrap_or_default();
     // The opening this render shows (0: none, which no opening has). A
@@ -181,6 +186,16 @@ pub(super) fn MobileMessageSheet(
                         onclick: action(MobileAction::Reply),
                         {line_icon(REPLY_ICON_PATH, 20)}
                         span { "Reply" }
+                    }
+                    if can_ban_newcomer {
+                        button {
+                            r#type: "button",
+                            "data-testid": "mobile-message-action-ban-newcomer",
+                            class: "mobile-sheet-action mobile-sheet-action--danger",
+                            onclick: action(MobileAction::BanNewcomer),
+                            {line_icon(BAN_ICON_PATH, 20)}
+                            span { "Ban newcomer" }
+                        }
                     }
                     if own {
                         button {
