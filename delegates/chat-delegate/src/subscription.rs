@@ -423,6 +423,35 @@ pub(crate) fn handle_contract_notification(
         return Ok(vec![]);
     }
 
+    // Already distributed: if the current secret version already has a blob
+    // for exactly the current members (owner aside), a rotation was already
+    // published for this member set, whatever the local cache says. This
+    // bounds re-rotation when the cache cannot be written (see the end of
+    // this function). Version 0 never counts, so a new private room still
+    // gets its first rotation.
+    if new_state.secrets.current_version > 0 {
+        let owner_id = MemberId::from(&owner_vk);
+        let holders: std::collections::BTreeSet<MemberId> = new_state
+            .secrets
+            .encrypted_secrets
+            .iter()
+            .filter(|s| s.secret.secret_version == new_state.secrets.current_version)
+            .map(|s| s.secret.member_id)
+            .filter(|id| *id != owner_id)
+            .collect();
+        let members: std::collections::BTreeSet<MemberId> = current_members
+            .iter()
+            .copied()
+            .filter(|id| *id != owner_id)
+            .collect();
+        if holders == members {
+            logging::info(
+                "Current secret version already covers exactly the current members — no rotation",
+            );
+            return Ok(vec![]);
+        }
+    }
+
     // Determine the new version. We always derive from the notification's
     // current_version + 1 so concurrent rotations across replicas at least
     // converge on the highest observed version+1; at a version both paths
@@ -565,35 +594,60 @@ pub(crate) fn handle_contract_notification(
     );
     update_req.context = DelegateContext::default();
 
-    // Both writes happen BEFORE the update is handed back, so a refusal
-    // publishes nothing and advances nothing. The secret is a local copy
-    // (the owner can also recover it from the room's own blob), so this is
-    // a choice: a host that refuses writes pauses rotation, which resumes
-    // at the next notification (a room update), not on a timer. The
-    // member-set cache stops the next notification re-rotating, so it
-    // advances only once the rotation is certain to be emitted. The secret
-    // is deterministic for `(seed, owner, version)`: a retry stores the
-    // same bytes.
-    put_secret(
-        ctx,
-        &secret_keys::secret(&room_b58, new_version),
-        &secret,
-        "rotated room secret",
-    )
-    .map_err(|e| {
-        logging::info(&format!(
-            "Rotation of room {room_b58} to v{new_version} abandoned: {e:?}"
-        ));
-        e
-    })?;
-    update_member_set_cache(ctx, &room_b58, &new_state).map_err(|e| {
-        logging::info(&format!(
-            "Rotation of room {room_b58} to v{new_version} abandoned: {e:?}"
-        ));
-        e
-    })?;
+    // The rotation is returned whatever happens to the two local writes
+    // below: it is the step that cuts a removed member off, and it must not
+    // depend on a host that refuses writes. Neither write is read to decide
+    // whether to publish this update.
+    //
+    // - The secret copy is never read back (`secret_keys::secret` has no
+    //   reader); the owner recovers every version from the room's own blob.
+    //   A refused write is logged (version and room only, never the bytes).
+    // - The member-set cache only stops the NEXT notification from rotating
+    //   again. If it is refused, the next notification would rotate again,
+    //   and because our own update raises a notification, that could repeat
+    //   on every round trip. The "already distributed" check above bounds
+    //   that: once the published rotation is in the room state, the current
+    //   version's blob holders equal the current members, so it rotates no
+    //   more, whether or not the cache ever persisted.
+    //
+    // Both values are deterministic for `(seed, owner, version)` and the
+    // member set, so a retry stores the same bytes.
+    for warning in store_rotation_copies(ctx, &room_b58, new_version, &secret, &new_state) {
+        logging::info(&warning);
+    }
 
     Ok(vec![OutboundDelegateMsg::UpdateContractRequest(update_req)])
+}
+
+/// Store the local secret copy and the member-set cache after a rotation was
+/// built. Neither failure stops the rotation; each is returned as a warning
+/// for the caller to log (room and version only, never the secret bytes).
+fn store_rotation_copies(
+    ctx: &mut impl SecretStore,
+    room_b58: &str,
+    new_version: u32,
+    secret: &[u8; 32],
+    new_state: &ChatRoomStateV1,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if let Err(e) = put_secret(
+        ctx,
+        &secret_keys::secret(room_b58, new_version),
+        secret,
+        "rotated room secret",
+    ) {
+        warnings.push(format!(
+            "WARNING: rotation of room {room_b58} to v{new_version}: local secret copy \
+             not stored ({e:?}); the rotation is still published"
+        ));
+    }
+    if let Err(e) = update_member_set_cache(ctx, room_b58, new_state) {
+        warnings.push(format!(
+            "WARNING: rotation of room {room_b58} to v{new_version}: member-set cache \
+             not stored ({e:?}); the rotation is still published"
+        ));
+    }
+    warnings
 }
 
 fn update_member_set_cache(

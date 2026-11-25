@@ -40,7 +40,7 @@ use super::*;
 use ed25519_dalek::SigningKey;
 use freenet_stdlib::prelude::{
     ApplicationMessage, ContractInstanceId, ContractNotification, DelegateCtx, DelegateInterface,
-    InboundDelegateMsg, MessageOrigin, OutboundDelegateMsg, Parameters,
+    InboundDelegateMsg, MessageOrigin, OutboundDelegateMsg, Parameters, UpdateData,
 };
 use rand::rngs::OsRng;
 use river_core::chat_delegate::ChatDelegateRequestMsg;
@@ -1158,48 +1158,106 @@ fn rotation_succeeds_and_stores_the_secret_and_member_set() {
 }
 
 #[test]
-fn a_refused_secret_write_publishes_no_update_and_advances_nothing() {
+fn a_refused_secret_write_still_publishes_the_rotation_and_is_reported() {
     let (mut store, n, room) = rotation_fixture();
     store.refuse_prefixes = vec![secret_keys::secret(&room, 1)];
-    let out = handle_contract_notification(&mut store, n.clone());
+    let out = handle_contract_notification(&mut store, n.clone()).unwrap();
     assert!(
-        out.is_err(),
-        "a rotation whose secret cannot be stored must fail, not publish"
+        has_update(&out),
+        "the rotation must not depend on the local copy"
     );
-    assert!(!store.map.contains_key(&secret_keys::member_set(&room)));
     assert!(!store.map.contains_key(&secret_keys::secret(&room, 1)));
-
-    // The store recovers: the next notification rotates cleanly.
-    store.refuse_prefixes.clear();
-    let out = handle_contract_notification(&mut store, n).unwrap();
-    assert!(has_update(&out));
-    assert!(store.map.contains_key(&secret_keys::secret(&room, 1)));
+    // The cache still advances, so the next notification does not re-rotate.
     assert!(store.map.contains_key(&secret_keys::member_set(&room)));
+
+    // The failure is observable, and names no secret bytes.
+    let mut store2 = RefusingStore {
+        refuse_prefixes: vec![secret_keys::secret(&room, 1)],
+        ..Default::default()
+    };
+    let state: ChatRoomStateV1 = ciborium::from_reader(n.new_state.as_ref()).unwrap();
+    let secret = [0xABu8; 32];
+    let warnings = store_rotation_copies(&mut store2, &room, 1, &secret, &state);
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("local secret copy"));
+    assert!(!warnings[0].contains("171") && !warnings[0].contains("ab, ab"));
 }
 
 #[test]
-fn a_refused_member_set_write_publishes_no_update_and_a_retry_rotates() {
+fn a_refused_member_set_write_still_publishes_the_rotation_and_is_reported() {
     let (mut store, n, room) = rotation_fixture();
     store.refuse_prefixes = vec![secret_keys::member_set(&room)];
-    let out = handle_contract_notification(&mut store, n.clone());
-    assert!(
-        out.is_err(),
-        "a failed member-set write must fail the round"
-    );
-    assert!(!store.map.contains_key(&secret_keys::member_set(&room)));
-
-    // Not wedged: with the store back, the same notification rotates, and
-    // the secret it re-stores is the same bytes.
-    let before = store
-        .map
-        .get(&secret_keys::secret(&room, 1))
-        .cloned()
-        .expect("the secret was stored before the member-set write was refused");
-    store.refuse_prefixes.clear();
-    let out = handle_contract_notification(&mut store, n).unwrap();
+    let out = handle_contract_notification(&mut store, n.clone()).unwrap();
     assert!(has_update(&out));
-    assert!(store.map.contains_key(&secret_keys::member_set(&room)));
-    assert_eq!(store.map.get(&secret_keys::secret(&room, 1)), Some(&before));
+    assert!(!store.map.contains_key(&secret_keys::member_set(&room)));
+    assert!(store.map.contains_key(&secret_keys::secret(&room, 1)));
+
+    let mut store2 = RefusingStore {
+        refuse_prefixes: vec![secret_keys::member_set(&room)],
+        ..Default::default()
+    };
+    let state: ChatRoomStateV1 = ciborium::from_reader(n.new_state.as_ref()).unwrap();
+    let warnings = store_rotation_copies(&mut store2, &room, 1, &[1u8; 32], &state);
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("member-set cache"));
+}
+
+/// The room state after the delegate's published rotation was applied.
+fn apply_rotation(n: &ContractNotification, out: &[OutboundDelegateMsg]) -> ContractNotification {
+    let mut state: ChatRoomStateV1 = ciborium::from_reader(n.new_state.as_ref()).unwrap();
+    for m in out {
+        if let OutboundDelegateMsg::UpdateContractRequest(req) = m {
+            if let UpdateData::Delta(d) = &req.update {
+                let delta: river_core::room_state::ChatRoomStateV1Delta =
+                    ciborium::from_reader(d.as_ref()).unwrap();
+                let sd = delta.secrets.unwrap();
+                state.secrets.current_version = sd.current_version.unwrap();
+                state.secrets.versions.extend(sd.new_versions);
+                state
+                    .secrets
+                    .encrypted_secrets
+                    .extend(sd.new_encrypted_secrets);
+            }
+        }
+    }
+    ContractNotification {
+        new_state: freenet_stdlib::prelude::WrappedState::new(cbor(&state)),
+        ..n.clone()
+    }
+}
+
+#[test]
+fn writes_refused_every_time_still_publish_on_each_notification_and_do_not_wedge() {
+    let (mut store, n, room) = rotation_fixture();
+    // Every write to the delegate's secret store is refused, including the cache.
+    store.refuse_prefixes = vec![
+        secret_keys::SECRET_PREFIX.as_bytes().to_vec(),
+        secret_keys::member_set(&room),
+    ];
+    for _ in 0..3 {
+        let out = handle_contract_notification(&mut store, n.clone()).unwrap();
+        assert!(has_update(&out), "a refused store must not pause rotation");
+    }
+    assert!(!store.map.contains_key(&secret_keys::member_set(&room)));
+    assert!(!store.map.contains_key(&secret_keys::secret(&room, 1)));
+}
+
+#[test]
+fn a_cache_that_never_persists_does_not_re_rotate_once_the_rotation_is_applied() {
+    let (mut store, n, room) = rotation_fixture();
+    store.refuse_prefixes = vec![secret_keys::member_set(&room)];
+    let out = handle_contract_notification(&mut store, n.clone()).unwrap();
+    assert!(has_update(&out));
+    // Our own update raises the next notification; with no cache it must
+    // not rotate to v2, or every round trip would publish another version.
+    let n2 = apply_rotation(&n, &out);
+    for _ in 0..3 {
+        let out2 = handle_contract_notification(&mut store, n2.clone()).unwrap();
+        assert!(
+            !has_update(&out2),
+            "bounded: no re-rotation for the same member set"
+        );
+    }
 }
 
 #[test]
