@@ -1016,13 +1016,14 @@ fn start_blocker_in_runtime(owner_vk: &VerifyingKey) -> Option<JoinFailure> {
     use crate::components::app::chat_delegate::ROOMS_LOAD_STATE;
     // The example build has no delegate to load from: its rooms are all there
     // is, and the load state never leaves `Loading`.
-    let readiness = if cfg!(feature = "no-sync") {
-        JoinReadiness::Ready
-    } else {
-        ROOMS_LOAD_STATE
-            .try_peek()
-            .map(|s| join_readiness(*s))
-            .unwrap_or(JoinReadiness::Waiting)
+    let state = ROOMS_LOAD_STATE.try_peek().map(|s| *s);
+    let readiness = match state {
+        Ok(s) if join_readiness(s) == JoinReadiness::LoadFailed => JoinReadiness::LoadFailed,
+        // The example build has no delegate to load from: its load state never
+        // leaves `Loading`, and its rooms are all there is.
+        _ if cfg!(feature = "no-sync") => JoinReadiness::Ready,
+        Ok(s) => join_readiness(s),
+        Err(_) => JoinReadiness::Waiting,
     };
     match readiness {
         JoinReadiness::Ready => {}

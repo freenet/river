@@ -157,7 +157,7 @@ fn send_favicon_to_shell() {
 /// The room the reader has open: the room selected, or none while a room
 /// opened from a link is shown (that room is not in `ROOMS`, and the one
 /// selected before it is hidden behind it, so it is neither read nor named).
-fn open_room_key() -> Option<ed25519_dalek::VerifyingKey> {
+pub(crate) fn open_room_key() -> Option<ed25519_dalek::VerifyingKey> {
     let selected = CURRENT_ROOM.read().owner_key;
     if crate::public_room::viewed_now().is_some() {
         None
@@ -177,7 +177,9 @@ fn get_current_room_name() -> Option<String> {
     let rooms = ROOMS.try_read().ok()?;
     let room_data = rooms.map.get(&owner_key)?;
 
-    Some(room_data.display_name())
+    // Not `display_name`: until the room's state arrives that says "Loading
+    // room…", which does not belong in the tab title.
+    Some(room_data.display_name_for_text())
 }
 
 /// Count unread messages in a single room's [`RoomData`].

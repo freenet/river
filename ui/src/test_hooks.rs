@@ -240,6 +240,17 @@ pub fn install_test_hooks() {
         .into_js_value(),
     );
 
+    // Make the user's rooms look as if their load failed (the example build
+    // never loads any), to check that a join then refuses to start.
+    set_hook(
+        "failRoomsLoad",
+        Closure::<dyn FnMut()>::new(move || {
+            *crate::components::app::chat_delegate::ROOMS_LOAD_STATE.write() =
+                crate::components::app::chat_delegate::RoomsLoadState::LoadFailed;
+        })
+        .into_js_value(),
+    );
+
     // The join's phase: idle, solving, ready, submitting or failed. Lets a
     // test wait for "the proof finished" instead of sleeping.
     set_hook(

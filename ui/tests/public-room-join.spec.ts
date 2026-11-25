@@ -34,18 +34,14 @@ async function openRoom(page: Page, kind: Kind) {
 }
 
 // The first Send of a visitor asks for a display name (one prompt, prefilled).
-// Escape keeps the generated default, as a visitor who skips it does. Pass
-// `name` to choose one.
+// Continue without typing sends under the generated default, as a visitor who
+// skips it does. Pass `name` to choose one.
 async function sendFirst(page: Page, name?: string) {
   await page.getByTestId("viewed-room-send").click();
   const input = page.getByTestId("viewed-room-nickname-input");
   await expect(input).toBeVisible();
-  if (name === undefined) {
-    await input.press("Escape");
-  } else {
-    await input.fill(name);
-    await page.getByTestId("viewed-room-nickname-continue").click();
-  }
+  if (name !== undefined) await input.fill(name);
+  await page.getByTestId("viewed-room-nickname-continue").click();
   await expect(page.getByTestId("viewed-room-nickname-modal")).toHaveCount(0);
 }
 
@@ -114,7 +110,7 @@ test("a proof that finishes while the name prompt is open does not post under th
   expect(panics).toEqual([]);
 });
 
-test("Escape at the name prompt keeps the suggested name, and that is the name posted", async ({ page }) => {
+test("Continue without typing posts under the suggested name", async ({ page }) => {
   const panics = panicsOf(page);
   await openRoom(page, "open");
   await page.getByTestId("viewed-room-composer").fill("Skip the name");
@@ -123,10 +119,50 @@ test("Escape at the name prompt keeps the suggested name, and that is the name p
   await expect(input).toBeVisible();
   const suggested = await input.inputValue();
   expect(suggested.length).toBeGreaterThan(0);
-  await input.press("Escape");
+  await page.getByTestId("viewed-room-nickname-continue").click();
   await expect(page.getByTestId("viewed-room")).toHaveCount(0, { timeout: 30_000 });
   expect(await callRiverTest(page, "currentRoomSelfNickname")).toBe(suggested);
   expect(panics).toEqual([]);
+});
+
+test("Escape at the name prompt cancels: nothing is sent and the text stays in the box", async ({ page }) => {
+  const panics = panicsOf(page);
+  await openRoom(page, "open");
+  const composer = page.getByTestId("viewed-room-composer");
+  await composer.fill("Not yet");
+  await page.getByTestId("viewed-room-send").click();
+  await expect(page.getByTestId("viewed-room-nickname-input")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("viewed-room-nickname-modal")).toHaveCount(0);
+  await expect(composer).toHaveValue("Not yet");
+  await expect(page.getByTestId("viewed-room-pending-message")).toHaveCount(0);
+  // Give a wrongly queued message time to post before checking it did not.
+  await expect.poll(() => callRiverTest(page, "joinPhase")).toBe("ready");
+  await expect(page.getByTestId("viewed-room")).toBeVisible();
+  expect(await callRiverTest(page, "roomMessageCount", "Not yet")).toBe(0);
+  // Sending again asks again, and then sends.
+  await page.getByTestId("viewed-room-send").click();
+  await expect(page.getByTestId("viewed-room-nickname-input")).toBeVisible();
+  await page.getByTestId("viewed-room-nickname-continue").click();
+  await expect(page.getByTestId("viewed-room")).toHaveCount(0, { timeout: 30_000 });
+  expect(await callRiverTest(page, "roomMessageCount", "Not yet")).toBe(1);
+  expect(panics).toEqual([]);
+});
+
+test("Tab follows the focused control even after a click inside the dialog", async ({ page }) => {
+  await openRoom(page, "hard");
+  await callRiverTest(page, "holdSolver", true);
+  await page.getByTestId("viewed-room-composer").fill("Hello");
+  await page.getByTestId("viewed-room-send").click();
+  const input = page.getByLabel("Your display name");
+  const cont = page.getByTestId("viewed-room-nickname-continue");
+  await cont.focus();
+  // Click the input, then Tab: focus must go to Continue, not stay or skip.
+  await input.click();
+  await page.keyboard.press("Tab");
+  await expect(cont).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(input).toBeFocused();
 });
 
 test("the name prompt is a labelled dialog that keeps focus, and its buttons are touch sized", async ({ page }) => {
@@ -148,13 +184,13 @@ test("the name prompt is a labelled dialog that keeps focus, and its buttons are
   await expect(page.getByLabel("Your display name")).toBeFocused();
   const box = await page.getByTestId("viewed-room-nickname-continue").boundingBox();
   expect(box!.height).toBeGreaterThanOrEqual(44);
-  await expect(modal).toContainText("Escape keeps the suggested name");
-  // Closing it puts focus back in the composer.
+  // Closing it (Escape cancels) puts focus back in the composer.
+  await expect(modal).toContainText("Escape cancels");
   await page.keyboard.press("Escape");
   await expect(page.getByTestId("viewed-room-composer")).toBeFocused();
 });
 
-test("a ban that lands while the name prompt is open is shown, and Escape sends again", async ({ page }) => {
+test("a ban that lands while the name prompt is open is shown, and Continue sends again", async ({ page }) => {
   const panics = panicsOf(page);
   await openRoom(page, "hard");
   await callRiverTest(page, "holdSolver", true);
@@ -164,7 +200,7 @@ test("a ban that lands while the name prompt is open is shown, and Escape sends 
   await expect.poll(() => callRiverTest(page, "banJoiner", "hard")).toBe(true);
   await expect(page.getByTestId("viewed-room-join-error")).toContainText("banned", { timeout: 30_000 });
   // The text was never queued, so nothing is lost; answering sends it afresh.
-  await page.getByTestId("viewed-room-nickname-input").press("Escape");
+  await page.getByTestId("viewed-room-nickname-continue").click();
   await expect(page.getByTestId("viewed-room-pending-message")).toContainText("Still here");
   expect(await callRiverTest(page, "roomMessageCount", "Still here")).toBe(0);
   expect(panics).toEqual([]);
@@ -193,6 +229,25 @@ test("the way out is labelled and visible: the rail x on a wide screen, the head
   await expect(page.getByTestId("viewed-room-rail-row")).toHaveCount(1);
   await closeViewer(page);
   await expect(page.getByTestId("viewed-room")).toHaveCount(0);
+  // ... and the title goes back once the viewer is closed.
+  await expect(page).not.toHaveTitle(new RegExp(roomName));
+});
+
+test("when the user's rooms failed to load, a visitor is told to reload and nothing starts", async ({ page }) => {
+  const panics = panicsOf(page);
+  await openRoom(page, "open");
+  await callRiverTest(page, "failRoomsLoad");
+  const composer = page.getByTestId("viewed-room-composer");
+  await composer.fill("Might double up");
+  await page.getByTestId("viewed-room-send").click();
+  await expect(page.getByTestId("viewed-room-join-error")).toContainText("Reload this page");
+  // Nothing was queued or posted, no key was made, and the text is kept.
+  await expect(page.getByTestId("viewed-room-pending-message")).toHaveCount(0);
+  await expect(composer).toHaveValue("Might double up");
+  expect(await callRiverTest(page, "joinSessionKey")).toBe("");
+  expect(await callRiverTest(page, "roomMessageCount", "Might double up")).toBe(0);
+  await expect(page.getByTestId("viewed-room")).toBeVisible();
+  expect(panics).toEqual([]);
 });
 
 test("the display name chosen at the first message is the one posted", async ({ page }) => {

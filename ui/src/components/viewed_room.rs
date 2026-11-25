@@ -609,6 +609,26 @@ fn PublicRoomView(
     }
 }
 
+/// How the display-name prompt ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NameAnswer {
+    /// Escape: nothing is sent and the text stays in the box.
+    Cancel,
+    /// Enter or Continue: send now; `None` keeps the generated default.
+    Send(Option<String>),
+}
+
+/// The id of the control that has focus, if any.
+fn focused_id() -> String {
+    web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.active_element())
+        .map(|e| e.id())
+        .unwrap_or_default()
+}
+
+const NICKNAME_CONTINUE_ID: &str = "viewed-room-nickname-continue-button";
+
 /// What a confirmed name means: the default itself, or nothing, is "no
 /// choice", so the join keeps whatever default its own key gives.
 fn name_choice(default: &str, typed: &str) -> Option<String> {
@@ -624,7 +644,7 @@ fn name_choice(default: &str, typed: &str) -> Option<String> {
 /// with the generated default. Continue or Enter keeps what is in the box;
 /// Escape keeps the default. It never holds up the proof of work.
 #[component]
-fn NicknamePrompt(default: String, on_done: EventHandler<Option<String>>) -> Element {
+fn NicknamePrompt(default: String, on_done: EventHandler<NameAnswer>) -> Element {
     let mut nickname = use_signal({
         let default = default.clone();
         move || default
@@ -632,7 +652,6 @@ fn NicknamePrompt(default: String, on_done: EventHandler<Option<String>>) -> Ele
     // Focus is kept inside the dialog: the two controls take turns on Tab.
     let mut input_el = use_signal(|| None::<std::rc::Rc<MountedData>>);
     let mut button_el = use_signal(|| None::<std::rc::Rc<MountedData>>);
-    let mut on_button = use_signal(|| false);
     let has_emoji = contains_hidden_chars(&nickname.read());
     let too_long = nickname.read().len() > river_core::room_state::member_info::NICKNAME_CEILING;
     let disabled = invitation_accept_disabled(&nickname.read(), None);
@@ -646,23 +665,25 @@ fn NicknamePrompt(default: String, on_done: EventHandler<Option<String>>) -> Ele
                 "aria-modal": "true",
                 "aria-labelledby": "viewed-room-nickname-text",
                 class: "relative z-10 w-full max-w-md mx-4 bg-panel rounded-xl shadow-xl border border-border",
-                // Escape keeps the suggested name and sends, wherever focus is;
-                // Tab stays inside the dialog.
+                // Escape cancels (nothing is sent), wherever focus is; Tab stays
+                // inside the dialog.
                 onkeydown: {
                     let default = default.clone();
                     move |evt: KeyboardEvent| match evt.key() {
                         Key::Escape => {
                             evt.prevent_default();
-                            on_done.call(None);
+                            on_done.call(NameAnswer::Cancel);
                         }
-                        Key::Enter if !disabled && !*on_button.peek() => {
+                        Key::Enter if !disabled && focused_id() != NICKNAME_CONTINUE_ID => {
                             evt.prevent_default();
                             let name = nickname.peek().clone();
-                            on_done.call(name_choice(&default, &name));
+                            on_done.call(NameAnswer::Send(name_choice(&default, &name)));
                         }
                         Key::Tab => {
                             evt.prevent_default();
-                            let to_input = *on_button.peek() || disabled;
+                            // From the control that really has focus, so a click
+                            // inside the dialog cannot leave this out of step.
+                            let to_input = focused_id() == NICKNAME_CONTINUE_ID || disabled;
                             let target = if to_input { input_el.peek().clone() } else { button_el.peek().clone() };
                             if let Some(el) = target {
                                 crate::util::safe_spawn_local(async move {
@@ -705,7 +726,6 @@ fn NicknamePrompt(default: String, on_done: EventHandler<Option<String>>) -> Ele
                                     let _ = element.set_focus(true).await;
                                 });
                             },
-                            onfocus: move |_| on_button.set(false),
                             oninput: move |evt| nickname.set(evt.value()),
                             placeholder: "Your name (e.g. Alex)",
                         }
@@ -718,22 +738,22 @@ fn NicknamePrompt(default: String, on_done: EventHandler<Option<String>>) -> Ele
                             }
                         }
                         p { class: "mt-2 text-xs text-text-muted",
-                            "Enter or Continue sends your message with this name. Escape keeps the suggested name and sends."
+                            "Enter or Continue sends your message with this name. Escape cancels and keeps your message in the box."
                         }
                     }
                     div { class: "flex gap-3",
                         button {
                             r#type: "button",
+                            id: NICKNAME_CONTINUE_ID,
                             "data-testid": "viewed-room-nickname-continue",
                             class: "px-4 py-2 min-h-11 bg-surface hover:bg-surface-hover border border-border-hover text-text font-medium rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed",
                             disabled,
                             onmounted: move |cx| button_el.set(Some(cx.data())),
-                            onfocus: move |_| on_button.set(true),
                             onclick: {
                                 let default = default.clone();
                                 move |_| {
                                     let name = nickname.peek().clone();
-                                    on_done.call(name_choice(&default, &name));
+                                    on_done.call(NameAnswer::Send(name_choice(&default, &name)));
                                 }
                             },
                             "Continue"
@@ -838,17 +858,27 @@ pub(crate) fn JoinComposer(
         }
         do_send();
     };
-    let on_nickname = move |name: Option<String>| {
-        public_join::set_nickname(name);
+    let on_nickname = move |answer: NameAnswer| {
         nick_prompt.set(None);
         if let Some(el) = composer_el.peek().clone() {
             crate::util::safe_spawn_local(async move {
                 let _ = el.set_focus(true).await;
             });
         }
-        if *hold_send.peek() {
-            hold_send.set(false);
-            do_send();
+        match answer {
+            NameAnswer::Cancel => {
+                // Nothing was sent: the text is still in the box, and the next
+                // Send asks again. The proof may keep running.
+                hold_send.set(false);
+                nick_asked.set(false);
+            }
+            NameAnswer::Send(name) => {
+                public_join::set_nickname(name);
+                if *hold_send.peek() {
+                    hold_send.set(false);
+                    do_send();
+                }
+            }
         }
     };
 
