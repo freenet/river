@@ -213,8 +213,34 @@ pub fn composer_note(state: &ChatRoomStateV1) -> &'static str {
     if crate::public_join::offers_join(state) {
         "Your first message joins you."
     } else {
-        "You are viewing this room read-only. Joining needs an invitation from a member."
+        "Only invited people can write here. Ask a member for an invitation."
     }
+}
+
+/// Whether a room opened from a link is shown, and its name once the state has
+/// arrived. `None`: no viewer. `Some(None)`: the viewer is open but has no room
+/// to name yet. The tab title and the unread and read-marker logic use this so
+/// the room selected before the viewer opened is not treated as the open room.
+pub fn viewed_now() -> Option<Option<String>> {
+    let viewed = match VIEWED_ROOM.try_read() {
+        Ok(v) => v,
+        Err(_) => {
+            crate::util::signal_guard::schedule_nudge();
+            return None;
+        }
+    };
+    let viewed = viewed.as_ref()?;
+    Some(match &viewed.status {
+        ViewedRoomStatus::Public(state) => Some(
+            state
+                .configuration
+                .configuration
+                .display
+                .name
+                .to_string_lossy(),
+        ),
+        _ => None,
+    })
 }
 
 /// A request the pane sends.
@@ -1029,7 +1055,8 @@ mod tests {
     #[test]
     fn the_composer_note_follows_the_rooms_admission_setting() {
         let closed = state_with(PrivacyMode::Public);
-        assert!(composer_note(&closed).contains("needs an invitation"));
+        assert!(composer_note(&closed).contains("invitation"));
+        assert!(!composer_note(&closed).contains("read-only"));
         assert!(!composer_note(&closed).contains("coming"));
     }
 

@@ -78,6 +78,9 @@ pub enum JoinFailure {
     NotReady,
     /// The user already holds this room.
     AlreadyMember,
+    /// The user's rooms failed to load, so it is not known whether they are
+    /// already in this room: a join could mint a second identity in it.
+    RoomsNotLoaded,
     /// The browser could not hash.
     Internal(String),
 }
@@ -97,6 +100,9 @@ impl JoinFailure {
                 .to_string(),
             Self::NotReady => "Your rooms are still loading. Try again in a moment.".to_string(),
             Self::AlreadyMember => "You are already in this room.".to_string(),
+            Self::RoomsNotLoaded => {
+                "We couldn't load your rooms yet. Reload this page to send a message.".to_string()
+            }
             Self::NotOpen => "This room no longer admits new members this way. \
                 Ask a member for an invitation."
                 .to_string(),
@@ -951,6 +957,19 @@ pub fn session_member_vk() -> Option<VerifyingKey> {
 #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
 pub static HOLD_SOLVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The join's phase by name (test hook).
+#[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+pub fn phase_name() -> String {
+    match machine().phase {
+        JoinPhase::Idle => "idle",
+        JoinPhase::Solving { .. } => "solving",
+        JoinPhase::Ready => "ready",
+        JoinPhase::Submitting => "submitting",
+        JoinPhase::Failed(_) => "failed",
+    }
+    .to_string()
+}
+
 /// Forget the join: it is over, or the viewer closed. Messages not yet in the
 /// room go back to their composer.
 pub fn reset() {
@@ -960,6 +979,31 @@ pub fn reset() {
 /// Cancel solving. The queued messages return to the draft box.
 pub fn cancel() {
     step(|m| m.cancel());
+}
+
+/// Whether the user's rooms are known well enough to start a join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinReadiness {
+    Ready,
+    /// Still loading or migrating: wait.
+    Waiting,
+    /// The load failed: the visitor may already belong to this room, so no
+    /// join starts. Viewing is unaffected (`viewed_room::load_settled`).
+    LoadFailed,
+}
+
+/// The join's reading of the rooms load state. Stricter than the viewer's
+/// (`viewed_room::load_settled`), which shows a room to anyone once nothing
+/// more will arrive.
+pub fn join_readiness(
+    state: crate::components::app::chat_delegate::RoomsLoadState,
+) -> JoinReadiness {
+    use crate::components::app::chat_delegate::RoomsLoadState as S;
+    match state {
+        S::Loaded => JoinReadiness::Ready,
+        S::Loading | S::Migrating => JoinReadiness::Waiting,
+        S::LoadFailed => JoinReadiness::LoadFailed,
+    }
 }
 
 /// A room's own messages and rooms loading are both needed before a join can
@@ -972,16 +1016,18 @@ fn start_blocker_in_runtime(owner_vk: &VerifyingKey) -> Option<JoinFailure> {
     use crate::components::app::chat_delegate::ROOMS_LOAD_STATE;
     // The example build has no delegate to load from: its rooms are all there
     // is, and the load state never leaves `Loading`.
-    // Settled, not only `Loaded`: when the load failed the viewer still shows
-    // the room (`viewed_room::load_settled`), and joining must not then fail
-    // with "still loading" forever.
-    let loaded = cfg!(feature = "no-sync")
-        || ROOMS_LOAD_STATE
+    let readiness = if cfg!(feature = "no-sync") {
+        JoinReadiness::Ready
+    } else {
+        ROOMS_LOAD_STATE
             .try_peek()
-            .map(|s| crate::components::viewed_room::load_settled(*s))
-            .unwrap_or(false);
-    if !loaded {
-        return Some(JoinFailure::NotReady);
+            .map(|s| join_readiness(*s))
+            .unwrap_or(JoinReadiness::Waiting)
+    };
+    match readiness {
+        JoinReadiness::Ready => {}
+        JoinReadiness::Waiting => return Some(JoinFailure::NotReady),
+        JoinReadiness::LoadFailed => return Some(JoinFailure::RoomsNotLoaded),
     }
     match crate::components::app::ROOMS.try_peek() {
         Ok(rooms) if rooms.map.contains_key(owner_vk) => Some(JoinFailure::AlreadyMember),
@@ -1939,6 +1985,7 @@ mod tests {
             JoinFailure::NoKey,
             JoinFailure::NotReady,
             JoinFailure::AlreadyMember,
+            JoinFailure::RoomsNotLoaded,
             JoinFailure::Internal("Err(Variant { x: 1 })".into()),
         ] {
             let m = f.message().to_lowercase();
@@ -1956,6 +2003,29 @@ mod tests {
                 assert!(!m.contains(bad), "{f:?} says {bad:?}: {m}");
             }
         }
+    }
+
+    #[test]
+    fn viewing_and_joining_read_the_rooms_load_state_differently() {
+        use crate::components::app::chat_delegate::RoomsLoadState as S;
+        use crate::components::viewed_room::load_settled;
+        // (state, may view, join readiness)
+        for (state, view, join) in [
+            (S::Loading, false, JoinReadiness::Waiting),
+            (S::Migrating, false, JoinReadiness::Waiting),
+            (S::Loaded, true, JoinReadiness::Ready),
+            (S::LoadFailed, true, JoinReadiness::LoadFailed),
+        ] {
+            assert_eq!(load_settled(state), view, "{state:?} view");
+            assert_eq!(join_readiness(state), join, "{state:?} join");
+        }
+        assert!(
+            !JoinFailure::RoomsNotLoaded.retryable(),
+            "reload, not retry"
+        );
+        assert!(JoinFailure::RoomsNotLoaded
+            .message()
+            .contains("Reload this page"));
     }
 
     #[test]

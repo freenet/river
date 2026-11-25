@@ -154,8 +154,23 @@ fn send_favicon_to_shell() {
     let _ = target.post_message(&msg, "*");
 }
 
+/// The room the reader has open: the room selected, or none while a room
+/// opened from a link is shown (that room is not in `ROOMS`, and the one
+/// selected before it is hidden behind it, so it is neither read nor named).
+fn open_room_key() -> Option<ed25519_dalek::VerifyingKey> {
+    let selected = CURRENT_ROOM.read().owner_key;
+    if crate::public_room::viewed_now().is_some() {
+        None
+    } else {
+        selected
+    }
+}
+
 /// Get the current room name (decrypted if private)
 fn get_current_room_name() -> Option<String> {
+    if let Some(viewed) = crate::public_room::viewed_now() {
+        return viewed;
+    }
     let current_room = CURRENT_ROOM.read();
     let owner_key = current_room.owner_key?;
 
@@ -682,7 +697,8 @@ pub fn count_unread_in_current_room() -> CurrentRoomUnread {
         crate::util::signal_guard::schedule_nudge();
         return CurrentRoomUnread::default();
     };
-    let Some(current) = current.owner_key else {
+    let current = current.owner_key;
+    let Some(current) = current.filter(|_| crate::public_room::viewed_now().is_none()) else {
         return CurrentRoomUnread::default();
     };
     let Ok(rooms) = ROOMS.try_read() else {
@@ -728,7 +744,7 @@ pub fn count_unread_behind_rooms_panel() -> usize {
     // instead of waiting on an unrelated CURRENT_ROOM change. See
     // `unread_wrappers_anchor_and_nudge` below for the pin.
     crate::util::signal_guard::anchor();
-    let current = CURRENT_ROOM.read().owner_key;
+    let current = open_room_key();
     let Ok(rooms) = ROOMS.try_read() else {
         crate::util::signal_guard::schedule_nudge();
         return 0;
@@ -775,7 +791,7 @@ pub fn update_document_title() {
 /// on screen, so an arrival below the fold stays unread until the reader
 /// reaches it. See [`read_marker_update`] for the decision.
 fn mark_current_room_as_read() {
-    let current_owner_key = CURRENT_ROOM.read().owner_key;
+    let current_owner_key = open_room_key();
     // Fallible like `ROOMS` below: in the title effect this read is the
     // subscription to what the reader has seen, and the anchor there keeps the
     // effect alive for the nudge (freenet/river#555).
@@ -914,7 +930,7 @@ fn hide_actions(
 /// across all rooms, matching what the room-list and hamburger badges already
 /// show. See the freenet/river#446 PR description.
 fn mark_current_room_as_read_on_hide() {
-    let current_owner_key = CURRENT_ROOM.read().owner_key;
+    let current_owner_key = open_room_key();
     // A contended read marks nothing (the title effect marks what was seen
     // anyway) and still flushes.
     let seen = NEWEST_SEEN.try_read().ok().and_then(|seen| seen.clone());
@@ -1053,6 +1069,38 @@ pub fn DocumentTitleUpdater() -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// While a room opened from a link is shown, the room selected before it
+    /// is not the open room: the read rule, the hide flush, the current-room
+    /// count, the rooms-panel count and the title all go through
+    /// `open_room_key` / `viewed_now`, never straight to `CURRENT_ROOM`.
+    #[test]
+    fn the_open_room_logic_knows_about_the_link_viewer() {
+        let src = include_str!("document_title.rs");
+        let prod = src.rsplit_once("#[cfg(test)]\nmod tests").unwrap().0;
+        for f in [
+            "fn mark_current_room_as_read()",
+            "fn mark_current_room_as_read_on_hide()",
+            "pub fn count_unread_behind_rooms_panel()",
+        ] {
+            let at = prod.find(f).unwrap_or_else(|| panic!("{f} not found"));
+            let body = &prod[at..at + 1500.min(prod.len() - at)];
+            let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+            assert!(body.contains("open_room_key()"), "{f} ignores the viewer");
+            assert!(
+                !body.contains("CURRENT_ROOM.read().owner_key"),
+                "{f} reads CURRENT_ROOM directly"
+            );
+        }
+        for f in [
+            "fn get_current_room_name()",
+            "pub fn count_unread_in_current_room()",
+        ] {
+            let at = prod.find(f).unwrap();
+            let body = &prod[at..at + 900.min(prod.len() - at)];
+            assert!(body.contains("viewed_now()"), "{f} ignores the viewer");
+        }
+    }
 
     /// Source-grep pin (freenet/river#500 review C2): every cross-room total
     /// must go through the MODE-AWARE sum.

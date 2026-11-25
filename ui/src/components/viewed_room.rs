@@ -429,7 +429,7 @@ pub fn ViewedRailRow() -> Element {
                 button {
                     r#type: "button",
                     "data-testid": "viewed-room-close",
-                    class: "flex-shrink-0 mx-1 w-7 h-7 rounded-lg text-text-muted hover:text-text hover:bg-surface transition-colors",
+                    class: "flex-shrink-0 mx-1 w-7 h-7 pointer-coarse:w-11 pointer-coarse:h-11 rounded-lg text-text-muted hover:text-text hover:bg-surface transition-colors",
                     title: CLOSE_LABEL,
                     "aria-label": CLOSE_LABEL,
                     onclick: move |_| close(),
@@ -477,7 +477,7 @@ fn PublicRoomView(
             div { class: "flex items-center justify-between gap-2 md:gap-3",
                 button {
                     r#type: "button",
-                    class: "md:hidden flex-shrink-0 mr-1 p-2 rounded-lg text-text-muted hover:text-text hover:bg-surface transition-colors",
+                    class: "md:hidden flex-shrink-0 mr-1 p-2 min-w-11 min-h-11 rounded-lg text-text-muted hover:text-text hover:bg-surface transition-colors",
                     "aria-label": "Open room list",
                     onclick: move |_| crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Rooms),
                     {line_icon(MENU_ICON_PATH, 20)}
@@ -494,7 +494,7 @@ fn PublicRoomView(
                 }
                 button {
                     r#type: "button",
-                    class: "md:hidden flex-shrink-0 px-2 py-1 rounded-lg text-xs text-text-muted hover:text-text hover:bg-surface transition-colors",
+                    class: "md:hidden flex-shrink-0 px-2 min-h-11 rounded-lg text-xs text-text-muted hover:text-text hover:bg-surface transition-colors",
                     "data-testid": "viewed-room-members-button",
                     onclick: move |_| crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Members),
                     "{member_count_label(member_count)}"
@@ -509,7 +509,7 @@ fn PublicRoomView(
                 button {
                     r#type: "button",
                     "data-testid": "viewed-room-close-narrow",
-                    class: "md:hidden flex-shrink-0 w-8 h-8 rounded-lg text-text-muted hover:text-text hover:bg-surface transition-colors",
+                    class: "md:hidden flex-shrink-0 w-11 h-11 rounded-lg text-text-muted hover:text-text hover:bg-surface transition-colors",
                     title: CLOSE_LABEL,
                     "aria-label": CLOSE_LABEL,
                     onclick: move |_| close(),
@@ -629,6 +629,10 @@ fn NicknamePrompt(default: String, on_done: EventHandler<Option<String>>) -> Ele
         let default = default.clone();
         move || default
     });
+    // Focus is kept inside the dialog: the two controls take turns on Tab.
+    let mut input_el = use_signal(|| None::<std::rc::Rc<MountedData>>);
+    let mut button_el = use_signal(|| None::<std::rc::Rc<MountedData>>);
+    let mut on_button = use_signal(|| false);
     let has_emoji = contains_hidden_chars(&nickname.read());
     let too_long = nickname.read().len() > river_core::room_state::member_info::NICKNAME_CEILING;
     let disabled = invitation_accept_disabled(&nickname.read(), None);
@@ -638,16 +642,53 @@ fn NicknamePrompt(default: String, on_done: EventHandler<Option<String>>) -> Ele
             div { class: "absolute inset-0 bg-black/50" }
             div {
                 "data-testid": "viewed-room-nickname-modal",
+                role: "dialog",
+                "aria-modal": "true",
+                "aria-labelledby": "viewed-room-nickname-text",
                 class: "relative z-10 w-full max-w-md mx-4 bg-panel rounded-xl shadow-xl border border-border",
+                // Escape keeps the suggested name and sends, wherever focus is;
+                // Tab stays inside the dialog.
+                onkeydown: {
+                    let default = default.clone();
+                    move |evt: KeyboardEvent| match evt.key() {
+                        Key::Escape => {
+                            evt.prevent_default();
+                            on_done.call(None);
+                        }
+                        Key::Enter if !disabled && !*on_button.peek() => {
+                            evt.prevent_default();
+                            let name = nickname.peek().clone();
+                            on_done.call(name_choice(&default, &name));
+                        }
+                        Key::Tab => {
+                            evt.prevent_default();
+                            let to_input = *on_button.peek() || disabled;
+                            let target = if to_input { input_el.peek().clone() } else { button_el.peek().clone() };
+                            if let Some(el) = target {
+                                crate::util::safe_spawn_local(async move {
+                                    let _ = el.set_focus(true).await;
+                                });
+                            }
+                        }
+                        _ => {}
+                    }
+                },
                 div { class: "p-6",
-                    p { class: "text-[13px] text-text-muted mb-4",
+                    p {
+                        id: "viewed-room-nickname-text",
+                        class: "text-[13px] text-text-muted mb-4",
                         "Choose "
                         span { class: "text-text font-medium", "your own display name" }
                         " (not the room's name). It's what other members will see when you send messages:"
                     }
                     div { class: "mb-4",
-                        label { class: "block text-sm font-medium text-text mb-1", "Your display name" }
+                        label {
+                            r#for: "viewed-room-nickname-field",
+                            class: "block text-sm font-medium text-text mb-1",
+                            "Your display name"
+                        }
                         input {
+                            id: "viewed-room-nickname-field",
                             "data-testid": "viewed-room-nickname-input",
                             class: if has_emoji {
                                 "w-full px-3 py-2 bg-surface border border-danger rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-danger focus:border-transparent"
@@ -659,24 +700,13 @@ fn NicknamePrompt(default: String, on_done: EventHandler<Option<String>>) -> Ele
                             value: "{nickname}",
                             onmounted: move |cx| {
                                 let element = cx.data();
+                                input_el.set(Some(element.clone()));
                                 crate::util::safe_spawn_local(async move {
                                     let _ = element.set_focus(true).await;
                                 });
                             },
+                            onfocus: move |_| on_button.set(false),
                             oninput: move |evt| nickname.set(evt.value()),
-                            onkeydown: {
-                                let default = default.clone();
-                                move |evt: KeyboardEvent| {
-                                if evt.key() == Key::Enter && !disabled {
-                                    evt.prevent_default();
-                                    let name = nickname.peek().clone();
-                                    on_done.call(name_choice(&default, &name));
-                                } else if evt.key() == Key::Escape {
-                                    evt.prevent_default();
-                                    on_done.call(None);
-                                }
-                                }
-                            },
                             placeholder: "Your name (e.g. Alex)",
                         }
                         if has_emoji {
@@ -687,16 +717,24 @@ fn NicknamePrompt(default: String, on_done: EventHandler<Option<String>>) -> Ele
                                 "That display name is too long."
                             }
                         }
+                        p { class: "mt-2 text-xs text-text-muted",
+                            "Enter or Continue sends your message with this name. Escape keeps the suggested name and sends."
+                        }
                     }
                     div { class: "flex gap-3",
                         button {
                             r#type: "button",
                             "data-testid": "viewed-room-nickname-continue",
-                            class: "px-4 py-2 bg-surface hover:bg-surface-hover border border-border-hover text-text font-medium rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed",
+                            class: "px-4 py-2 min-h-11 bg-surface hover:bg-surface-hover border border-border-hover text-text font-medium rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed",
                             disabled,
-                            onclick: move |_| {
-                                let name = nickname.peek().clone();
-                                on_done.call(name_choice(&default, &name));
+                            onmounted: move |cx| button_el.set(Some(cx.data())),
+                            onfocus: move |_| on_button.set(true),
+                            onclick: {
+                                let default = default.clone();
+                                move |_| {
+                                    let name = nickname.peek().clone();
+                                    on_done.call(name_choice(&default, &name));
+                                }
                             },
                             "Continue"
                         }
@@ -725,6 +763,8 @@ pub(crate) fn JoinComposer(
     let mut nick_prompt = use_signal(|| None::<String>);
     let mut nick_asked = use_signal(|| false);
     let mut hold_send = use_signal(|| false);
+    // Focus goes back to the composer when the prompt closes.
+    let mut composer_el = use_signal(|| None::<std::rc::Rc<MountedData>>);
 
     // Text handed back after a failure, cancel or close returns to the draft in
     // front of what was typed since. The text is taken from the join itself,
@@ -801,6 +841,11 @@ pub(crate) fn JoinComposer(
     let on_nickname = move |name: Option<String>| {
         public_join::set_nickname(name);
         nick_prompt.set(None);
+        if let Some(el) = composer_el.peek().clone() {
+            crate::util::safe_spawn_local(async move {
+                let _ = el.set_focus(true).await;
+            });
+        }
         if *hold_send.peek() {
             hold_send.set(false);
             do_send();
@@ -876,6 +921,7 @@ pub(crate) fn JoinComposer(
                     rows: "1",
                     placeholder: "Write a message",
                     value: "{draft}",
+                    onmounted: move |cx| composer_el.set(Some(cx.data())),
                     onfocus: move |_| wake(),
                     oninput: move |evt| {
                         let value = evt.value();

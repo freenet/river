@@ -35,7 +35,8 @@ test("a public room opens read-only, with messages and a disabled composer", asy
   await expect(page.getByTestId("viewed-room-message").first()).toBeVisible();
   expect(await page.getByTestId("viewed-room-message").count()).toBeGreaterThan(3);
   await expect(page.getByTestId("viewed-room-composer")).toBeDisabled();
-  await expect(page.getByTestId("viewed-room-composer-note")).toContainText("read-only");
+  await expect(page.getByTestId("viewed-room-composer-note")).toContainText("invitation");
+  await expect(page.getByTestId("viewed-room-composer-note")).not.toContainText("read-only");
   // No member identity was needed: nothing offers to send.
   await expect(page.getByTestId("send-message-button")).toHaveCount(0);
   expect(panics).toEqual([]);

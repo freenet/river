@@ -240,6 +240,14 @@ pub fn install_test_hooks() {
         .into_js_value(),
     );
 
+    // The join's phase: idle, solving, ready, submitting or failed. Lets a
+    // test wait for "the proof finished" instead of sleeping.
+    set_hook(
+        "joinPhase",
+        Closure::<dyn FnMut() -> String>::new(move || crate::public_join::phase_name())
+            .into_js_value(),
+    );
+
     // Base58 of the verifying key the join in progress holds, "" when none:
     // empty after a cancel, ban or failure means no key was kept.
     set_hook(

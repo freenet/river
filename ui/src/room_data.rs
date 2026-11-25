@@ -819,6 +819,24 @@ impl RoomData {
         })
     }
 
+    /// The room's name for text that leaves the screen or labels something
+    /// other than the room itself (an invitation message, a direct-message
+    /// title or card, the invite picker). Until the room's state has arrived
+    /// `display_name` says "Loading room…", which belongs on a rail row but
+    /// not in a message someone else will read: use the owner key's prefix.
+    pub fn display_name_for_text(&self) -> String {
+        if self.is_awaiting_initial_sync() {
+            let prefix: String = bs58::encode(self.owner_vk.as_bytes())
+                .into_string()
+                .chars()
+                .take(8)
+                .collect();
+            format!("Room {prefix}")
+        } else {
+            self.display_name()
+        }
+    }
+
     /// Get the current (latest) secret for encryption/decryption
     pub fn get_secret(&self) -> Option<(&[u8; 32], u32)> {
         self.current_secret_version
@@ -6645,6 +6663,53 @@ mod tests {
             rekey_merge: Default::default(),
             own_purges: Default::default(),
             invitation_secrets: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn text_that_leaves_the_screen_never_says_loading_room() {
+        let mut rng = rand::thread_rng();
+        let vk = SigningKey::generate(&mut rng).verifying_key();
+        let waiting = test_minimal_room_data(vk);
+        assert_eq!(waiting.display_name(), "Loading room\u{2026}");
+        let text = waiting.display_name_for_text();
+        assert!(text.starts_with("Room "), "{text}");
+        assert!(!text.contains("Loading"), "{text}");
+        assert_eq!(text.chars().count(), "Room ".len() + 8);
+    }
+
+    /// The callers whose output leaves the screen or is not a rail row must
+    /// use the text form, so a room still awaiting its state is never named
+    /// "Loading room…" in an invitation or a direct-message label.
+    #[test]
+    fn invitation_and_dm_callers_use_the_text_name() {
+        for (file, src) in [
+            (
+                "members/invite_member_modal.rs",
+                include_str!("components/members/invite_member_modal.rs"),
+            ),
+            (
+                "direct_messages/dm_thread_modal.rs",
+                include_str!("components/direct_messages/dm_thread_modal.rs"),
+            ),
+            (
+                "direct_messages/invite_via_dm_picker_modal.rs",
+                include_str!("components/direct_messages/invite_via_dm_picker_modal.rs"),
+            ),
+            (
+                "room_list/dm_rail_section.rs",
+                include_str!("components/room_list/dm_rail_section.rs"),
+            ),
+        ] {
+            let prod = src.split("#[cfg(test)]").next().unwrap();
+            assert!(
+                prod.contains("display_name_for_text()"),
+                "{file} must use display_name_for_text"
+            );
+            assert!(
+                !prod.contains(".display_name()"),
+                "{file} still calls display_name() for text"
+            );
         }
     }
 

@@ -1,5 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
-import { closeViewer, waitForApp, panicsOf } from "./example-room";
+import { CLOSE_VIEWER_LABEL, closeViewer, waitForApp, panicsOf } from "./example-room";
 import { callRiverTest } from "./river-test";
 
 // freenet/river#975 step 2: join a public room from inside the read-only view
@@ -101,7 +101,8 @@ test("a proof that finishes while the name prompt is open does not post under th
   await expect(input).toBeVisible();
   // The proof finishes while the visitor is still choosing a name.
   await callRiverTest(page, "holdSolver", false);
-  await page.waitForTimeout(1500);
+  // Wait for the event, not the clock: the proof is done, nothing was queued.
+  await expect.poll(() => callRiverTest(page, "joinPhase")).toBe("ready");
   await expect(page.getByTestId("viewed-room-nickname-modal")).toBeVisible();
   await expect(page.getByTestId("viewed-room")).toBeVisible();
   expect(await callRiverTest(page, "roomMessageCount", "Slow proof")).toBe(0);
@@ -111,6 +112,87 @@ test("a proof that finishes while the name prompt is open does not post under th
   expect(await callRiverTest(page, "roomMessageCount", "Slow proof")).toBe(1);
   expect(await callRiverTest(page, "currentRoomSelfNickname")).toBe("Quinn");
   expect(panics).toEqual([]);
+});
+
+test("Escape at the name prompt keeps the suggested name, and that is the name posted", async ({ page }) => {
+  const panics = panicsOf(page);
+  await openRoom(page, "open");
+  await page.getByTestId("viewed-room-composer").fill("Skip the name");
+  await page.getByTestId("viewed-room-send").click();
+  const input = page.getByTestId("viewed-room-nickname-input");
+  await expect(input).toBeVisible();
+  const suggested = await input.inputValue();
+  expect(suggested.length).toBeGreaterThan(0);
+  await input.press("Escape");
+  await expect(page.getByTestId("viewed-room")).toHaveCount(0, { timeout: 30_000 });
+  expect(await callRiverTest(page, "currentRoomSelfNickname")).toBe(suggested);
+  expect(panics).toEqual([]);
+});
+
+test("the name prompt is a labelled dialog that keeps focus, and its buttons are touch sized", async ({ page }) => {
+  await openRoom(page, "hard");
+  await callRiverTest(page, "holdSolver", true);
+  await page.getByTestId("viewed-room-composer").fill("Hello");
+  await page.getByTestId("viewed-room-send").click();
+  const modal = page.getByTestId("viewed-room-nickname-modal");
+  await expect(modal).toHaveAttribute("role", "dialog");
+  await expect(modal).toHaveAttribute("aria-modal", "true");
+  const labelled = await modal.getAttribute("aria-labelledby");
+  await expect(page.locator(`#${labelled}`)).toContainText("display name");
+  // The label is tied to the input, and the input has focus.
+  await expect(page.getByLabel("Your display name")).toBeFocused();
+  // Tab stays inside the dialog.
+  await page.keyboard.press("Tab");
+  await expect(page.getByTestId("viewed-room-nickname-continue")).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(page.getByLabel("Your display name")).toBeFocused();
+  const box = await page.getByTestId("viewed-room-nickname-continue").boundingBox();
+  expect(box!.height).toBeGreaterThanOrEqual(44);
+  await expect(modal).toContainText("Escape keeps the suggested name");
+  // Closing it puts focus back in the composer.
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("viewed-room-composer")).toBeFocused();
+});
+
+test("a ban that lands while the name prompt is open is shown, and Escape sends again", async ({ page }) => {
+  const panics = panicsOf(page);
+  await openRoom(page, "hard");
+  await callRiverTest(page, "holdSolver", true);
+  await page.getByTestId("viewed-room-composer").fill("Still here");
+  await page.getByTestId("viewed-room-send").click();
+  await expect(page.getByTestId("viewed-room-nickname-modal")).toBeVisible();
+  await expect.poll(() => callRiverTest(page, "banJoiner", "hard")).toBe(true);
+  await expect(page.getByTestId("viewed-room-join-error")).toContainText("banned", { timeout: 30_000 });
+  // The text was never queued, so nothing is lost; answering sends it afresh.
+  await page.getByTestId("viewed-room-nickname-input").press("Escape");
+  await expect(page.getByTestId("viewed-room-pending-message")).toContainText("Still here");
+  expect(await callRiverTest(page, "roomMessageCount", "Still here")).toBe(0);
+  expect(panics).toEqual([]);
+});
+
+test("the way out is labelled and visible: the rail x on a wide screen, the header x on a narrow one", async ({ page }) => {
+  await openRoom(page, "open");
+  const wide = (page.viewportSize()?.width ?? 0) >= 768;
+  const rail = page.getByTestId("viewed-room-close");
+  const narrow = page.getByTestId("viewed-room-close-narrow");
+  const shown = wide ? rail : narrow;
+  const hidden = wide ? narrow : rail;
+  await expect(shown).toBeVisible();
+  await expect(hidden).toBeHidden();
+  await expect(shown).toHaveAttribute("aria-label", CLOSE_VIEWER_LABEL);
+  await expect(shown).toHaveAttribute("title", CLOSE_VIEWER_LABEL);
+  if (!wide) {
+    const box = await narrow.boundingBox();
+    expect(box!.width).toBeGreaterThanOrEqual(44);
+    expect(box!.height).toBeGreaterThanOrEqual(44);
+  }
+  // The tab is named for the room that is open, not the one selected before.
+  const roomName = (await page.getByTestId("viewed-room-name").textContent())!;
+  await expect(page).toHaveTitle(new RegExp(roomName));
+  // Only the viewed room's row is highlighted in the rail.
+  await expect(page.getByTestId("viewed-room-rail-row")).toHaveCount(1);
+  await closeViewer(page);
+  await expect(page.getByTestId("viewed-room")).toHaveCount(0);
 });
 
 test("the display name chosen at the first message is the one posted", async ({ page }) => {
@@ -178,6 +260,10 @@ test("a full room says so, offers a retry later, and keeps the draft", async ({ 
   await expect(page.getByTestId("viewed-room")).toBeVisible();
   await expect(page.getByTestId("viewed-room-pending-message")).toHaveCount(0);
   expect(await callRiverTest(page, "joinSessionKey")).toBe("");
+  // Try again is offered, and the room being still full says so again.
+  await page.getByTestId("viewed-room-join").click();
+  await expect(page.getByTestId("viewed-room-join-error")).toContainText("no free spot");
+  await expect(page.getByTestId("viewed-room-composer")).toHaveValue("Too late");
   expect(panics).toEqual([]);
 });
 
@@ -190,7 +276,7 @@ test("a private room and a public room without open admission offer no Join", as
   await waitForApp(page);
   await expect(page.getByTestId("viewed-room-join")).toHaveCount(0);
   await expect(page.getByTestId("viewed-room-composer")).toBeDisabled();
-  await expect(page.getByTestId("viewed-room-composer-note")).toContainText("needs an invitation");
+  await expect(page.getByTestId("viewed-room-composer-note")).toContainText("invitation");
 });
 
 for (const forget of [false, true]) {
@@ -297,6 +383,8 @@ test("a room the user already holds cannot be joined over", async ({ page }) => 
   await expect(page.getByTestId("viewed-room")).toHaveCount(0);
   await expect(page.getByTestId("viewed-room-composer")).toHaveCount(0);
   await expect(page.getByTestId("message-composer").first()).toBeVisible();
+  expect(await callRiverTest(page, "currentRoomOwnerKey")).toBe(key);
+  await expect(page.getByTestId("viewed-room-rail-row")).toHaveCount(0);
   expect(await callRiverTest(page, "joinSessionKey")).toBe("");
   expect(panics).toEqual([]);
 });

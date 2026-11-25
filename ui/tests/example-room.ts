@@ -767,7 +767,11 @@ export async function withFingers(page: Page, body: (fingers: Fingers) => Promis
 
 // Leave a room opened from a link without joining it: the x on the room's rail
 // row on a wide screen, the x in the room's header on a narrow one. Whichever
-// of them is on screen.
+// of them is on screen, and it must say what it does.
+export const CLOSE_VIEWER_LABEL = "Close this room (you haven't joined)";
+
 export async function closeViewer(page: Page) {
-  await page.locator('[data-testid^="viewed-room-close"]:visible').first().click();
+  const close = page.locator('[data-testid^="viewed-room-close"]:visible').first();
+  await expect(close).toHaveAttribute("aria-label", CLOSE_VIEWER_LABEL);
+  await close.click();
 }

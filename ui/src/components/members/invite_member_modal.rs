@@ -143,7 +143,7 @@ fn InviteMemberBody(is_active: Signal<bool>, room: Memo<Option<RoomData>>) -> El
         }
         // Named from the same snapshot the link is minted from, so the message
         // can never name one room while the link grants another.
-        let room_name = room_data.as_ref().map(|r| r.display_name());
+        let room_name = room_data.as_ref().map(|r| r.display_name_for_text());
         create_invitation(room_data)
             .await
             .map(|invitation| (invitation, room_name))
