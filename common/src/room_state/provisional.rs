@@ -57,6 +57,16 @@ pub const POW_DOMAIN_TAG: &[u8; 27] = b"river-room-admission-pow/v1";
 /// `common/benches/provisional_pair.rs` (native; `BENCH_PROVISIONAL=<n>`
 /// sets the cap) and the same fixtures run under wasmtime.
 pub const MAX_PROVISIONAL_CEILING: u32 = 24;
+/// Messages one provisional author may hold in the room's message pool. A
+/// contract constant, not a signed policy value: it only bounds what one key
+/// can take of the shared newcomer quota (`max_provisional_messages`), so that
+/// a single key posting many messages cannot fill the quota and turn every
+/// other newcomer away as "room full". The per-author messages kept are the
+/// newest by `(time, id)`, the order the window already uses, so the rule is a
+/// function of the set of messages held and not of arrival order. It narrows
+/// the bound to `quota / PROVISIONAL_MESSAGES_PER_AUTHOR` keys; it does not
+/// remove it. Does not apply to the owner or to members.
+pub const PROVISIONAL_MESSAGES_PER_AUTHOR: usize = 2;
 /// Largest `max_provisional_messages` a policy may set.
 pub const MAX_PROVISIONAL_MESSAGES_CEILING: u32 = 500;
 /// Largest `max_provisional_bans` a policy may set (see
@@ -849,6 +859,50 @@ impl ProvisionalV1 {
 }
 
 // --- cleanup -----------------------------------------------------------------
+
+/// The provisional share of the window scan (P6), shared by every place the
+/// pool is chosen so they cannot drift. Feed it the non-live provisional
+/// messages newest first; a message is taken only while the quota and the pool
+/// cap allow it and its author holds fewer than
+/// [`PROVISIONAL_MESSAGES_PER_AUTHOR`] taken messages. An author's messages
+/// arrive newest first, so this keeps each author's newest ones. A refusal
+/// is monotone (quota, pool and per-author counts only grow), so a message
+/// refused once stays refused later in the scan.
+pub(crate) struct ProvisionalScan {
+    quota: usize,
+    pool_cap: usize,
+    taken: usize,
+    per_author: HashMap<MemberId, usize>,
+}
+
+impl ProvisionalScan {
+    pub(crate) fn new(plan: &ProvisionalPlan) -> Self {
+        Self {
+            quota: plan.quota,
+            pool_cap: plan.pool_cap,
+            taken: 0,
+            per_author: HashMap::new(),
+        }
+    }
+
+    /// Whether the next (older) provisional message of `author` is taken.
+    pub(crate) fn take(&mut self, author: MemberId) -> bool {
+        let held = self.per_author.get(&author).copied();
+        let ok = self.taken < self.quota
+            && held.unwrap_or(0) < PROVISIONAL_MESSAGES_PER_AUTHOR
+            && (held.is_some() || self.per_author.len() < self.pool_cap);
+        if ok {
+            self.taken += 1;
+            *self.per_author.entry(author).or_insert(0) += 1;
+        }
+        ok
+    }
+
+    /// The authors taken so far: the pool.
+    pub(crate) fn pool(&self) -> HashSet<MemberId> {
+        self.per_author.keys().copied().collect()
+    }
+}
 
 /// What `provisional_step` fixed for the member loop.
 #[derive(Default)]
