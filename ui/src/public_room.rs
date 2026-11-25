@@ -289,13 +289,30 @@ fn should_hold(
     m: Option<&Mirror>,
     id: &ContractInstanceId,
     rooms_ready: bool,
+    ours: bool,
     answer: &Answer,
 ) -> bool {
     !rooms_ready
+        && !ours
         && !matches!(answer, Answer::Delta)
         && m.is_some_and(|m| {
             &m.id == id && m.requested && !matches!(m.status, ViewedRoomStatus::Public(_))
         })
+}
+
+/// What to keep when an answer arrives while one is already held: the newest,
+/// except that a NotFound never replaces a held State (a retry's NotFound must
+/// not undo an answer that already arrived).
+fn merge_held(existing: Option<Held>, new: Held) -> Held {
+    match (existing, new) {
+        (Some(state @ Held::State(_)), Held::NotFound) => state,
+        (_, new) => new,
+    }
+}
+
+/// Whether an answer is currently held (so the lookup counts as answered).
+fn answer_is_held() -> bool {
+    HELD.lock().unwrap_or_else(|e| e.into_inner()).is_some()
 }
 
 fn set_answer_held(held: bool) {
@@ -472,6 +489,7 @@ pub fn view_for_test(raw: &str) {
 /// the viewer pane's own effect. Call from a deferred context.
 pub fn open_from_discover(owner_key_b58: &str) {
     crate::public_join::reset();
+    set_answer_held(false);
     let viewed = viewed_from_param(owner_key_b58);
     *VIEWED_ROOM.write() = Some(viewed);
 }
@@ -487,6 +505,7 @@ fn viewed_from_param(raw: &str) -> ViewedRoom {
             #[cfg(not(all(feature = "example-data", feature = "no-sync")))]
             let status = ViewedRoomStatus::Loading;
             lookup_begin(&owner_vk);
+            *HELD.lock().unwrap_or_else(|e| e.into_inner()) = None;
             set_mirror(Some(Mirror {
                 owner_vk,
                 id: *crate::util::owner_vk_to_contract_key(&owner_vk).id(),
@@ -660,8 +679,10 @@ pub fn error_action(
     error_text: &str,
     ours: bool,
     retried: bool,
+    answer_held: bool,
 ) -> ErrorAction {
     let for_viewer = !ours
+        && !answer_held
         && m.is_some_and(|m| {
             m.requested
                 && m.status == ViewedRoomStatus::Loading
@@ -686,7 +707,7 @@ pub fn deliver_error(error_text: &str) {
     let ours = m.as_ref().is_some_and(|m| is_ours(&m.owner_vk, &m.id));
     let retried = LOOKUP_RETRIED.load(Ordering::SeqCst);
     let Some(m) = m.as_ref() else { return };
-    match error_action(Some(m), error_text, ours, retried) {
+    match error_action(Some(m), error_text, ours, retried, answer_is_held()) {
         ErrorAction::Ignore => {}
         ErrorAction::Retry => {
             if !LOOKUP_RETRIED.swap(true, Ordering::SeqCst) {
@@ -739,6 +760,7 @@ pub fn request_fetch(owner_vk: VerifyingKey) {
         lookup_log("GET sent");
         crate::util::sleep(LOOKUP_RETRY_AFTER).await;
         if lookup_still_waiting(mirror().as_ref(), &owner_vk, current())
+            && !answer_is_held()
             && !LOOKUP_RETRIED.swap(true, Ordering::SeqCst)
         {
             send_lookup_get(owner_vk);
@@ -858,12 +880,19 @@ fn deliver_with(
 
 fn deliver(id: &ContractInstanceId, answer: Answer) -> bool {
     let m = mirror();
-    if should_hold(m.as_ref(), id, rooms_ready(), &answer) {
-        let held = match &answer {
+    let ours = m.as_ref().is_some_and(|m| is_ours(&m.owner_vk, id));
+    if should_hold(m.as_ref(), id, rooms_ready(), ours, &answer) {
+        let new = match &answer {
             Answer::State(bytes) => Held::State(bytes.to_vec()),
             _ => Held::NotFound,
         };
-        *HELD.lock().unwrap_or_else(|e| e.into_inner()) = Some((*id, held));
+        let mut slot = HELD.lock().unwrap_or_else(|e| e.into_inner());
+        let existing = slot
+            .take()
+            .filter(|(held_id, _)| held_id == id)
+            .map(|(_, h)| h);
+        *slot = Some((*id, merge_held(existing, new)));
+        drop(slot);
         set_answer_held(true);
         lookup_log("answer held until your rooms load");
         return true;
@@ -1175,14 +1204,22 @@ mod tests {
             Some(&loading),
             &id,
             false,
+            false,
             &Answer::State(&bytes)
         ));
-        assert!(should_hold(Some(&loading), &id, false, &Answer::NotFound));
+        assert!(should_hold(
+            Some(&loading),
+            &id,
+            false,
+            false,
+            &Answer::NotFound
+        ));
         // Loaded: routed.
         assert!(!should_hold(
             Some(&loading),
             &id,
             true,
+            false,
             &Answer::State(&bytes)
         ));
         // Not the viewer's, not asked, a delta, or a view already shown.
@@ -1192,17 +1229,36 @@ mod tests {
             Some(&loading),
             &other_id,
             false,
+            false,
             &Answer::NotFound
         ));
         let unasked = mirror_for(&vk, false, ViewedRoomStatus::Loading);
-        assert!(!should_hold(Some(&unasked), &id, false, &Answer::NotFound));
-        assert!(!should_hold(Some(&loading), &id, false, &Answer::Delta));
+        assert!(!should_hold(
+            Some(&unasked),
+            &id,
+            false,
+            false,
+            &Answer::NotFound
+        ));
+        assert!(!should_hold(
+            Some(&loading),
+            &id,
+            false,
+            false,
+            &Answer::Delta
+        ));
         let shown = mirror_for(
             &vk,
             true,
             ViewedRoomStatus::Public(Box::new(state_with(PrivacyMode::Public))),
         );
-        assert!(!should_hold(Some(&shown), &id, false, &Answer::NotFound));
+        assert!(!should_hold(
+            Some(&shown),
+            &id,
+            false,
+            false,
+            &Answer::NotFound
+        ));
         // Released after the rooms loaded and the room is theirs: not claimed,
         // nothing written, so the pane's redirect opens the member room.
         let mut fx = Recorder::default();
@@ -1263,26 +1319,29 @@ mod tests {
         let loading = mirror_for(&vk, true, ViewedRoomStatus::Loading);
         let text = format!("request failed for contract {}: refused", loading.id);
         assert_eq!(
-            error_action(Some(&loading), &text, false, false),
+            error_action(Some(&loading), &text, false, false, false),
             ErrorAction::Retry
         );
         assert_eq!(
-            error_action(Some(&loading), &text, false, true),
+            error_action(Some(&loading), &text, false, true, false),
             ErrorAction::GiveUp
         );
         assert_eq!(
-            error_action(Some(&loading), "other", false, false),
+            error_action(Some(&loading), "other", false, false, false),
             ErrorAction::Ignore
         );
-        assert_eq!(error_action(None, &text, false, false), ErrorAction::Ignore);
         assert_eq!(
-            error_action(Some(&loading), &text, true, false),
+            error_action(None, &text, false, false, false),
+            ErrorAction::Ignore
+        );
+        assert_eq!(
+            error_action(Some(&loading), &text, true, false, false),
             ErrorAction::Ignore,
             "the user's own room"
         );
         let unasked = mirror_for(&vk, false, ViewedRoomStatus::Loading);
         assert_eq!(
-            error_action(Some(&unasked), &text, false, false),
+            error_action(Some(&unasked), &text, false, false, false),
             ErrorAction::Ignore
         );
         let shown = mirror_for(
@@ -1291,7 +1350,7 @@ mod tests {
             ViewedRoomStatus::Public(Box::new(state_with(PrivacyMode::Public))),
         );
         assert_eq!(
-            error_action(Some(&shown), &text, false, false),
+            error_action(Some(&shown), &text, false, false, false),
             ErrorAction::Ignore
         );
         // A later good answer is still accepted after the wait ended.
@@ -1306,6 +1365,42 @@ mod tests {
             )
             .claimed
         );
+    }
+
+    #[test]
+    fn a_not_found_never_replaces_a_held_state_and_held_answers_stop_retries() {
+        let state = || Held::State(state_bytes(PrivacyMode::Public));
+        assert!(matches!(
+            merge_held(Some(state()), Held::NotFound),
+            Held::State(_)
+        ));
+        assert!(matches!(
+            merge_held(Some(Held::NotFound), state()),
+            Held::State(_)
+        ));
+        assert!(matches!(merge_held(None, Held::NotFound), Held::NotFound));
+        assert!(matches!(merge_held(Some(state()), state()), Held::State(_)));
+        // With an answer held, an error neither retries nor ends the wait.
+        let vk = key();
+        let loading = mirror_for(&vk, true, ViewedRoomStatus::Loading);
+        let text = format!("failed for contract {}", loading.id);
+        assert_eq!(
+            error_action(Some(&loading), &text, false, false, true),
+            ErrorAction::Ignore
+        );
+    }
+
+    #[test]
+    fn the_users_own_room_is_not_held() {
+        let vk = key();
+        let loading = mirror_for(&vk, true, ViewedRoomStatus::Loading);
+        assert!(!should_hold(
+            Some(&loading),
+            &loading.id,
+            false,
+            true,
+            &Answer::NotFound
+        ));
     }
 
     #[test]

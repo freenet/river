@@ -18,13 +18,21 @@ use river_core::room_state::ChatRoomStateV1;
 use std::collections::HashMap;
 use std::time::UNIX_EPOCH;
 
-/// Whether the user's rooms have loaded. A contended signal counts as loaded:
-/// `is_ours` then treats the room as theirs, which is the safe error.
+/// Whether a load state is final for the viewer: anything but still loading
+/// or migrating. A failed load is final too, so a visitor can still view a room
+/// (the user's own rooms are not known then, but nothing more will arrive).
+pub(crate) fn load_settled(state: RoomsLoadState) -> bool {
+    !matches!(state, RoomsLoadState::Loading | RoomsLoadState::Migrating)
+}
+
+/// Whether the user's rooms have finished loading. A contended signal counts as
+/// NOT settled: an answer is held rather than risk claiming the user's own room
+/// as a visitor's, and the pane's effect nudges and re-runs to release it.
 pub(crate) fn rooms_loaded() -> bool {
     ROOMS_LOAD_STATE
         .try_read()
-        .map(|s| *s == RoomsLoadState::Loaded)
-        .unwrap_or(true)
+        .map(|s| load_settled(*s))
+        .unwrap_or(false)
 }
 
 #[component]
@@ -50,8 +58,14 @@ pub fn ViewedRoomPane() -> Element {
         if connected {
             // Route an answer held while the user's rooms loaded; the redirect
             // below opens it as theirs when it is.
-            if rooms_loaded() {
-                crate::public_room::release_held();
+            match ROOMS_LOAD_STATE.try_read() {
+                Ok(state) => {
+                    if load_settled(*state) {
+                        crate::public_room::release_held();
+                    }
+                }
+                // Stay subscribed: re-run once the signal is readable.
+                Err(_) => crate::util::signal_guard::schedule_nudge(),
             }
         }
         if !connected {
@@ -531,5 +545,21 @@ pub(crate) fn JoinComposer(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod load_state_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_load_still_in_progress_holds_the_viewers_answer() {
+        assert!(!load_settled(RoomsLoadState::Loading));
+        assert!(!load_settled(RoomsLoadState::Migrating));
+        assert!(load_settled(RoomsLoadState::Loaded));
+        assert!(
+            load_settled(RoomsLoadState::LoadFailed),
+            "a failed load must not hold a visitor's answer forever"
+        );
     }
 }
