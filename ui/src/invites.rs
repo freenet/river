@@ -73,7 +73,13 @@ impl PendingInvites {
             crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage,
         >,
     ) -> bool {
-        let Some(join) = self.map.get_mut(vk) else {
+        // Only from Error: a second click that lands before the re-render
+        // finds the invitation already retrying and must not restart it.
+        let Some(join) = self
+            .map
+            .get_mut(vk)
+            .filter(|join| matches!(join.status, PendingRoomStatus::Error(_)))
+        else {
             return false;
         };
         join.status = PendingRoomStatus::PendingSubscription;

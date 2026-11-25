@@ -3153,6 +3153,29 @@ mod tests {
         assert!(rx.try_recv().is_err(), "exactly one pass per click");
     }
 
+    /// A second Retry click that lands before the re-render finds the
+    /// invitation already retrying: it changes nothing and requests no pass.
+    #[test]
+    fn retry_from_error_ignores_an_invite_that_is_not_in_error() {
+        let room = SigningKey::from_bytes(&[13u8; 32]).verifying_key();
+        let mut pending = crate::invites::PendingInvites::default();
+        pending.map.insert(room, pending_join(room));
+        pending.begin_get(&room, 0.0);
+        let before = pending.map[&room].get_budget.clone();
+        let (tx, mut rx): (Tx, _) = futures::channel::mpsc::unbounded();
+        for status in [
+            PendingRoomStatus::Subscribing,
+            PendingRoomStatus::PendingSubscription,
+            PendingRoomStatus::Subscribed,
+        ] {
+            pending.map.get_mut(&room).unwrap().status = status.clone();
+            assert!(!pending.retry_from_error(&room, &tx));
+            assert_eq!(pending.map[&room].status, status);
+            assert_eq!(pending.map[&room].get_budget, before, "budget untouched");
+            assert!(rx.try_recv().is_err(), "no pass requested");
+        }
+    }
+
     /// Generations never repeat, even for a re-accepted invitation whose
     /// budget starts again from `Default`, so an old timer never matches.
     #[test]
