@@ -12,6 +12,12 @@
 # To validate entries: cargo make check-migration
 # To sync all WASMs:   cargo make sync-wasm
 
+# Note (2026-11-25): the intermediate build published for preview under container
+# 7vjXd4ueq113kNe2Sag3FGCNjDuss8yc2aiSkhduwNo7 (built from acb26fec79478130e48f27b6f163fd5cbeb7a3a9;
+# room contract 80f8064b..., chat delegate 000af837...) is deliberately NOT registered here.
+# It was shared with no one and only rooms created inside the preview exist on those keys, so no
+# user data lives under them.
+
 [[entry]]
 version = "V1"
 description = "Before signing API was added"

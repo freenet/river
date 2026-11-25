@@ -12,7 +12,14 @@ use river_core::ChatRoomStateV1;
 #[allow(dead_code)]
 struct Contract;
 
-#[contract]
+// `update_validates` is a promise to freenet-core: `update_state`, given a state
+// this node stored, treats every update (including a whole `State`) as
+// untrusted input and returns `Err` unless its output passes `validate_state`
+// (the whole-state check at the end of `update_state`). A core release that
+// honours the marker (none does yet) may then skip its own `validate_state`
+// both before (of an incoming `State`) and after (of the result), and skip the
+// recovery that replaces a stored state failing `validate_state`.
+#[contract(update_validates)]
 impl ContractInterface for Contract {
     fn validate_state(
         parameters: Parameters<'static>,
@@ -60,18 +67,26 @@ impl ContractInterface for Contract {
             let mut chat_state = from_reader::<ChatRoomStateV1, &[u8]>(state.as_ref())
                 .map_err(|e| ContractError::Deser(e.to_string()))?;
 
-            // Validate deltas incrementally. freenet-core stores only states
-            // that passed `validate_state`, so the signatures the stored
+            // Validate deltas incrementally. The signatures the stored
             // state's `verify` relies on are recorded as already checked, and
             // only signatures a delta adds cost crypto. Apply, cleanup and
             // the whole-state check below are the unchanged rules. This
             // relies on the stored state being valid: a stored state that
             // is not (disk damage) seeds its bad signatures as good, and
-            // the output check below cannot see them. The host's own
-            // `validate_state` of the result, which it runs today, is what
-            // refuses such a state. A seeding error (a structural fault in
-            // the stored state) continues unseeded. `seed_from` is called
-            // from here and nowhere else.
+            // the output check below cannot see them.
+            //
+            // This contract opts in to `update_validates`. When a core
+            // release honours that opt-in (not yet released), core will skip
+            // its own `validate_state` on hosts that already hold a state
+            // for this key, and rely on the whole-state check at the end of
+            // this function. Then a corrupted stored state can yield an `Ok`
+            // output that fails `validate_state`, and core would commit it.
+            // The opt-in is sound only if core first validates a key's stored
+            // state before trusting it (once per process); that is a
+            // precondition core is expected to provide, planned and not yet
+            // built. A seeding error (a structural fault in the stored state)
+            // continues unseeded.
+            // `seed_from` is called from here and nowhere else.
             let _ = river_core::room_state::sigcheck::seed_from(|| {
                 chat_state.verify(&chat_state, &parameters)
             });
@@ -197,6 +212,20 @@ mod tests {
     use river_core::room_state::ban::{AuthorizedUserBan, BansV1, UserBan};
     use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
     use river_core::room_state::member::MemberId;
+
+    /// The `update_validates` opt-in is the export `__frnt__update_validates`
+    /// returning 1, which core reads from the built module. Dropping the
+    /// attribute fails this. `scripts/check-update-validates-export.sh` checks
+    /// the same on the built WASM.
+    #[test]
+    fn contract_exports_the_update_validates_marker() {
+        assert_eq!(super::__frnt__update_validates(), 1);
+        let src = include_str!("lib.rs");
+        assert!(
+            src.contains("#[contract(update_validates)]\nimpl ContractInterface for Contract"),
+            "the room contract must opt in with #[contract(update_validates)]"
+        );
+    }
 
     macro_rules! cbor {
         ($v:expr) => {{

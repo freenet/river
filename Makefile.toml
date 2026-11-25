@@ -418,6 +418,12 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/code/scratch/legacy-delegate-
 scripts/legacy-delegate-gate.sh --core-rev "$rev"
 '''
 
+[tasks.no-git-stdlib-guard]
+description = "Refuse a build whose freenet-stdlib/macros come from git (their hash differs from the released crate)"
+script = '''
+./scripts/check-no-git-stdlib.sh
+'''
+
 [tasks.publish-river]
 # GUARDRAIL: any republish that regenerates the room-contract / chat-delegate
 # WASM MUST go through a PR that COMMITS the regenerated WASM (run `cargo make
@@ -437,7 +443,7 @@ scripts/legacy-delegate-gate.sh --core-rev "$rev"
 # Migration entries carry our users' DATA forward; the pointer carries their
 # open tabs and everyone else. Skipped, open tabs stay on the old keys.
 description = "Publish River to Freenet using the committed contract version"
-dependencies = ["legacy-delegate-gate", "sign-webapp"]
+dependencies = ["no-git-stdlib-guard", "legacy-delegate-gate", "sign-webapp"]
 script = '''
 if [ ! -f "published-contract/contract-id.txt" ]; then
     echo "No published contract found"
@@ -490,7 +496,7 @@ fi
 [tasks.publish-river-debug]
 description = "Publish River to Freenet in debug mode"
 env = { BUILD_PROFILE = "dev" }
-dependencies = ["legacy-delegate-gate", "sign-webapp"]
+dependencies = ["no-git-stdlib-guard", "legacy-delegate-gate", "sign-webapp"]
 script = '''
 if [ ! -f "published-contract/contract-id.txt" ]; then
     echo "No published contract found"
