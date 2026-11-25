@@ -50,7 +50,7 @@ pub fn describe_requirements(req: &AdmissionRequirements) -> String {
         } => format!(
             "open: join with `riverctl room join <room> --pow`; proof of work {} bits \
              (about {:.0} hashes), epoch {}; the room holds at most {max_provisional} open \
-             members, who may fill {quota} message slots{}",
+             members, who may fill {quota} message slots (at most 2 each){}",
             p.difficulty_bits,
             p.expected_hashes,
             p.epoch,

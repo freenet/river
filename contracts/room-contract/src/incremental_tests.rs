@@ -137,7 +137,21 @@ fn signature_checks_per_update_are_constant() {
     // The whole-state check is a full check and stays one.
     let (ok, full) = real_checks_of(|| contract_validate(&p, &s));
     assert!(ok);
-    assert!(full > 1000, "validate_state checks every record ({full})");
+    // Every signed record the state holds is checked: derived from the built
+    // state, so a change to what the fixture keeps (the per-author cap on
+    // provisional messages drops some of its newcomers' messages) moves both
+    // sides together. An update checks a handful, so the whole-state check is
+    // O(records) and the update O(1).
+    let signed = f.state.recent_messages.messages.len()
+        + f.state.members.members.len()
+        + f.state.member_info.member_info.len()
+        + f.state.provisional.entries.len()
+        + f.state.provisional.bans.len();
+    assert!(signed > 500, "the fixture is room-sized ({signed} records)");
+    assert!(
+        full >= signed,
+        "validate_state checks every record ({full} checks, {signed} records)"
+    );
 
     let (r, n) = real_checks_of(|| {
         contract_update(&p, &s, &Input::Delta(msg_delta(&f, &f.members[3], 10_000)))

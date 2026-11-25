@@ -103,9 +103,16 @@ pub struct PublicRoomPolicy {
     /// is oldest falls out, with its entry and messages, and may come back by
     /// sending a newer message. A newcomer whose message is older than every
     /// pooled author's is the one dropped (`RoomFull`).
+    ///
+    /// Each author holds at most [`PROVISIONAL_MESSAGES_PER_AUTHOR`] messages
+    /// of the quota, so the authors actually held are at most
+    /// `min(this, quota / PROVISIONAL_MESSAGES_PER_AUTHOR)`: with a quota of
+    /// 20 at most 10 authors, even where this says 16.
     pub max_provisional: u32,
     /// Window slots for provisional messages, `1..=500`. The effective quota is
-    /// `min(this, max_recent_messages / 2)` ([`Self::quota`]).
+    /// `min(this, max_recent_messages / 2)` ([`Self::quota`]). One provisional
+    /// author fills at most [`PROVISIONAL_MESSAGES_PER_AUTHOR`] of them (its
+    /// newest two messages, reactions, edits and deletes included).
     pub max_provisional_messages: u32,
     /// Provisional ban list size, `0..=24` ([`MAX_PROVISIONAL_BANS_CEILING`]).
     pub max_provisional_bans: u32,
@@ -886,6 +893,13 @@ impl ProvisionalScan {
     }
 
     /// Whether the next (older) provisional message of `author` is taken.
+    ///
+    /// Every message by the author counts toward its
+    /// [`PROVISIONAL_MESSAGES_PER_AUTHOR`], reactions, edits and deletes
+    /// included. Exempting them would let one key fill the quota with
+    /// reactions, which is the hole this limit closes. The visible
+    /// consequence is that a provisional member's older messages roll off
+    /// after their third; an invited or sponsored member is not limited.
     pub(crate) fn take(&mut self, author: MemberId) -> bool {
         let held = self.per_author.get(&author).copied();
         let ok = self.taken < self.quota

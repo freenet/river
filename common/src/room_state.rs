@@ -1157,10 +1157,11 @@ impl ChatRoomStateV1 {
                         break;
                     }
                     let author = m.message.author;
-                    if pool.contains(&author) && !current_member_ids.contains(&author) {
-                        if !scan.take(author) {
-                            continue;
-                        }
+                    if pool.contains(&author)
+                        && !current_member_ids.contains(&author)
+                        && !scan.take(author)
+                    {
+                        continue;
                     }
                     keep[i] = true;
                     taken += 1;
@@ -1341,8 +1342,9 @@ impl ChatRoomStateV1 {
         // `plan.quota` provisional messages are taken, its author holds fewer
         // than `PROVISIONAL_MESSAGES_PER_AUTHOR` taken, and, if its author is
         // not yet in the pool, the pool is under `plan.pool_cap` (all three in
-        // `ProvisionalScan`); an author joins the pool when one of its messages is taken; a message not
-        // taken is neither kept nor counted against the window. Which
+        // `ProvisionalScan`); an author joins the pool when one of its
+        // messages is taken; a message not taken is neither kept nor
+        // counted against the window. Which
         // provisional messages are taken does not depend on the members (it
         // reads only the provisional messages, newest first), so one that is
         // not taken stays so in every later pass and is dropped from the

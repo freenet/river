@@ -308,7 +308,9 @@ A public room can let newcomers in by proof of work instead of an invitation.
   `riverctl room config <room> --public-admission true`, and tunes it with
   `--admission-difficulty` (0 to 32 bits), `--admission-new-epoch`
   (invalidates every proof solved so far), `--max-provisional` (1 to 24),
-  `--max-provisional-messages`, `--max-provisional-bans` and
+  `--max-provisional-messages` (the slots open members share; each holds
+  at most its newest 2, so the room holds at most half that many of them),
+  `--max-provisional-bans` and
   `--admission-listed`. `--public-admission false` turns it off and clears
   the room's open members and bans.
 

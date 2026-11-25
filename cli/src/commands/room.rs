@@ -157,7 +157,9 @@ pub enum RoomCommands {
         max_provisional: Option<u32>,
 
         /// Message-window slots open members may fill (1 to 500; the room
-        /// also caps it at half its message window)
+        /// also caps it at half its message window). Each open member holds
+        /// at most its newest 2 of them, so the room holds at most half this
+        /// many open members whatever --max-provisional says
         #[arg(long)]
         max_provisional_messages: Option<u32>,
 
