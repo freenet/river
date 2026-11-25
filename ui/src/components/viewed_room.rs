@@ -3,7 +3,7 @@
 
 use crate::components::app::chat_delegate::{RoomsLoadState, ROOMS_LOAD_STATE};
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
-use crate::components::app::{MobileView, CURRENT_ROOM, MOBILE_VIEW, ROOMS, SYNC_STATUS};
+use crate::components::app::{MobileView, MOBILE_VIEW, ROOMS, SYNC_STATUS};
 use crate::components::back_to_chat::BackToChatButton;
 use crate::components::icons::{line_icon, MENU_ICON_PATH};
 use crate::components::room_list::receive_invitation_modal::invitation_accept_disabled;
@@ -12,7 +12,6 @@ use crate::public_room::{
     close, composer_note, fetch_action, request_fetch, request_subscribe, retry, waiting_hint,
     FetchAction, ViewedRoom, ViewedRoomStatus, VIEWED_ROOM,
 };
-use crate::room_data::CurrentRoom;
 use crate::util::display_name::{contains_hidden_chars, display_nickname, EMOJI_REJECTION_MESSAGE};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
@@ -123,12 +122,10 @@ pub fn ViewedRoomPane() -> Element {
             return;
         };
         if rooms.map.contains_key(&owner) {
-            crate::util::defer(move || {
-                *CURRENT_ROOM.write() = CurrentRoom {
-                    owner_key: Some(owner),
-                };
-                close();
-            });
+            // The timer can fire long after the effect ran (a loaded WebKit
+            // delays it by 150 ms or more): the viewer may show another room
+            // by then (freenet/river#1047). It re-checks inside.
+            crate::public_room::redirect_to_member_room(owner);
         }
     });
 
