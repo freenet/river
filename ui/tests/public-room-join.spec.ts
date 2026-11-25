@@ -131,7 +131,8 @@ test("Escape at the name prompt cancels: nothing is sent and the text stays in t
   const composer = page.getByTestId("viewed-room-composer");
   await composer.fill("Not yet");
   await page.getByTestId("viewed-room-send").click();
-  await expect(page.getByTestId("viewed-room-nickname-input")).toBeVisible();
+  // Focus moves into the dialog a moment after it opens; Escape acts from there.
+  await expect(page.getByTestId("viewed-room-nickname-input")).toBeFocused();
   await page.keyboard.press("Escape");
   await expect(page.getByTestId("viewed-room-nickname-modal")).toHaveCount(0);
   await expect(composer).toHaveValue("Not yet");

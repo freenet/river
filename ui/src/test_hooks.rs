@@ -255,8 +255,7 @@ pub fn install_test_hooks() {
     // test wait for "the proof finished" instead of sleeping.
     set_hook(
         "joinPhase",
-        Closure::<dyn FnMut() -> String>::new(move || crate::public_join::phase_name())
-            .into_js_value(),
+        Closure::<dyn FnMut() -> String>::new(crate::public_join::phase_name).into_js_value(),
     );
 
     // Base58 of the verifying key the join in progress holds, "" when none:
