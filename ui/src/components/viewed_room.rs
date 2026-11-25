@@ -249,6 +249,9 @@ fn Notice(status: ViewedRoomStatus, owner_vk: Option<ed25519_dalek::VerifyingKey
 
 /// One line of the history.
 struct Line {
+    /// Who wrote it, when, and how long: tells one message from another when
+    /// the window is full and an arrival replaces the oldest.
+    id: String,
     author: String,
     when: String,
     html: String,
@@ -278,6 +281,7 @@ fn lines(state: &ChatRoomStateV1) -> Vec<Line> {
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
             Some(Line {
+                id: format!("{:?}:{ms}:{}", m.message.author, text.len()),
                 author,
                 when: crate::util::format_utc_as_full_datetime(ms),
                 html: crate::components::conversation::message_to_html(&text),
@@ -476,28 +480,33 @@ fn PublicRoomView(
     // change, as a joined room opens at its newest message, but leave a reader
     // who has scrolled up where they are (see `follow_to_end`).
     let queued_len = queued.len();
-    let history_size = (rows.len(), queued_len);
+    let history_size = HistoryMark {
+        rows: rows.len(),
+        newest: rows.last().map(|l| l.id.clone()),
+        queued: queued_len,
+    };
     let mut end_el = use_signal(|| None::<std::rc::Rc<MountedData>>);
-    let mut handled = use_signal(|| None::<(usize, usize)>);
-    if *handled.peek() != Some(history_size) {
+    let mut handled = use_signal(|| None::<HistoryMark>);
+    if handled.peek().as_ref() != Some(&history_size) {
         // Measured now, before this render's rows reach the page: the pane
         // still has the old content, so this says whether the reader was at
         // its end. (A scroll event would also fire when content is added.)
         let near = history_is_near_bottom();
+        let history_size = history_size.clone();
         crate::util::defer(move || {
             // The pane may have closed since: its signals are then gone.
             let state = match (handled.try_peek(), end_el.try_peek()) {
-                (Ok(previous), Ok(element)) => Some((*previous, element.clone())),
+                (Ok(previous), Ok(element)) => Some((previous.clone(), element.clone())),
                 _ => None,
             };
             let Some((previous, element)) = state else {
                 return;
             };
-            if previous == Some(history_size) {
+            if previous.as_ref() == Some(&history_size) {
                 return;
             }
-            handled.set(Some(history_size));
-            if follow_to_end(previous.map(|(_, q)| q), history_size.1, near) {
+            handled.set(Some(history_size.clone()));
+            if follow_to_end(previous.map(|m| m.queued), history_size.queued, near) {
                 if let Some(element) = element {
                     crate::util::safe_spawn_local(async move {
                         let _ = element.scroll_to(ScrollBehavior::Instant).await;
@@ -664,6 +673,23 @@ enum NameAnswer {
     Send(Option<String>),
 }
 
+/// Where Tab (or Shift+Tab) goes next in the name dialog: the field, then
+/// Continue (skipped while it is disabled), then Cancel, round again.
+fn next_dialog_focus(current: &str, continue_disabled: bool, backwards: bool) -> &'static str {
+    let order: &[&'static str] = if continue_disabled {
+        &[NICKNAME_FIELD_ID, NICKNAME_CANCEL_ID]
+    } else {
+        &[NICKNAME_FIELD_ID, NICKNAME_CONTINUE_ID, NICKNAME_CANCEL_ID]
+    };
+    let at = order.iter().position(|id| *id == current).unwrap_or(0);
+    let next = if backwards {
+        (at + order.len() - 1) % order.len()
+    } else {
+        (at + 1) % order.len()
+    };
+    order[next]
+}
+
 /// The id of the control that has focus, if any.
 fn focused_id() -> String {
     web_sys::window()
@@ -674,6 +700,8 @@ fn focused_id() -> String {
 }
 
 const NICKNAME_CONTINUE_ID: &str = "viewed-room-nickname-continue-button";
+const NICKNAME_CANCEL_ID: &str = "viewed-room-nickname-cancel-button";
+const NICKNAME_FIELD_ID: &str = "viewed-room-nickname-field";
 
 /// What a confirmed name means: the default itself, or nothing, is "no
 /// choice", so the join keeps whatever default its own key gives.
@@ -698,6 +726,7 @@ fn NicknamePrompt(default: String, on_done: EventHandler<NameAnswer>) -> Element
     // Focus is kept inside the dialog: the two controls take turns on Tab.
     let mut input_el = use_signal(|| None::<std::rc::Rc<MountedData>>);
     let mut button_el = use_signal(|| None::<std::rc::Rc<MountedData>>);
+    let mut cancel_el = use_signal(|| None::<std::rc::Rc<MountedData>>);
     let has_emoji = contains_hidden_chars(&nickname.read());
     let too_long = nickname.read().len() > river_core::room_state::member_info::NICKNAME_CEILING;
     let disabled = invitation_accept_disabled(&nickname.read(), None);
@@ -725,7 +754,11 @@ fn NicknamePrompt(default: String, on_done: EventHandler<NameAnswer>) -> Element
                             evt.prevent_default();
                             on_done.call(NameAnswer::Cancel);
                         }
-                        Key::Enter if !disabled && focused_id() != NICKNAME_CONTINUE_ID => {
+                        Key::Enter
+                            if !disabled
+                                && focused_id() != NICKNAME_CONTINUE_ID
+                                && focused_id() != NICKNAME_CANCEL_ID =>
+                        {
                             evt.prevent_default();
                             let name = nickname.peek().clone();
                             on_done.call(NameAnswer::Send(name_choice(&default, &name)));
@@ -734,8 +767,15 @@ fn NicknamePrompt(default: String, on_done: EventHandler<NameAnswer>) -> Element
                             evt.prevent_default();
                             // From the control that really has focus, so a click
                             // inside the dialog cannot leave this out of step.
-                            let to_input = focused_id() == NICKNAME_CONTINUE_ID || disabled;
-                            let target = if to_input { input_el.peek().clone() } else { button_el.peek().clone() };
+                            let target = match next_dialog_focus(
+                                &focused_id(),
+                                disabled,
+                                evt.modifiers().shift(),
+                            ) {
+                                NICKNAME_CONTINUE_ID => button_el.peek().clone(),
+                                NICKNAME_CANCEL_ID => cancel_el.peek().clone(),
+                                _ => input_el.peek().clone(),
+                            };
                             if let Some(el) = target {
                                 crate::util::safe_spawn_local(async move {
                                     let _ = el.set_focus(true).await;
@@ -763,7 +803,7 @@ fn NicknamePrompt(default: String, on_done: EventHandler<NameAnswer>) -> Element
                             "Your display name"
                         }
                         input {
-                            id: "viewed-room-nickname-field",
+                            id: NICKNAME_FIELD_ID,
                             "data-testid": "viewed-room-nickname-input",
                             class: if has_emoji {
                                 "w-full px-3 py-2 bg-surface border border-danger rounded-lg text-text placeholder-text-muted focus:outline-none focus:ring-2 focus:ring-danger focus:border-transparent"
@@ -792,7 +832,7 @@ fn NicknamePrompt(default: String, on_done: EventHandler<NameAnswer>) -> Element
                             }
                         }
                         p { class: "mt-2 text-xs text-text-muted",
-                            "Enter or Continue sends it. Escape cancels and keeps your message in the box."
+                            "Enter or Continue sends it. Cancel keeps your message in the box."
                         }
                     }
                     div { class: "flex gap-3",
@@ -811,6 +851,15 @@ fn NicknamePrompt(default: String, on_done: EventHandler<NameAnswer>) -> Element
                                 }
                             },
                             "Continue"
+                        }
+                        button {
+                            r#type: "button",
+                            id: NICKNAME_CANCEL_ID,
+                            "data-testid": "viewed-room-nickname-cancel",
+                            class: "px-4 py-2 min-h-11 text-text-secondary hover:text-text rounded-lg transition-colors",
+                            onmounted: move |cx| cancel_el.set(Some(cx.data())),
+                            onclick: move |_| on_done.call(NameAnswer::Cancel),
+                            "Cancel"
                         }
                     }
                 }
@@ -846,6 +895,16 @@ fn history_is_near_bottom() -> bool {
 /// its end.
 fn is_near_bottom(scroll_top: f64, scroll_height: f64, client_height: f64) -> bool {
     scroll_height - scroll_top - client_height <= NEAR_BOTTOM_PX
+}
+
+/// What the history pane shows, for telling that it changed. The newest
+/// message's identity is part of it because a full window drops the oldest
+/// message as a new one arrives, leaving the row count unchanged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HistoryMark {
+    rows: usize,
+    newest: Option<String>,
+    queued: usize,
 }
 
 /// Whether a change to the history should scroll to its end. Always on first
@@ -1139,6 +1198,54 @@ pub(crate) fn JoinComposer(
 #[cfg(test)]
 mod view_tests {
     use super::*;
+
+    #[test]
+    fn a_full_window_that_drops_the_oldest_still_counts_as_changed() {
+        let before = HistoryMark {
+            rows: 100,
+            newest: Some("m99".into()),
+            queued: 0,
+        };
+        let after = HistoryMark {
+            rows: 100,
+            newest: Some("m100".into()),
+            queued: 0,
+        };
+        assert_ne!(before, after, "same row count, new newest message");
+        assert!(
+            follow_to_end(Some(0), 0, true),
+            "a reader at the end follows it"
+        );
+        assert!(
+            !follow_to_end(Some(0), 0, false),
+            "a reader scrolled up stays"
+        );
+    }
+
+    #[test]
+    fn tab_goes_field_continue_cancel_and_round() {
+        assert_eq!(
+            next_dialog_focus(NICKNAME_FIELD_ID, false, false),
+            NICKNAME_CONTINUE_ID
+        );
+        assert_eq!(
+            next_dialog_focus(NICKNAME_CONTINUE_ID, false, false),
+            NICKNAME_CANCEL_ID
+        );
+        assert_eq!(
+            next_dialog_focus(NICKNAME_CANCEL_ID, false, false),
+            NICKNAME_FIELD_ID
+        );
+        assert_eq!(
+            next_dialog_focus(NICKNAME_FIELD_ID, false, true),
+            NICKNAME_CANCEL_ID
+        );
+        assert_eq!(
+            next_dialog_focus(NICKNAME_FIELD_ID, true, false),
+            NICKNAME_CANCEL_ID
+        );
+        assert_eq!(next_dialog_focus("", false, false), NICKNAME_CONTINUE_ID);
+    }
 
     #[test]
     fn a_reader_scrolled_up_is_not_moved_by_a_new_message() {

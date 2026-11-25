@@ -163,7 +163,30 @@ test("Tab follows the focused control even after a click inside the dialog", asy
   await page.keyboard.press("Tab");
   await expect(cont).toBeFocused();
   await page.keyboard.press("Tab");
+  await expect(page.getByTestId("viewed-room-nickname-cancel")).toBeFocused();
+  await page.keyboard.press("Tab");
   await expect(input).toBeFocused();
+});
+
+test("Cancel at the name prompt (a tap) keeps the text, sends nothing, and the next Send asks again", async ({ page }) => {
+  const panics = panicsOf(page);
+  await openRoom(page, "open");
+  const composer = page.getByTestId("viewed-room-composer");
+  await composer.fill("Tapped away");
+  await page.getByTestId("viewed-room-send").click();
+  await expect(page.getByTestId("viewed-room-nickname-input")).toBeVisible();
+  await page.getByTestId("viewed-room-nickname-cancel").click();
+  await expect(page.getByTestId("viewed-room-nickname-modal")).toHaveCount(0);
+  await expect(composer).toHaveValue("Tapped away");
+  await expect(page.getByTestId("viewed-room-pending-message")).toHaveCount(0);
+  await expect.poll(() => callRiverTest(page, "joinPhase")).toBe("ready");
+  expect(await callRiverTest(page, "roomMessageCount", "Tapped away")).toBe(0);
+  await page.getByTestId("viewed-room-send").click();
+  await expect(page.getByTestId("viewed-room-nickname-input")).toBeVisible();
+  await page.getByTestId("viewed-room-nickname-continue").click();
+  await expect(page.getByTestId("viewed-room")).toHaveCount(0, { timeout: 30_000 });
+  expect(await callRiverTest(page, "roomMessageCount", "Tapped away")).toBe(1);
+  expect(panics).toEqual([]);
 });
 
 test("the name prompt is a labelled dialog that keeps focus, and its buttons are touch sized", async ({ page }) => {
@@ -183,12 +206,17 @@ test("the name prompt is a labelled dialog that keeps focus, and its buttons are
   // Tab stays inside the dialog.
   await page.keyboard.press("Tab");
   await expect(page.getByTestId("viewed-room-nickname-continue")).toBeFocused();
-  await page.keyboard.press("Tab");
-  await expect(page.getByLabel("Your display name")).toBeFocused();
   const box = await page.getByTestId("viewed-room-nickname-continue").boundingBox();
   expect(box!.height).toBeGreaterThanOrEqual(44);
+  // Cancel is a second touch-sized control after Continue, and Tab goes round to the field.
+  await page.keyboard.press("Tab");
+  await expect(page.getByTestId("viewed-room-nickname-cancel")).toBeFocused();
+  const cancelBox = await page.getByTestId("viewed-room-nickname-cancel").boundingBox();
+  expect(cancelBox!.height).toBeGreaterThanOrEqual(44);
+  await page.keyboard.press("Tab");
+  await expect(page.getByLabel("Your display name")).toBeFocused();
   // Closing it (Escape cancels) puts focus back in the composer.
-  await expect(modal).toContainText("Escape cancels");
+  await expect(modal).toContainText("Cancel keeps your message in the box");
   await page.keyboard.press("Escape");
   await expect(page.getByTestId("viewed-room-composer")).toBeFocused();
 });
@@ -291,6 +319,36 @@ test("a new message does not move a reader who scrolled up, and is followed at t
   expect(await callRiverTest(page, "appendViewedMessages", "open", "Latest", 1)).toBe(true);
   await expect(pane).toContainText("Latest 00");
   await expect.poll(async () => (await metrics()).gap, { timeout: 10_000 }).toBeLessThanOrEqual(80);
+  expect(panics).toEqual([]);
+});
+
+test("in a full history window an arrival that replaces the oldest is followed at the bottom and not when scrolled up", async ({ page }) => {
+  const panics = panicsOf(page);
+  await openRoom(page, "open");
+  const pane = page.getByTestId("viewed-room-messages");
+  const rows = page.getByTestId("viewed-room-message");
+  const metrics = () => pane.evaluate((el) => ({ top: el.scrollTop, gap: el.scrollHeight - el.scrollTop - el.clientHeight }));
+  // Far more than the room keeps, so the window is full and its length constant.
+  expect(await callRiverTest(page, "appendViewedMessages", "open", "Fill", 400)).toBe(true);
+  await expect(pane).toContainText("Fill 399");
+  await expect.poll(async () => (await metrics()).gap, { timeout: 10_000 }).toBeLessThanOrEqual(80);
+  const full = await rows.count();
+  const tall = ("a much taller arriving message ").repeat(40);
+
+  // At the bottom: the arrival replaces the oldest (same row count) and is followed.
+  expect(await callRiverTest(page, "appendViewedMessages", "open", tall, 1)).toBe(true);
+  await expect(pane).toContainText("a much taller arriving message");
+  expect(await rows.count()).toBe(full);
+  await expect.poll(async () => (await metrics()).gap, { timeout: 10_000 }).toBeLessThanOrEqual(80);
+
+  // Scrolled up: the next arrival leaves the reader where they are.
+  await pane.evaluate((el) => { el.scrollTop = 40; });
+  await expect.poll(async () => (await metrics()).top).toBeLessThan(60);
+  expect(await callRiverTest(page, "appendViewedMessages", "open", "Last one", 1)).toBe(true);
+  await expect(pane).toContainText("Last one 00");
+  expect(await rows.count()).toBe(full);
+  await page.waitForTimeout(500);
+  expect((await metrics()).top).toBeLessThan(120);
   expect(panics).toEqual([]);
 });
 

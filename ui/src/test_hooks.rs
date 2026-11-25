@@ -251,6 +251,10 @@ pub fn install_test_hooks() {
                             now + std::time::Duration::from_millis(u64::from(i)),
                         ));
                     }
+                    // A full window drops its oldest messages as new ones arrive.
+                    let max = state.configuration.configuration.max_recent_messages;
+                    let extra = state.recent_messages.messages.len().saturating_sub(max);
+                    state.recent_messages.messages.drain(..extra);
                 })
             },
         )
