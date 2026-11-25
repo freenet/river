@@ -2,22 +2,38 @@
 # The pointer-freshness gate under the same eight stacked-PR cases as
 # ci-published-base-test.sh, on throwaway repos with a throwaway author key.
 #
-# Needs `pointer-record` on PATH and a throwaway signing key file in
-# $POINTER_TEST_KEY (same format as web-container-keys.toml: signing_key and
-# verifying_key lines). Without them it exits 0 and says SKIPPED on stderr:
-# nothing in CI can mint a key, so this runs by hand when the gate changes.
-# Never point it at the real author key.
+# Needs `pointer-record` and `openssl` on PATH. It mints its own THROWAWAY ed25519 key in a
+# temp dir (override with $POINTER_TEST_KEY); it never reads or needs the real author key.
+# POINTER_GATE_SCRIPT=<file> runs the cases against another version of the gate (to show what an
+# older script missed). Without the tools it exits 0 and says SKIPPED on stderr.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"; ROOT="$(cd "$HERE/.." && pwd)"
+if ! command -v pointer-record >/dev/null || ! command -v openssl >/dev/null; then
+  echo "SKIPPED: needs pointer-record and openssl on PATH" >&2; exit 0; fi
+T="$(mktemp -d)" || exit 3; trap 'rm -rf "$T"' EXIT
 KEY="${POINTER_TEST_KEY:-}"
-if [ -z "$KEY" ] || [ ! -f "$KEY" ] || ! command -v pointer-record >/dev/null; then
-  echo "SKIPPED: set POINTER_TEST_KEY to a THROWAWAY key file and install pointer-record" >&2; exit 0; fi
+if [ -z "$KEY" ]; then
+  KEY="$T/key.toml"
+  openssl genpkey -algorithm ed25519 -out "$T/k.pem" 2>/dev/null || exit 3
+  seed=$(openssl pkey -in "$T/k.pem" -outform DER | tail -c 32 | xxd -p -c64)
+  pub=$(openssl pkey -in "$T/k.pem" -pubout -outform DER | tail -c 32 | xxd -p -c64)
+  python3 - "$seed" "$pub" > "$KEY" <<'PY'
+import sys
+A='123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+def b58(h):
+    b=bytes.fromhex(h); n=int.from_bytes(b,'big'); s=''
+    while n: n,r=divmod(n,58); s=A[r]+s
+    return '1'*(len(b)-len(b.lstrip(b'\0')))+s
+print('signing_key = "river:v1:sk:%s"'%b58(sys.argv[1])); print('verifying_key = "river:v1:vk:%s"'%b58(sys.argv[2]))
+PY
+fi
+mkdir -p "$T/repo"
 VK="$(sed -n 's/^verifying_key *= *"\(.*\)"/\1/p' "$KEY" | head -1)"
 FAILS=0
-T="$(mktemp -d)" || exit 3; trap 'rm -rf "$T"' EXIT; cd "$T" || exit 3
+cd "$T/repo" || exit 3
 git init -q -b main .; git config user.email t@t; git config user.name t; git remote add origin .
 mkdir -p scripts ui/public/contracts
-cp "$HERE/check-pointer-freshness.sh" "$HERE/pointer-toml-lib.sh" "$HERE/ci-published-base.sh" scripts/
+cp "${POINTER_GATE_SCRIPT:-$HERE/check-pointer-freshness.sh}" scripts/check-pointer-freshness.sh; cp "$HERE/pointer-toml-lib.sh" "$HERE/ci-published-base.sh" scripts/
 git -C "$ROOT" show HEAD:pointer-records.toml | sed "s|^author_verifying_key *=.*|author_verifying_key = \"$VK\"|" > pointer-records.toml
 printf '%s\n' "$VK" > FREENET.md
 printf rc0 > ui/public/contracts/room_contract.wasm; printf dl0 > ui/public/contracts/chat_delegate.wasm
@@ -68,14 +84,24 @@ git checkout -q -B u1 $M; chg rc1 dl1; both 11; U1=$(commit u1)
 git checkout -q -B u2 $U1; chg rc2 dl2; both 10; H=$(commit u2)
 check "pointer 5 stack, v not above main" FAIL "$(old $U1 $H)" "$(new u1 $U1 $H)"
 git checkout -q -B v1 $M; chg rc1 dl1; both 11; python3 - <<'PY'
-p='pointer-records.toml'; s=open(p).read().split('[[record]]'); open(p,'w').write('[[record]]'.join(s[:2]))
+import re
+p='pointer-records.toml'; s=re.split(r'(?m)^(?=\[\[record\]\])',open(p).read())
+assert len(s)==3, len(s)   # header + two records; keep exactly one
+open(p,'w').write(s[0]+s[1])
 PY
 H=$(commit v1)
-check "pointer 6 record vanished" FAIL "$(old $M $H)" "$(new main $M $H)"
+check "pointer 6 one record deleted" FAIL "$(old $M $H)" "$(new main $M $H)"
 git checkout -q -B w1 $M; chg rc1 dl1; both 10; H=$(commit w1)
 check "pointer 7 main-based, same version" FAIL "$(old $M $H)" "$(new main $M $H)"
 git checkout -q -B x1 $M; chg rc1 dl1; both 11; X1=$(commit x1)
 git checkout -q -B x2 $X1; chg rc2 dl2; both 12; H=$(commit x2)
 git checkout -q -B main $M; chg rcM dlM; both 11; commit main1 >/dev/null
 check "pointer 8 stale merge-base (gap)" PASS "$(old $X1 $H)" "$(new x1 $X1 $H)"
+# 9: the base commit cannot be read (git error, not "file absent"): fail closed.
+git checkout -q -B y1 $M; chg rc1 dl1; both 11; H=$(commit y1)
+check "pointer 9 unreadable base sha" FAIL "$(old 0123456789abcdef0123456789abcdef01234567 $H)" "$(old 0123456789abcdef0123456789abcdef01234567 $H)"
+# 10: the registry did not exist at the base (a new file): nothing to compare, passes.
+git checkout -q -B z0 $M; git rm -q pointer-records.toml; Z0=$(commit z0)
+git checkout -q -B z1 $M; chg rc1 dl1; both 11; H=$(commit z1)
+check "pointer 10 registry absent at base" PASS "$(old $Z0 $H)" "$(old $Z0 $H)"
 [ "$FAILS" -eq 0 ] && echo "pointer matrix: all cases as expected" || { echo "pointer matrix: $FAILS WRONG"; exit 1; }

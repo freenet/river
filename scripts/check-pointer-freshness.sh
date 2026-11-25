@@ -93,6 +93,18 @@ elif [ -n "${1:-}" ]; then
     die "unknown argument '$1' (expected nothing, or --ci BASE_SHA HEAD_SHA)"
 fi
 
+# Write the registry as it was at the base commit to $1. Returns 1 only when the file did
+# not exist there (a new file: nothing to compare). Any other git failure (unknown commit,
+# unreadable object) is fatal: treating it as "absent" would skip the vanish and version
+# checks silently.
+base_toml_to() {
+    git rev-parse --verify -q "$BASE_SHA^{commit}" >/dev/null || die "base commit $BASE_SHA is not readable"
+    local listed
+    listed="$(git ls-tree --name-only "$BASE_SHA" -- "$TOML_REL")" || die "git ls-tree failed for $BASE_SHA"
+    [ -n "$listed" ] || return 1
+    git show "$BASE_SHA:$TOML_REL" > "$1" || die "git show $BASE_SHA:$TOML_REL failed"
+}
+
 [ -f "$TOML_PATH" ] || die "$TOML_PATH not found"
 
 # ------------------------------------------------- read ONE tree, not two
@@ -174,7 +186,7 @@ FAILED=0
 # silent.
 if [ "$MODE" = "ci" ]; then
     BASE_TOML_ALL="$(mktemp)"
-    if git show "$BASE_SHA:$TOML_REL" > "$BASE_TOML_ALL" 2>/dev/null; then
+    if base_toml_to "$BASE_TOML_ALL"; then
         # Compared as exact STRINGS via `grep -qxF` against the head file's
         # extracted app_id list — never by interpolating the app_id into a
         # regex. Both real app_ids contain a `.`, which is a regex wildcard, so
@@ -272,7 +284,7 @@ for i in $(seq 1 "$N"); do
     # downstream would ever tell us the release was ignored.
     if [ "$MODE" = "ci" ]; then
         BASE_TOML="$(mktemp)"
-        if git show "$BASE_SHA:$TOML_REL" > "$BASE_TOML" 2>/dev/null; then
+        if base_toml_to "$BASE_TOML"; then
             # Looked up BY app_id. An index-matched lookup skips this check
             # whenever the two blocks are reordered — for each index the base
             # and head apps differ, so both records dodge the version gate at

@@ -17,8 +17,12 @@ mk ok "$reg" ""
 mk lock-git "$git" ""
 mk toml-git "$reg" 'freenet-stdlib = { git = "https://github.com/freenet/freenet-stdlib", rev = "6bd4398c" }'
 
+# A second workspace lock (apps/) resolving from git must be refused too.
+mk apps-git "$reg" ""; mkdir -p "$tmp/apps-git/apps"
+printf '[[package]]\nname = "freenet-stdlib"\nversion = "0.12.1"\nsource = "%s"\n' "$git" > "$tmp/apps-git/apps/Cargo.lock"
+
 "$guard" "$tmp/ok" >/dev/null || { echo "FAIL: registry stdlib with a markdown git patch must pass"; exit 1; }
-for c in lock-git toml-git; do
+for c in lock-git toml-git apps-git; do
     if "$guard" "$tmp/$c" >/dev/null 2>&1; then echo "FAIL: $c must be refused"; exit 1; fi
 done
 echo "PASS: check-no-git-stdlib"
