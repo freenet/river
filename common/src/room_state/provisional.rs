@@ -849,7 +849,34 @@ pub(crate) struct ProvisionalPlan {
     pub pool_cap: usize,
     /// Issuers of the kept provisional bans: required ids in the member loop.
     pub ban_issuers: HashSet<MemberId>,
+    /// The latest time a provisional author's message is ranked at (P6), or
+    /// `None` when no message exists to anchor it. Fixed once per pass here,
+    /// so the member loop and step 5b rank by the same value.
+    pub ceiling: Option<SignedTime>,
 }
+
+impl ProvisionalPlan {
+    /// The key the P6 window scan orders a message by, newest first: its time,
+    /// except that a provisional author's time is clamped to `ceiling`, so a
+    /// message dated far ahead cannot hold a pool slot over honest newcomers.
+    /// Every site that applies P6 must order by this key.
+    pub(crate) fn scan_key(
+        &self,
+        m: &crate::room_state::message::AuthorizedMessageV1,
+    ) -> crate::room_state::message::MessageOrderKey {
+        let mut key = m.order_key();
+        if let (Some(ceiling), true) = (self.ceiling, self.ids.contains(&m.message.author)) {
+            key.time = key.time.min(ceiling);
+        }
+        key
+    }
+}
+
+/// How far past the newest member message's time a provisional message is
+/// ranked (P6). Ten minutes covers an honest newcomer's clock being a few
+/// minutes fast and the delay between signing and the message reaching a peer,
+/// while a message dated further ahead gains nothing from it.
+pub const PROVISIONAL_TIME_SLACK: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// What ban enforcement fixed for [`ChatRoomStateV1::provisional_step`].
 pub(crate) struct BanInputs<'a> {
@@ -977,23 +1004,45 @@ impl ChatRoomStateV1 {
                 }
             }
             // Owner bans first, then the first ban per target before repeats,
-            // then digest. A repeat is a ban whose target an earlier ban in
-            // (owner first, digest) order already names.
-            valid.sort_by_key(|(non_owner, digest, _)| (*non_owner, *digest));
+            // then NEWEST `banned_at` first, then digest. A repeat is a ban
+            // whose target an earlier ban in (owner first, newest first,
+            // digest) order already names. Newest first keeps the ban just
+            // issued when the list is full and cuts the oldest, as UserBans
+            // do (`BansV1::enforce_user_ban_cap`); a digest-only order cut a
+            // random ban, the new one about 1 time in `cap + 1`. A far-future
+            // `banned_at` holds a slot until the cap pushes it out, which is
+            // accepted: bans are signed by the owner or an owner deputy, who
+            // are trusted. This is the only place the provisional ban set is
+            // chosen: summaries and deltas carry `self.provisional.bans`
+            // as this step left it.
+            valid.sort_by_key(|(non_owner, digest, ban)| {
+                (*non_owner, std::cmp::Reverse(ban.ban.banned_at), *digest)
+            });
             let mut per_target: HashMap<MemberId, usize> = HashMap::new();
-            let mut ranked: Vec<(bool, usize, BanDigest, &AuthorizedProvisionalBan)> = valid
+            let mut ranked: Vec<(
+                (bool, usize, std::cmp::Reverse<SignedTime>, BanDigest),
+                &AuthorizedProvisionalBan,
+            )> = valid
                 .into_iter()
                 .map(|(non_owner, digest, ban)| {
                     let seen_before = per_target.entry(ban.ban.target).or_insert(0);
                     let rank = *seen_before;
                     *seen_before += 1;
-                    (non_owner, rank, digest, ban)
+                    (
+                        (
+                            non_owner,
+                            rank,
+                            std::cmp::Reverse(ban.ban.banned_at),
+                            digest,
+                        ),
+                        ban,
+                    )
                 })
                 .collect();
-            ranked.sort_by_key(|(non_owner, rank, digest, _)| (*non_owner, *rank, *digest));
+            ranked.sort_by_key(|(key, _)| *key);
             ranked.truncate(policy.ban_cap());
             let mut kept: Vec<AuthorizedProvisionalBan> =
-                ranked.into_iter().map(|(_, _, _, b)| b.clone()).collect();
+                ranked.into_iter().map(|(_, b)| b.clone()).collect();
             kept.sort_by_cached_key(ban_digest);
             kept
         };
@@ -1077,11 +1126,36 @@ impl ChatRoomStateV1 {
         let ids: HashSet<MemberId> = entries.iter().map(|e| e.member_id()).collect();
         self.provisional.entries = entries;
         self.provisional.bans = kept_bans;
+        // P6 ceiling: the newest message of the owner or a member plus the
+        // slack. A pure function of the state at this point (members after
+        // ban enforcement), computed once and carried in the plan. With no
+        // such message the anchor is the OLDEST provisional message: an
+        // empty room has no clock, and anchoring there ranks every
+        // provisional message within the slack of the earliest, so a far-
+        // future one still cannot outrank honest ones (they tie, and the
+        // id decides).
+        let ceiling = {
+            let member_ids: HashSet<MemberId> =
+                self.members.members.iter().map(|m| m.member.id()).collect();
+            let msgs = &self.recent_messages.messages;
+            msgs.iter()
+                .filter(|m| m.message.author == owner_id || member_ids.contains(&m.message.author))
+                .map(|m| m.message.time)
+                .max()
+                .or_else(|| {
+                    msgs.iter()
+                        .filter(|m| ids.contains(&m.message.author))
+                        .map(|m| m.message.time)
+                        .min()
+                })
+                .map(|t| t + PROVISIONAL_TIME_SLACK)
+        };
         ProvisionalPlan {
             ids,
             quota,
             pool_cap: policy.pool_cap(),
             ban_issuers,
+            ceiling,
         }
     }
 }
