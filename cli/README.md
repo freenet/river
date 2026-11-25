@@ -296,7 +296,7 @@ A public room can let newcomers in by proof of work instead of an invitation.
   small rise in difficulty does not invalidate the proof, and `--threads`
   (at most 256) sets the solver threads. Later messages use
   `riverctl message send <room> "text" --signing-key <key>`.
-- A room holds at most `--max-provisional` open members (16 at most). When it
+- A room holds at most `--max-provisional` open members (32 at most). When it
   is full a new member is not turned away for being one too many: the open
   members are the authors of the newest open-member messages, so the member
   whose newest message is oldest drops out (entry and messages) and can come
@@ -307,7 +307,7 @@ A public room can let newcomers in by proof of work instead of an invitation.
 - The room owner turns it on with
   `riverctl room config <room> --public-admission true`, and tunes it with
   `--admission-difficulty` (0 to 32 bits), `--admission-new-epoch`
-  (invalidates every proof solved so far), `--max-provisional` (1 to 16),
+  (invalidates every proof solved so far), `--max-provisional` (1 to 32),
   `--max-provisional-messages`, `--max-provisional-bans` and
   `--admission-listed`. `--public-admission false` turns it off and clears
   the room's open members and bans.

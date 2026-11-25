@@ -41,10 +41,18 @@ use std::time::{Duration, Instant, SystemTime};
 const WINDOW: usize = 100;
 const MEMBERS: u8 = 26;
 /// The ceilings: `MAX_PROVISIONAL_CEILING` entries and as many bans.
-const PROVISIONAL: usize = 16;
+/// Overridable with `BENCH_PROVISIONAL=<n>` to measure a candidate cap.
+fn provisional() -> usize {
+    std::env::var("BENCH_PROVISIONAL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(river_core::room_state::provisional::MAX_PROVISIONAL_CEILING as usize)
+}
 /// What fills the window beside the members' three messages each and the
 /// provisional authors' one each.
-const OWNER_FILL: usize = WINDOW - MEMBERS as usize * 3 - PROVISIONAL;
+fn owner_fill() -> usize {
+    WINDOW.saturating_sub(MEMBERS as usize * 3 + provisional())
+}
 
 fn sk(n: u32) -> SigningKey {
     let mut b = [0u8; 32];
@@ -80,9 +88,9 @@ fn build(
     let owner_id = params.owner_id();
     let policy = with_provisional.then_some(PublicRoomPolicy {
         listed: false,
-        max_provisional: PROVISIONAL as u32,
+        max_provisional: provisional() as u32,
         max_provisional_messages: 500,
-        max_provisional_bans: PROVISIONAL as u32,
+        max_provisional_bans: provisional() as u32,
         pow: Some(PowPolicy {
             difficulty_bits: 0,
             epoch: 1,
@@ -117,7 +125,7 @@ fn build(
             msgs.push(msg(owner_id, k, t));
         }
     }
-    for _ in 0..OWNER_FILL {
+    for _ in 0..owner_fill() {
         t += 1;
         msgs.push(msg(owner_id, &owner, t));
     }
@@ -145,7 +153,7 @@ fn build(
     );
     if with_provisional {
         // 16 (the ceiling) provisional authors, each with an entry and one message.
-        let authors: Vec<SigningKey> = (0..PROVISIONAL as u32).map(|i| sk(500_000 + i)).collect();
+        let authors: Vec<SigningKey> = (0..provisional() as u32).map(|i| sk(500_000 + i)).collect();
         let entries: Vec<AuthorizedProvisionalMember> = authors
             .iter()
             .map(|k| {
@@ -161,7 +169,7 @@ fn build(
                 )
             })
             .collect();
-        let bans: Vec<AuthorizedProvisionalBan> = (0..PROVISIONAL as u32)
+        let bans: Vec<AuthorizedProvisionalBan> = (0..provisional() as u32)
             .map(|i| {
                 AuthorizedProvisionalBan::new(
                     &params.owner,
@@ -191,12 +199,12 @@ fn build(
         );
         assert_eq!(
             state.provisional.entries.len(),
-            PROVISIONAL,
+            provisional(),
             "fixture holds the ceiling of entries"
         );
         assert_eq!(
             state.provisional.bans.len(),
-            PROVISIONAL,
+            provisional(),
             "fixture holds the ceiling of bans"
         );
     }
@@ -205,7 +213,7 @@ fn build(
         if with_provisional {
             WINDOW
         } else {
-            WINDOW - PROVISIONAL
+            MEMBERS as usize * 3 + owner_fill()
         }
     );
     (state, params, members[0].clone(), owner)
@@ -248,7 +256,9 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(15);
     println!(
-        "room at the ceilings: {PROVISIONAL} entries, {PROVISIONAL} provisional bans, window {WINDOW}"
+        "room at the ceilings: {} entries, {} provisional bans, window {WINDOW}",
+        provisional(),
+        provisional()
     );
     let mut medians = Vec::new();
     for with in [false, true] {
@@ -291,7 +301,7 @@ fn main() {
     {
         let (state, params, member, owner) = build(true);
         let owner_id = params.owner_id();
-        let authors: Vec<SigningKey> = (0..PROVISIONAL as u32).map(|i| sk(600_000 + i)).collect();
+        let authors: Vec<SigningKey> = (0..provisional() as u32).map(|i| sk(600_000 + i)).collect();
         let entries = authors
             .iter()
             .map(|k| {
@@ -305,7 +315,7 @@ fn main() {
                 )
             })
             .collect();
-        let bans = (0..PROVISIONAL as u32)
+        let bans = (0..provisional() as u32)
             .map(|i| {
                 AuthorizedProvisionalBan::new(
                     &params.owner,
