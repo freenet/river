@@ -25,14 +25,16 @@ use std::fmt;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use freenet_stdlib::client_api::{ContractRequest, ContractResponse, HostResponse};
+use freenet_stdlib::client_api::{
+    ContractError, ContractRequest, ContractResponse, ErrorKind, HostResponse, RequestError,
+};
 use freenet_stdlib::prelude::{
-    ContractCode, ContractContainer, ContractKey, ContractWasmAPIVersion, Parameters,
-    WrappedContract, WrappedState,
+    ContractCode, ContractContainer, ContractInstanceId, ContractKey, ContractWasmAPIVersion,
+    Parameters, WrappedContract, WrappedState,
 };
 use std::sync::Arc;
 
-use crate::api::{classify_put_response, ApiClient, PutAck};
+use crate::api::{classify_put_response, ApiClient, PutAck, WaitError};
 
 /// Domain separation prefix for the handle derivation (generation 1).
 pub const DERIVE_DOMAIN: &[u8] = b"freenet-shortkey/v1";
@@ -62,6 +64,16 @@ const RESOLVER_WASM: &[u8] = include_bytes!("../contracts/freenet_shortkey_v1.wa
 /// a test pins the two together.
 pub const WEB_APP_ID: &str = "raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv";
 
+/// Whether the shipped River UI opens `?room=<handle>` links. While this is false, riverctl
+/// still publishes resolver entries but does not advertise short links in `room config` output,
+/// and `room short-link` says such links open only in a River release with short-link support.
+/// The UI resolve PR (freenet/river#973) flips it to true.
+pub const UI_RESOLVES_SHORT_LINKS: bool = false;
+
+/// Total time `room config` spends publishing the resolver entry after the configuration
+/// change has been applied. The GET and PUT timeouts below are per request; this bounds both.
+pub const AUTO_PUBLISH_BUDGET: Duration = Duration::from_secs(10);
+
 /// How long to wait for the node to answer a resolver GET.
 pub const GET_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long to wait for the node to answer a resolver PUT.
@@ -75,6 +87,9 @@ pub enum ShortError {
     BadState(&'static str),
     /// The key does not hash to the handle.
     Mismatch,
+    /// Not an acceptable Ed25519 owner key (non-canonical, small-order or mixed-order),
+    /// which the resolver contract refuses.
+    BadKey,
 }
 
 impl fmt::Display for ShortError {
@@ -82,6 +97,11 @@ impl fmt::Display for ShortError {
         match self {
             ShortError::BadHandle(s) => write!(f, "invalid short handle: {s}"),
             ShortError::BadState(s) => write!(f, "malformed resolver state: {s}"),
+            ShortError::BadKey => write!(
+                f,
+                "not an acceptable Ed25519 owner key (non-canonical, small-order or mixed-order); \
+                 the resolver contract would refuse it"
+            ),
             ShortError::Mismatch => write!(
                 f,
                 "the resolver returned a key that does not hash to this handle; refusing it"
@@ -222,13 +242,28 @@ pub fn state_owner_key(bytes: &[u8]) -> Result<[u8; KEY_LEN], ShortError> {
     }
 }
 
+/// The resolver contract's `validate_key`: the canonical encoding of a point in the prime-order
+/// subgroup that is not the identity. Checked here too so `short-link` refuses early a key the
+/// contract would refuse on PUT.
+pub fn validate_owner_key(vk: &[u8; KEY_LEN]) -> Result<(), ShortError> {
+    let key = ed25519_dalek::VerifyingKey::from_bytes(vk).map_err(|_| ShortError::BadKey)?;
+    let point = key.to_edwards();
+    if point.compress().to_bytes() != *vk
+        || point.is_small_order()
+        || !point.is_torsion_free()
+        || key.is_weak()
+    {
+        return Err(ShortError::BadKey);
+    }
+    Ok(())
+}
+
 /// Read a resolver state and verify it against `handle`: the key it holds must
 /// hash to the handle, and must be a well-formed Ed25519 key.
 pub fn resolve_state(handle: &ShortHandle, state: &[u8]) -> Result<[u8; KEY_LEN], ShortError> {
     let vk = state_owner_key(state)?;
     handle.verify(&vk)?;
-    ed25519_dalek::VerifyingKey::from_bytes(&vk)
-        .map_err(|_| ShortError::BadState("not an Ed25519 key"))?;
+    validate_owner_key(&vk)?;
     Ok(vk)
 }
 
@@ -266,6 +301,8 @@ pub enum Lookup {
     NotFound(String),
     /// No answer in time: the entry may or may not exist.
     TimedOut,
+    /// The lookup itself failed (connection closed, node error): says nothing about the entry.
+    Error(String),
 }
 
 /// What publishing did.
@@ -275,6 +312,61 @@ pub enum Published {
     AlreadyPublished,
     /// The entry was created.
     Created,
+}
+
+/// A request the resolver flow may send: a GET or a PUT, by construction. `ApiClient::send_and_await`
+/// takes only this, so it cannot be used to send an Update or any other operation.
+pub enum ResolverRequest {
+    Get(ContractInstanceId),
+    Put(ShortHandle, [u8; KEY_LEN]),
+}
+
+impl ResolverRequest {
+    pub(crate) fn into_request(self) -> ContractRequest<'static> {
+        match self {
+            ResolverRequest::Get(id) => ContractRequest::Get {
+                key: id,
+                return_contract_code: false,
+                subscribe: false,
+                blocking_subscribe: false,
+            },
+            ResolverRequest::Put(handle, vk) => ContractRequest::Put {
+                contract: resolver_container(&handle),
+                state: resolver_state(&vk),
+                related_contracts: Default::default(),
+                subscribe: false,
+                blocking_subscribe: false,
+            },
+        }
+    }
+}
+
+/// How a resolver PUT answer counts: `Merged` means the entry already existed.
+pub(crate) fn published_from_ack(ack: PutAck) -> Option<Published> {
+    match ack {
+        PutAck::NotYet => None,
+        PutAck::Stored | PutAck::Acknowledged => Some(Published::Created),
+        PutAck::Merged => Some(Published::AlreadyPublished),
+    }
+}
+
+/// Classify the error from a failed wait into a [`Lookup`].
+pub fn lookup_from_error(e: &anyhow::Error) -> Lookup {
+    match e.downcast_ref::<WaitError>() {
+        Some(WaitError::Timeout(_)) => Lookup::TimedOut,
+        Some(WaitError::Recv(client)) => match client.kind() {
+            ErrorKind::RequestError(RequestError::ContractError(
+                ContractError::MissingContract { .. } | ContractError::Get { .. },
+            )) => Lookup::NotFound(e.to_string()),
+            _ => Lookup::Error(e.to_string()),
+        },
+        None => Lookup::Error(e.to_string()),
+    }
+}
+
+/// The URL to advertise for `handle`, or `None` while the UI cannot open short links.
+pub fn advertised_link(handle: &ShortHandle, ui_resolves: bool) -> Option<String> {
+    ui_resolves.then(|| short_link(handle))
 }
 
 /// The resolver contract container for `handle`: generation 1 code, the handle bytes as parameters.
@@ -298,6 +390,10 @@ pub fn resolve_lookup(handle: &ShortHandle, lookup: Lookup) -> Result<[u8; KEY_L
             "no resolver entry for handle {handle}: the room owner has not published one \
              (node said: {why})"
         )),
+        Lookup::Error(why) => Err(anyhow!(
+            "could not look up handle {handle}: {why}. This says nothing about whether the \
+             entry exists; check the node connection (--node-url) and retry"
+        )),
         Lookup::TimedOut => Err(anyhow!(
             "timed out looking up handle {handle}; the entry may not exist or the network \
              may be slow"
@@ -309,15 +405,9 @@ impl ApiClient {
     /// GET the resolver contract for `handle`.
     pub async fn short_handle_lookup(&self, handle: &ShortHandle) -> Lookup {
         let id = *resolver_contract_key(handle).id();
-        let request = ContractRequest::Get {
-            key: id,
-            return_contract_code: false,
-            subscribe: false,
-            blocking_subscribe: false,
-        };
         let answer = self
             .send_and_await(
-                request,
+                ResolverRequest::Get(id),
                 GET_TIMEOUT,
                 "short handle GET response",
                 |response| match response {
@@ -335,18 +425,13 @@ impl ApiClient {
                 },
             )
             .await;
-        match answer {
-            Ok(lookup) => lookup,
-            // `await_response` words its deadline error this way; anything else is the node
-            // refusing (a missing contract arrives as a client error).
-            Err(e) if e.to_string().starts_with("Timeout waiting") => Lookup::TimedOut,
-            Err(e) => Lookup::NotFound(e.to_string()),
-        }
+        answer.unwrap_or_else(|e| lookup_from_error(&e))
     }
 
     /// PUT the minimal resolver entry for `vk`, unless it is already there.
     pub async fn short_handle_publish(&self, vk: &[u8; KEY_LEN]) -> Result<Published> {
         check_embedded_resolver()?;
+        validate_owner_key(vk)?;
         let handle = ShortHandle::derive(vk);
         if let Lookup::Found(state) = self.short_handle_lookup(&handle).await {
             // The contract rejects a key that does not hash to the handle, so a found state
@@ -356,21 +441,11 @@ impl ApiClient {
             }
         }
         let contract_key = resolver_contract_key(&handle);
-        let request = ContractRequest::Put {
-            contract: resolver_container(&handle),
-            state: resolver_state(vk),
-            related_contracts: Default::default(),
-            subscribe: false,
-            blocking_subscribe: false,
-        };
         self.send_and_await(
-            request,
+            ResolverRequest::Put(handle, *vk),
             PUT_TIMEOUT,
             "short handle PUT response",
-            |response| match classify_put_response(&contract_key, response) {
-                PutAck::NotYet => None,
-                _ => Some(Ok(Published::Created)),
-            },
+            |response| published_from_ack(classify_put_response(&contract_key, response)).map(Ok),
         )
         .await
     }
@@ -381,13 +456,20 @@ impl ApiClient {
     }
 }
 
-/// Best-effort publish used by `room config --public-admission true`: a failure is
-/// a warning, never an error. Returns the short link when the entry is in place.
-pub async fn publish_best_effort(api: &ApiClient, vk: &[u8; KEY_LEN]) -> Option<String> {
-    let handle = ShortHandle::derive(vk);
-    match api.short_handle_publish(vk).await {
-        Ok(_) => Some(short_link(&handle)),
-        Err(e) => {
+/// Best-effort publish used by `room config --public-admission true`, run AFTER the
+/// configuration change is applied and reported. The whole publish is bounded by `budget`; a
+/// failure or a timeout warns and returns `None`, never an error. Returns the outcome on success.
+pub async fn publish_best_effort_within<F>(
+    handle: &ShortHandle,
+    budget: Duration,
+    publish: F,
+) -> Option<Published>
+where
+    F: std::future::Future<Output = Result<Published>>,
+{
+    match tokio::time::timeout(budget, publish).await {
+        Ok(Ok(done)) => Some(done),
+        Ok(Err(e)) => {
             tracing::warn!("could not publish the short handle {handle}: {e}");
             eprintln!(
                 "warning: could not publish the short link entry for this room ({e}). The room \
@@ -395,7 +477,22 @@ pub async fn publish_best_effort(api: &ApiClient, vk: &[u8; KEY_LEN]) -> Option<
             );
             None
         }
+        Err(_) => {
+            eprintln!(
+                "warning: publishing the short link entry for this room took longer than {}s and \
+                 was abandoned. The room setting was changed. Retry with `riverctl room \
+                 short-link <room> --publish`.",
+                budget.as_secs()
+            );
+            None
+        }
     }
+}
+
+/// [`publish_best_effort_within`] against the node, with [`AUTO_PUBLISH_BUDGET`].
+pub async fn publish_best_effort(api: &ApiClient, vk: &[u8; KEY_LEN]) -> Option<Published> {
+    let handle = ShortHandle::derive(vk);
+    publish_best_effort_within(&handle, AUTO_PUBLISH_BUDGET, api.short_handle_publish(vk)).await
 }
 
 #[cfg(test)]
@@ -556,5 +653,182 @@ mod tests {
         let b = resolver_contract_key(&ShortHandle::derive(&[2u8; 32]));
         assert_ne!(a.id(), b.id());
         assert_eq!(a.code_hash().to_string(), RESOLVER_CODE_HASH_B58);
+    }
+
+    // ---- review fixes (river#1043) ----
+
+    #[test]
+    fn owner_key_check_is_as_strict_as_the_contract() {
+        let good = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
+        assert!(validate_owner_key(good.verifying_key().as_bytes()).is_ok());
+        // identity point y = 1
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        assert_eq!(validate_owner_key(&identity), Err(ShortError::BadKey));
+        // (0, -1): order 2
+        let mut order2 = [0xffu8; 32];
+        order2[0] = 0xec;
+        order2[31] = 0x7f;
+        assert_eq!(validate_owner_key(&order2), Err(ShortError::BadKey));
+        // non-canonical alias of the identity, y = p + 1
+        let mut alias = [0xffu8; 32];
+        alias[0] = 0xee;
+        alias[31] = 0x7f;
+        assert_eq!(validate_owner_key(&alias), Err(ShortError::BadKey));
+        // resolve_state applies it too (a state whose key is small-order but hashes right)
+        let id = ShortHandle::derive(&identity);
+        assert_eq!(
+            resolve_state(&id, &minimal_state(&identity)),
+            Err(ShortError::BadKey)
+        );
+    }
+
+    #[test]
+    fn short_links_are_advertised_only_when_the_ui_resolves_them() {
+        let id = ShortHandle::derive(&[4u8; 32]);
+        assert_eq!(advertised_link(&id, true), Some(short_link(&id)));
+        assert_eq!(advertised_link(&id, false), None);
+        // The shipped UI cannot open them yet; the UI resolve PR flips this and this test.
+        assert!(!UI_RESOLVES_SHORT_LINKS);
+    }
+
+    fn client_error(kind: ErrorKind) -> anyhow::Error {
+        anyhow::Error::new(WaitError::Recv(
+            freenet_stdlib::client_api::ClientError::from(kind),
+        ))
+    }
+
+    #[test]
+    fn lookup_errors_are_told_apart() {
+        let timeout = anyhow::Error::new(WaitError::Timeout("Timeout waiting for x".into()));
+        assert_eq!(lookup_from_error(&timeout), Lookup::TimedOut);
+
+        let id = *resolver_contract_key(&ShortHandle::derive(&[1u8; 32])).id();
+        let missing = client_error(ErrorKind::RequestError(RequestError::ContractError(
+            ContractError::MissingContract { key: id },
+        )));
+        assert!(matches!(lookup_from_error(&missing), Lookup::NotFound(_)));
+
+        // A dead connection is NOT "not found".
+        for dead in [
+            ErrorKind::Disconnect,
+            ErrorKind::ChannelClosed,
+            ErrorKind::NodeUnavailable,
+        ] {
+            assert!(matches!(
+                lookup_from_error(&client_error(dead)),
+                Lookup::Error(_)
+            ));
+        }
+        assert!(matches!(
+            lookup_from_error(&anyhow!("Failed to send the x request: closed")),
+            Lookup::Error(_)
+        ));
+    }
+
+    #[test]
+    fn each_failure_has_its_own_message() {
+        let vk = [3u8; 32];
+        let ed = ed25519_dalek::SigningKey::from_bytes(&vk);
+        let vk = *ed.verifying_key().as_bytes();
+        let id = ShortHandle::derive(&vk);
+        let msg = |l: Lookup| resolve_lookup(&id, l).unwrap_err().to_string();
+        let not_found = msg(Lookup::NotFound("x".into()));
+        let transport = msg(Lookup::Error("connection closed".into()));
+        let timed_out = msg(Lookup::TimedOut);
+        let malformed = msg(Lookup::Found(b"\x02junk".to_vec()));
+        let other = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let mismatch = msg(Lookup::Found(minimal_state(
+            other.verifying_key().as_bytes(),
+        )));
+        assert!(not_found.contains("has not published"));
+        assert!(
+            transport.contains("could not look up") && !transport.contains("has not published")
+        );
+        assert!(timed_out.contains("timed out"));
+        assert!(malformed.contains("malformed resolver state"));
+        assert!(mismatch.contains("does not hash to this handle"));
+        let all = [not_found, transport, timed_out, malformed, mismatch];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn an_existing_entry_is_not_reported_as_created() {
+        assert_eq!(published_from_ack(PutAck::Stored), Some(Published::Created));
+        assert_eq!(
+            published_from_ack(PutAck::Merged),
+            Some(Published::AlreadyPublished)
+        );
+        assert_eq!(published_from_ack(PutAck::NotYet), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn auto_publish_is_bounded_and_never_fails() {
+        let id = ShortHandle::derive(&[2u8; 32]);
+        // A hung node: the publish never answers. The whole thing ends at the budget.
+        let started = tokio::time::Instant::now();
+        let out = publish_best_effort_within(
+            &id,
+            Duration::from_secs(10),
+            std::future::pending::<Result<Published>>(),
+        )
+        .await;
+        assert_eq!(out, None);
+        assert_eq!(started.elapsed(), Duration::from_secs(10));
+        // An error warns and returns None rather than propagating.
+        let out = publish_best_effort_within(&id, Duration::from_secs(10), async {
+            Err::<Published, _>(anyhow!("boom"))
+        })
+        .await;
+        assert_eq!(out, None);
+        let out = publish_best_effort_within(&id, Duration::from_secs(10), async {
+            Ok(Published::Created)
+        })
+        .await;
+        assert_eq!(out, Some(Published::Created));
+        // The budget is shorter than one request timeout, which is the point of it.
+        assert!(AUTO_PUBLISH_BUDGET < GET_TIMEOUT + PUT_TIMEOUT);
+    }
+
+    /// The resolver seam in `api.rs` is outside that file's response-multiplexing pin, so pin
+    /// its use here: only this module calls it, and the PUT keeps its classifier.
+    #[test]
+    fn the_resolver_seam_is_used_only_here_and_keeps_its_classifier() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stack = vec![root.clone()];
+        let mut seen = 0;
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    seen += 1;
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    let name = path.file_name().unwrap().to_str().unwrap();
+                    if name != "api.rs" && name != "shortkey.rs" {
+                        assert!(
+                            !text.contains("send_and_await("),
+                            "{name} calls send_and_await; only shortkey.rs may"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(seen >= 8, "the source walk found only {seen} files");
+        let src = include_str!("shortkey.rs");
+        let body = src
+            .split("pub async fn short_handle_publish")
+            .nth(1)
+            .and_then(|b| b.split("pub async fn short_handle_resolve").next())
+            .expect("short_handle_publish exists");
+        let squashed: String = body.split_whitespace().collect();
+        assert!(squashed.contains("classify_put_response(&contract_key,response)"));
+        assert!(squashed.contains("published_from_ack("));
+        assert!(squashed.contains("ResolverRequest::Put("));
     }
 }

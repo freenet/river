@@ -903,6 +903,27 @@ fn response_kind(response: &HostResponse) -> &'static str {
     }
 }
 
+/// Why [`await_response`] gave up, typed so a caller can tell a deadline from a node refusal
+/// without matching on message text. The `Display` text is what the untyped errors said.
+#[derive(Debug)]
+pub(crate) enum WaitError {
+    /// The deadline passed.
+    Timeout(String),
+    /// The connection returned an error instead of a response.
+    Recv(ClientError),
+}
+
+impl std::fmt::Display for WaitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WaitError::Timeout(msg) => f.write_str(msg),
+            WaitError::Recv(e) => write!(f, "Failed to receive response: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for WaitError {}
+
 /// Wait for the node's answer to the request we just sent, stepping over
 /// responses that are not it.
 ///
@@ -972,11 +993,13 @@ async fn await_response<T, S: ResponseSource>(
     // a failed wait would say only "timeout" where it used to name what the
     // node actually sent.
     let timed_out = |n: usize, last: Option<&'static str>| match last {
-        Some(kind) => anyhow!(
+        Some(kind) => anyhow::Error::new(WaitError::Timeout(format!(
             "Timeout waiting for {awaiting} after {timeout:?}; stepped over {n} response(s) \
              that were not it, most recently a {kind}"
-        ),
-        None => anyhow!("Timeout waiting for {awaiting} after {timeout:?}; the node sent nothing"),
+        ))),
+        None => anyhow::Error::new(WaitError::Timeout(format!(
+            "Timeout waiting for {awaiting} after {timeout:?}; the node sent nothing"
+        ))),
     };
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -1050,7 +1073,7 @@ async fn await_response<T, S: ResponseSource>(
                     debug!("Stepping over a {kind} while waiting for the {awaiting}");
                 }
             },
-            Ok(Err(e)) => return Err(anyhow!("Failed to receive response: {e}")),
+            Ok(Err(e)) => return Err(anyhow::Error::new(WaitError::Recv(e))),
             Err(_) => return Err(timed_out(stepped_over, last_stepped)),
         }
     }
@@ -2768,21 +2791,22 @@ impl ApiClient {
         &self.storage
     }
 
-    /// Send one contract request and wait for its answer through the shared waiter.
+    /// Send one resolver request (a GET or a PUT, by construction) and wait for its answer
+    /// through the shared waiter.
     ///
     /// For callers outside this file (the short-handle resolver, `crate::shortkey`) that
     /// build their own request and classifier but must not read the multiplexed connection
     /// themselves: `classify` has the same three outcomes as in [`await_response`].
     pub(crate) async fn send_and_await<T>(
         &self,
-        request: ContractRequest<'static>,
+        request: crate::shortkey::ResolverRequest,
         timeout: Duration,
         awaiting: &str,
         classify: impl FnMut(&HostResponse) -> Option<Result<T>>,
     ) -> Result<T> {
         let mut web_api = self.web_api.lock().await;
         web_api
-            .send(ClientRequest::ContractOp(request))
+            .send(ClientRequest::ContractOp(request.into_request()))
             .await
             .map_err(|e| anyhow!("Failed to send the {awaiting} request: {e}"))?;
         await_response(&mut web_api, timeout, awaiting, classify).await
@@ -14826,6 +14850,33 @@ mod await_response_tests {
             conn.reads, 2,
             "the notification must be READ and stepped over, not skipped by luck"
         );
+    }
+
+    /// Callers tell a deadline from a node refusal by TYPE, not by message text
+    /// (the short-handle lookup does): pin both shapes.
+    #[tokio::test(start_paused = true)]
+    async fn await_response_errors_are_typed() {
+        let mut silent = Scripted::new(vec![]);
+        let err = await_response::<(), _>(&mut silent, Duration::from_secs(1), "x", |_| None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<WaitError>(),
+            Some(WaitError::Timeout(_))
+        ));
+        assert!(err.to_string().starts_with("Timeout waiting for x"));
+
+        let mut refused = Scripted::new(vec![Err(ClientError::from(
+            freenet_stdlib::client_api::ErrorKind::Disconnect,
+        ))]);
+        let err = await_response::<(), _>(&mut refused, Duration::from_secs(1), "x", |_| None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<WaitError>(),
+            Some(WaitError::Recv(_))
+        ));
+        assert!(err.to_string().starts_with("Failed to receive response"));
     }
 
     /// And it must keep stepping, rather than step over exactly one.

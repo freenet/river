@@ -196,6 +196,25 @@ pub enum RoomCommands {
     },
 }
 
+/// Publish the resolver entry when `--public-admission true` was just applied, and return the
+/// short link to show, if one may be shown (see `shortkey::UI_RESOLVES_SHORT_LINKS`). The entry
+/// is published either way; only advertising the link is gated.
+async fn auto_publish_short_link(
+    api: &ApiClient,
+    owner_key: &ed25519_dalek::VerifyingKey,
+    public_admission: Option<bool>,
+) -> Option<String> {
+    if public_admission != Some(true) {
+        return None;
+    }
+    let vk = owner_key.to_bytes();
+    crate::shortkey::publish_best_effort(api, &vk).await?;
+    crate::shortkey::advertised_link(
+        &crate::shortkey::ShortHandle::derive(&vk),
+        crate::shortkey::UI_RESOLVES_SHORT_LINKS,
+    )
+}
+
 /// Build the JSON payload emitted by `room join --format json`.
 ///
 /// `room join` cannot make the caller a member (River requires an
@@ -734,21 +753,9 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
                 .await
             {
                 Ok(()) => {
-                    // Opening a room to the public is when a short link becomes useful, so
-                    // publish the resolver entry now. Best effort: a failure warns and the
-                    // configuration change stands.
-                    let short_link = if public_admission == Some(true) {
-                        let vk = crate::shortkey::parse_owner_key(&room_id)?;
-                        crate::shortkey::publish_best_effort(&api, &vk).await
-                    } else {
-                        None
-                    };
                     match format {
                         OutputFormat::Human => {
                             println!("{}", "Configuration updated successfully!".green());
-                            if let Some(link) = &short_link {
-                                println!("  short link: {link}");
-                            }
                             if let Some(v) = name {
                                 println!("  name: {}", v);
                             }
@@ -776,16 +783,27 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
                             if let Some(v) = max_room_description {
                                 println!("  max_room_description: {}", v);
                             }
+                            // After the change is applied and reported: opening a room to the
+                            // public is when a short link becomes useful, so publish the
+                            // resolver entry. Best effort and time-bounded; nothing here can
+                            // fail the command.
+                            if let Some(link) =
+                                auto_publish_short_link(&api, &owner_key, public_admission).await
+                            {
+                                println!("  short link: {link}");
+                            }
                         }
                         OutputFormat::Json => {
-                            println!(
-                                "{}",
-                                serde_json::json!({
-                                    "status": "success",
-                                    "room_id": room_id,
-                                    "short_link": short_link,
-                                })
-                            );
+                            let mut out = serde_json::json!({
+                                "status": "success",
+                                "room_id": room_id,
+                            });
+                            if let Some(link) =
+                                auto_publish_short_link(&api, &owner_key, public_admission).await
+                            {
+                                out["short_link"] = serde_json::Value::String(link);
+                            }
+                            println!("{out}");
                         }
                     }
                     Ok(())
@@ -798,8 +816,7 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
         }
         RoomCommands::ShortLink { room_id, publish } => {
             let vk = crate::shortkey::parse_owner_key(&room_id)?;
-            ed25519_dalek::VerifyingKey::from_bytes(&vk)
-                .map_err(|e| anyhow::anyhow!("Invalid room owner key: {}", e))?;
+            crate::shortkey::validate_owner_key(&vk)?;
             let handle = crate::shortkey::ShortHandle::derive(&vk);
             let published = if publish {
                 Some(api.short_handle_publish(&vk).await?)
@@ -811,10 +828,17 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
                 Some(_) => Some(true),
                 None => match api.short_handle_lookup(&handle).await {
                     crate::shortkey::Lookup::Found(state) => {
-                        Some(crate::shortkey::resolve_state(&handle, &state).is_ok())
+                        crate::shortkey::resolve_state(&handle, &state)?;
+                        Some(true)
                     }
                     crate::shortkey::Lookup::NotFound(_) => Some(false),
                     crate::shortkey::Lookup::TimedOut => None,
+                    crate::shortkey::Lookup::Error(why) => {
+                        anyhow::bail!(
+                            "could not look up the resolver entry: {why}. Check the node \
+                             connection (--node-url) and retry"
+                        )
+                    }
                 },
             };
             let short = crate::shortkey::short_link(&handle);
@@ -824,6 +848,12 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
                     println!("Handle:     {handle}");
                     println!("Short link: {short}");
                     println!("Long link:  {long}");
+                    if !crate::shortkey::UI_RESOLVES_SHORT_LINKS {
+                        println!(
+                            "Note: short links open only in a River release with short-link \
+                             support. Share the long link until then."
+                        );
+                    }
                     match (published, exists) {
                         (Some(crate::shortkey::Published::Created), _) => {
                             println!("Resolver entry: published")
@@ -849,6 +879,7 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
                             "handle": handle.to_base58(),
                             "short_link": short,
                             "long_link": long,
+                            "short_link_opens_in_current_ui": crate::shortkey::UI_RESOLVES_SHORT_LINKS,
                             "entry_exists": exists,
                             "published": published.map(|p| p == crate::shortkey::Published::Created),
                         })
@@ -862,7 +893,13 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
             let vk = api.short_handle_resolve(&parsed).await?;
             let key = crate::shortkey::owner_key_b58(&vk);
             match format {
-                OutputFormat::Human => println!("{key}"),
+                OutputFormat::Human => {
+                    println!("{key}");
+                    eprintln!(
+                        "note: a handle is a 128-bit truncation of the key hash; the full key \
+                         above is what is trusted."
+                    );
+                }
                 OutputFormat::Json => println!(
                     "{}",
                     serde_json::json!({

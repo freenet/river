@@ -328,13 +328,18 @@ The handle is not a name and cannot be chosen.
   `--publish` creates the entry if it is missing; running it again does
   nothing. Anyone can publish it, since the contract only accepts a key that
   hashes to the handle. Use this for rooms that already exist.
-- `riverctl room config <room> --public-admission true` publishes the entry
-  automatically and prints the short link. If publishing fails it warns and the
-  setting still takes effect; retry with `room short-link --publish`.
+- `riverctl room config <room> --public-admission true` applies and reports the
+  setting first, then publishes the entry, giving up after 10 seconds. If that
+  fails or times out it warns and the command still succeeds; retry with
+  `room short-link --publish`. It does not print the short link until the River
+  UI can open short links (`UI_RESOLVES_SHORT_LINKS` in `src/shortkey.rs`);
+  `room short-link` prints it with a note to that effect.
 - `riverctl room resolve-handle <handle>` fetches the entry, checks that the
   key hashes back to the handle and prints the full key. It fails with a clear
-  message if the entry does not exist, the lookup times out, or the returned
-  key does not match.
+  message if the entry does not exist, the node cannot be reached, the lookup
+  times out, the state is malformed, or the returned key does not match.
+  A handle is a 128-bit truncation of the key hash; the full key printed is what
+  to trust.
 
 All three use `--node-url`. A handle has 128 bits, so a deliberate collision
 costs about 2^64 work; for a room whose full key you already know (the Official
