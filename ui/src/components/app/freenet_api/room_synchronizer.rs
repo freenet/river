@@ -707,35 +707,13 @@ impl RoomSynchronizer {
 
         // Reset stuck invitations that have been in Subscribing state too long
         if web_api_available {
-            let stuck_invites: Vec<VerifyingKey> = {
-                let pending = PENDING_INVITES.read();
-                let now = now_ms();
-                pending
-                    .map
-                    .iter()
-                    .filter(|(_, join)| {
-                        matches!(join.status, PendingRoomStatus::Subscribing)
-                            && join
-                                .subscribing_since
-                                .is_none_or(|since| now - since > INVITATION_TIMEOUT_MS as f64)
-                    })
-                    .map(|(vk, _)| *vk)
-                    .collect()
-            };
-            for vk in stuck_invites {
-                warn!(
-                    "Invitation for {:?} stuck in Subscribing, resetting for retry",
-                    MemberId::from(vk)
-                );
-                // Re-queue while the invitation's GET budget allows; past it
-                // the invitation shows an error and waits for the user.
-                let requeued = PENDING_INVITES.with_mut(|pending| {
-                    pending
-                        .map
-                        .get_mut(&vk)
-                        .is_some_and(|join| join.on_stuck(now_ms()))
-                });
+            let stuck = PENDING_INVITES.with_mut(|pending| pending.reset_stuck(now_ms()));
+            for (vk, requeued) in stuck {
                 if requeued {
+                    warn!(
+                        "Invitation for {:?} stuck in Subscribing, resetting for retry",
+                        MemberId::from(vk)
+                    );
                     SYNC_INFO
                         .write()
                         .update_sync_status(&vk, RoomSyncStatus::Disconnected);
@@ -751,13 +729,7 @@ impl RoomSynchronizer {
         // First, check for pending invitations that need subscription
         // Collect keys that need subscription without holding the read lock
         let invites_to_subscribe: Vec<VerifyingKey> = if web_api_available {
-            let pending_invites = PENDING_INVITES.read();
-            pending_invites
-                .map
-                .iter()
-                .filter(|(_, join)| matches!(join.status, PendingRoomStatus::PendingSubscription))
-                .map(|(key, _)| *key)
-                .collect()
+            PENDING_INVITES.read().awaiting_get()
         } else {
             // WebAPI not available, skip invitation processing until connection established
             Vec::new()
@@ -794,16 +766,9 @@ impl RoomSynchronizer {
 
                 // Update pending invite status to prevent re-processing on concurrent calls
                 // and read the retry count to decide whether to request contract code
-                let retry_count = PENDING_INVITES.with_mut(|pending| {
-                    if let Some(join) = pending.map.get_mut(&owner_vk) {
-                        join.status = PendingRoomStatus::Subscribing;
-                        join.subscribing_since = Some(now_ms());
-                        join.get_budget.record_get_sent(now_ms());
-                        join.retry_count
-                    } else {
-                        0
-                    }
-                });
+                let retry_count = PENDING_INVITES
+                    .with_mut(|pending| pending.begin_get(&owner_vk, now_ms()))
+                    .unwrap_or(0);
 
                 // Always request contract code so the node caches the WASM locally.
                 // Without cached WASM, subsequent Subscribe requests will be rejected
@@ -2615,6 +2580,15 @@ mod tests {
             ),
             "a sent invitation GET must arm the invitation timeout check"
         );
+        // The invite pass runs through the `PendingInvites` methods the
+        // budget tests drive, so those tests cover this code path.
+        for call in [
+            "PENDING_INVITES.with_mut(|pending|pending.reset_stuck(now_ms()))",
+            "PENDING_INVITES.read().awaiting_get()",
+            ".with_mut(|pending|pending.begin_get(&owner_vk,now_ms()))",
+        ] {
+            assert!(body.contains(call), "process_rooms must call {call}");
+        }
         let src: String = crate::util::strip_comments(include_str!("room_synchronizer.rs"))
             .chars()
             .filter(|c| !c.is_whitespace())

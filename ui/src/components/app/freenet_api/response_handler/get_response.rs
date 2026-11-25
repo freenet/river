@@ -1602,6 +1602,15 @@ pub(crate) fn invite_not_found_retry_delay_ms(retry_count: u32) -> u64 {
 /// Without this the invite stayed `Subscribing` until something else ran
 /// `process_rooms` past `INVITATION_TIMEOUT_MS`, which on a fresh profile
 /// nothing does.
+///
+/// A `NotFound` carries no request id, so it cannot be tied to the GET it
+/// answers. After the 91 s stuck check has re-sent, a late `NotFound` for
+/// the older GET is taken as the newer one's and can queue another GET while
+/// the newer is still in flight. Every GET is charged to the same budget, so
+/// that case still sends at most `MAX_AUTO_INVITE_GETS` (7) GETs per
+/// invitation within `INVITE_GIVE_UP_MS` (180 s) of the first; the
+/// slow-`NotFound` cases of `the_get_budget_holds_at_any_not_found_latency`
+/// run exactly this.
 fn schedule_invite_retry(owner_vk: ed25519_dalek::VerifyingKey) {
     let tx = crate::components::app::SYNCHRONIZER
         .read()
@@ -2973,15 +2982,15 @@ mod tests {
 
     /// One simulated invitation run against a fake clock. It drives the real
     /// transitions (`invite_not_found_step`, `fire_invite_retry`,
-    /// `PendingRoomJoin::on_stuck`, `InviteGetBudget::record_get_sent`). The
-    /// `ProcessRooms` handling mirrors `process_rooms`: first the stuck-invite
-    /// check, then a GET for every `PendingSubscription` invite, each of which
-    /// arms its own `INVITATION_TIMEOUT_MS + 1 s` check. Every GET is answered
-    /// `NotFound` after `latency_ms`, which is the deleted/never-created room.
+    /// and the `PendingInvites` invite-pass methods `process_rooms` itself
+    /// calls: `reset_stuck`, `awaiting_get`, `begin_get`). Each GET arms its
+    /// own `INVITATION_TIMEOUT_MS + 1 s` check, as `process_rooms` does. Every
+    /// GET is answered `NotFound` after `latency_ms` (a deleted or
+    /// never-created room), or never answered when it is `None`.
     /// Returns the time of every GET sent, per invitation.
     fn simulate_not_found_invites(
         n: u8,
-        latency_ms: f64,
+        latency_ms: Option<f64>,
     ) -> (crate::invites::PendingInvites, Vec<Vec<f64>>) {
         use crate::components::app::freenet_api::constants::INVITATION_TIMEOUT_MS;
         use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage;
@@ -3009,26 +3018,19 @@ mod tests {
             let (now, ev) = queue.remove(0);
             match ev {
                 Ev::ProcessRooms => {
-                    for (i, r) in rooms.iter().enumerate() {
-                        let join = pending.map.get_mut(r).unwrap();
-                        if matches!(join.status, PendingRoomStatus::Subscribing)
-                            && join
-                                .subscribing_since
-                                .is_none_or(|s| now - s > INVITATION_TIMEOUT_MS as f64)
-                        {
-                            join.on_stuck(now);
-                        }
-                        if matches!(join.status, PendingRoomStatus::PendingSubscription) {
-                            join.status = PendingRoomStatus::Subscribing;
-                            join.subscribing_since = Some(now);
-                            join.get_budget.record_get_sent(now);
-                            gets[i].push(now);
+                    // The same three calls `process_rooms` makes, in order.
+                    pending.reset_stuck(now);
+                    for vk in pending.awaiting_get() {
+                        let i = rooms.iter().position(|r| *r == vk).unwrap();
+                        pending.begin_get(&vk, now).unwrap();
+                        gets[i].push(now);
+                        if let Some(latency_ms) = latency_ms {
                             queue.push((now + latency_ms, Ev::NotFound(i)));
-                            queue.push((
-                                now + INVITATION_TIMEOUT_MS as f64 + 1000.0,
-                                Ev::ProcessRooms,
-                            ));
                         }
+                        queue.push((
+                            now + INVITATION_TIMEOUT_MS as f64 + 1000.0,
+                            Ev::ProcessRooms,
+                        ));
                     }
                 }
                 Ev::NotFound(i) => {
@@ -3061,7 +3063,7 @@ mod tests {
         use crate::components::app::freenet_api::constants::{
             INVITATION_TIMEOUT_MS, MAX_AUTO_INVITE_GETS,
         };
-        let (pending, gets) = simulate_not_found_invites(1, 500.0);
+        let (pending, gets) = simulate_not_found_invites(1, Some(500.0));
         assert_eq!(MAX_AUTO_INVITE_GETS, 7);
         assert_eq!(gets[0].len(), 7, "GETs sent: {:?}", gets[0]);
         assert_eq!(
@@ -3084,7 +3086,7 @@ mod tests {
     #[test]
     fn many_never_found_invites_do_not_amplify() {
         for n in [2u8, 5, 20] {
-            let (pending, gets) = simulate_not_found_invites(n, 500.0);
+            let (pending, gets) = simulate_not_found_invites(n, Some(500.0));
             assert_eq!(gets.iter().map(Vec::len).sum::<usize>(), 7 * n as usize);
             assert!(gets.iter().all(|g| g.len() == 7));
             assert!(pending
@@ -3099,7 +3101,7 @@ mod tests {
     #[test]
     fn the_get_budget_holds_at_any_not_found_latency() {
         for latency in [0.0, 500.0, 5_000.0, 30_000.0, 89_000.0, 120_000.0] {
-            let (pending, gets) = simulate_not_found_invites(1, latency);
+            let (pending, gets) = simulate_not_found_invites(1, Some(latency));
             assert!(
                 (1..=7).contains(&gets[0].len()),
                 "latency {latency}: {:?}",
@@ -3112,6 +3114,55 @@ mod tests {
                 PendingRoomStatus::Error(_)
             ));
         }
+    }
+
+    /// A GET that is never answered: the 91 s stuck check re-sends once, and
+    /// the next check (182 s, past the 180 s deadline) shows the error. Two
+    /// GETs in all, then nothing more.
+    #[test]
+    fn a_never_answered_invite_stops_at_its_deadline() {
+        let (pending, gets) = simulate_not_found_invites(1, None);
+        assert_eq!(gets[0], vec![0.0, 91_000.0]);
+        assert_eq!(
+            pending.map.values().next().unwrap().status,
+            PendingRoomStatus::Error(crate::invites::INVITE_NO_ANSWER_ERROR.to_string())
+        );
+    }
+
+    /// The error modal's Retry re-queues the invitation with a fresh budget
+    /// and requests exactly one synchronizer pass.
+    #[test]
+    fn retry_from_error_requests_one_pass() {
+        use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerMessage;
+        let room = SigningKey::from_bytes(&[12u8; 32]).verifying_key();
+        let mut pending = crate::invites::PendingInvites::default();
+        pending.map.insert(room, pending_join(room));
+        for t in 0..7 {
+            pending.begin_get(&room, t as f64);
+        }
+        pending.map.get_mut(&room).unwrap().status = PendingRoomStatus::Error("x".into());
+        let (tx, mut rx): (Tx, _) = futures::channel::mpsc::unbounded();
+        assert!(pending.retry_from_error(&room, &tx));
+        let join = &pending.map[&room];
+        assert_eq!(join.status, PendingRoomStatus::PendingSubscription);
+        assert_eq!(join.get_budget.gets_sent, 0, "a fresh budget");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(SynchronizerMessage::ProcessRooms)
+        ));
+        assert!(rx.try_recv().is_err(), "exactly one pass per click");
+    }
+
+    /// Generations never repeat, even for a re-accepted invitation whose
+    /// budget starts again from `Default`, so an old timer never matches.
+    #[test]
+    fn invite_get_generations_never_repeat() {
+        let mut old = crate::invites::InviteGetBudget::default();
+        let g1 = old.record_get_sent(0.0);
+        let mut reaccepted = crate::invites::InviteGetBudget::default();
+        let g2 = reaccepted.record_get_sent(0.0);
+        assert_ne!(g1, 0);
+        assert!(g2 > g1, "a re-accept draws a new generation");
     }
 
     /// A retry timer armed for an older GET does nothing once a newer GET
