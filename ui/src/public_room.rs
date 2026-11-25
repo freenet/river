@@ -1795,6 +1795,26 @@ mod tests {
     }
 
     #[test]
+    fn a_deferred_member_room_switch_checks_the_viewer_still_shows_that_room() {
+        // The effect that opens a room the user belongs to as their own defers
+        // the switch; the timer can fire after the viewer was closed and
+        // reopened on another room, which the stale close() then shut
+        // (freenet/river#1047, a webkit-only flake in pow-worker.spec.ts).
+        let src = handler_source("components/viewed_room.rs");
+        let deferred_at = src
+            .find("*CURRENT_ROOM.write() = CurrentRoom {\n                    owner_key: Some(owner),")
+            .expect("the deferred switch");
+        let guard_at = src[..deferred_at]
+            .rfind("== Some(owner)")
+            .expect("the guard");
+        let defer_at = src[..deferred_at].rfind("crate::util::defer(").unwrap();
+        assert!(
+            defer_at < guard_at,
+            "the deferred callback must re-check the viewed room first"
+        );
+    }
+
+    #[test]
     fn the_viewer_closes_wherever_the_selected_room_changes() {
         for rel in [
             "components/room_list.rs",

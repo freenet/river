@@ -124,6 +124,18 @@ pub fn ViewedRoomPane() -> Element {
         };
         if rooms.map.contains_key(&owner) {
             crate::util::defer(move || {
+                // The timer can fire long after the effect ran (a loaded
+                // WebKit delays it by 150 ms or more), by which time the
+                // viewer was closed and may show another room: closing then
+                // would shut the new view, and switching rooms would undo the
+                // user's choice (freenet/river#1047).
+                let still_viewing_it = VIEWED_ROOM
+                    .try_read()
+                    .ok()
+                    .is_some_and(|v| v.as_ref().and_then(|r| r.owner_vk) == Some(owner));
+                if !still_viewing_it {
+                    return;
+                }
                 *CURRENT_ROOM.write() = CurrentRoom {
                     owner_key: Some(owner),
                 };
