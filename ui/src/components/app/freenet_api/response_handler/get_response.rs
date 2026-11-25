@@ -3246,8 +3246,28 @@ mod tests {
             assert_eq!(pending.begin_get(&room, now), None);
             let join = &pending.map[&room];
             assert_eq!(join.get_budget.gets_sent, sent_before, "no GET charged");
-            assert!(matches!(join.status, PendingRoomStatus::Error(_)));
+            // The latest GET was never answered, so the error says so.
+            assert_eq!(
+                join.status,
+                PendingRoomStatus::Error(crate::invites::INVITE_NO_ANSWER_ERROR.to_string())
+            );
         }
+        // After a NotFound, the refusal says the room was not found.
+        let room = SigningKey::from_bytes(&[16u8; 32]).verifying_key();
+        let mut pending = crate::invites::PendingInvites::default();
+        pending.map.insert(room, pending_join(room));
+        for t in 0..7 {
+            pending.begin_get(&room, t as f64).unwrap();
+        }
+        let InviteNotFoundStep::GaveUp = invite_not_found_step(&mut pending, room, 10.0) else {
+            panic!("the eighth would exceed the budget");
+        };
+        pending.map.get_mut(&room).unwrap().status = PendingRoomStatus::PendingSubscription;
+        assert_eq!(pending.begin_get(&room, 11.0), None);
+        assert_eq!(
+            pending.map[&room].status,
+            PendingRoomStatus::Error(crate::invites::INVITE_NOT_FOUND_ERROR.to_string())
+        );
     }
 
     /// A retry timer armed for an older GET does nothing once a newer GET
