@@ -671,6 +671,7 @@ mod tests {
                 row: "m".into(),
                 message: MessageId(freenet_scaffold::util::FastHash(7)),
                 own: false,
+                can_ban_newcomer: false,
                 current: None,
             },
             origin: Origin::React,

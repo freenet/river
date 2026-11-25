@@ -808,15 +808,16 @@ pub(crate) fn JoinComposer(
         }
     });
 
-    let (phase, queued_here, notice) = match JOIN.try_read() {
+    let (phase, queued_here, notice, raised) = match JOIN.try_read() {
         Ok(j) => (
             j.phase_for(&owner_vk),
             j.queued_for(&owner_vk),
             j.notice_for(&owner_vk),
+            j.raised_for(&owner_vk),
         ),
         Err(_) => {
             crate::util::signal_guard::schedule_nudge();
-            (JoinPhase::Idle, Vec::new(), None)
+            (JoinPhase::Idle, Vec::new(), None, false)
         }
     };
     let can_send = !draft.read().trim().is_empty() && phase != JoinPhase::Submitting;
@@ -899,16 +900,25 @@ pub(crate) fn JoinComposer(
     let (status_testid, status) = if readmit {
         match &phase {
             JoinPhase::Idle => ("viewed-room-join-idle", note.clone()),
+            // The room raised what it asks of newcomers: say so, as an explanation.
+            JoinPhase::Solving { .. } if raised => (
+                "viewed-room-join-progress",
+                "Room security was raised; confirming you're human. You can keep writing."
+                    .to_string(),
+            ),
             JoinPhase::Solving { tried, expected } => (
                 "viewed-room-join-progress",
-                if *expected > 0.0 {
-                    format!(
-                        "Joining: proving you are not a bot ({}%). You can keep writing. Keep this tab visible: a hidden tab works slowly.",
+                // Always with a percentage, so the line does not change length when
+                // the first progress arrives and move the Cancel button under a
+                // pointer that is already on its way down.
+                format!(
+                    "Joining: proving you are not a bot ({:\u{a0}>3}%). You can keep writing. Keep this tab open: a phone may pause a hidden tab.",
+                    if *expected > 0.0 {
                         ((*tried as f64 / expected) * 100.0).min(99.0) as u32
-                    )
-                } else {
-                    "Joining: proving you are not a bot. You can keep writing. Keep this tab visible: a hidden tab works slowly.".to_string()
-                },
+                    } else {
+                        0
+                    }
+                ),
             ),
             JoinPhase::Ready => (
                 "viewed-room-join-ready",
@@ -994,7 +1004,7 @@ pub(crate) fn JoinComposer(
             }
             if show_status_line {
                 p {
-                    class: "mt-2 text-xs text-text-muted flex items-center gap-2",
+                    class: "mt-2 text-xs text-text-muted flex items-center gap-2 tabular-nums",
                     "data-testid": "{status_testid}",
                     "{status}"
                     if let Some(notice) = notice {
