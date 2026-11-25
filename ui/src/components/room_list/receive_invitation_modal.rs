@@ -804,6 +804,8 @@ fn render_error_state(
                             PENDING_INVITES.with_mut(|pending| {
                                 if let Some(join) = pending.map.get_mut(&room_key) {
                                     join.status = PendingRoomStatus::PendingSubscription;
+                                    // A user retry gets a fresh automatic-GET budget.
+                                    join.get_budget.restart();
                                 }
                             });
                         });
@@ -1287,6 +1289,7 @@ pub(crate) fn accept_invitation(inv: Invitation, nickname: String) {
                 subscribing_since: None,
                 retry_count: 0,
                 room_secrets: room_secrets.clone(),
+                get_budget: Default::default(),
             },
         );
     });
@@ -1427,6 +1430,7 @@ mod tests {
                         subscribing_since: None,
                         retry_count: 0,
                         room_secrets: vec![],
+                        get_budget: Default::default(),
                     },
                 )
             });
@@ -1549,6 +1553,7 @@ mod tests {
                 subscribing_since: None,
                 retry_count: 0,
                 room_secrets: vec![],
+                get_budget: Default::default(),
             },
         );
         let mut refusals = std::collections::HashMap::new();

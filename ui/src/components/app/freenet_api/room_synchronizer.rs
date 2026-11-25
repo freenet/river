@@ -646,15 +646,6 @@ pub(crate) fn fresh_rekey_merge(
     owed_rekey_merge(room).filter(|_| room.rekey_merge.owed.contains(old_contract_key))
 }
 
-/// The code-free subscribe for a room the network should already hold
-/// (freenet/river#757).
-///
-/// `return_contract_code: false` keeps the WASM off the client socket; the node
-/// still fetches and caches the code itself when it does not have it, which a
-/// later `Update` needs. `subscribe: true` registers this client's subscription
-/// on the node and the node's own upstream one. The reply is a `GetResponse`
-/// (completed in `handle_get_response`) or, when no peer has the contract, a
-/// `NotFound` (which re-seeds with [`seed_put_request`]).
 /// Run `ProcessRooms` once `INVITATION_TIMEOUT_MS` has passed since an
 /// invitation's GET went out, so the stuck-invite reset in `process_rooms`
 /// actually gets evaluated. That reset is only checked when something runs
@@ -680,6 +671,15 @@ fn schedule_invite_timeout_check() {
     });
 }
 
+/// The code-free subscribe for a room the network should already hold
+/// (freenet/river#757).
+///
+/// `return_contract_code: false` keeps the WASM off the client socket; the node
+/// still fetches and caches the code itself when it does not have it, which a
+/// later `Update` needs. `subscribe: true` registers this client's subscription
+/// on the node and the node's own upstream one. The reply is a `GetResponse`
+/// (completed in `handle_get_response`) or, when no peer has the contract, a
+/// `NotFound` (which re-seeds with [`seed_put_request`]).
 pub(crate) fn subscribe_get_request(owner_vk: &VerifyingKey) -> ContractRequest<'static> {
     ContractRequest::Get {
         key: *owner_vk_to_contract_key(owner_vk).id(),
@@ -727,16 +727,24 @@ impl RoomSynchronizer {
                     "Invitation for {:?} stuck in Subscribing, resetting for retry",
                     MemberId::from(vk)
                 );
-                PENDING_INVITES.with_mut(|pending| {
-                    if let Some(join) = pending.map.get_mut(&vk) {
-                        join.status = PendingRoomStatus::PendingSubscription;
-                        join.subscribing_since = None;
-                        join.retry_count += 1;
-                    }
+                // Re-queue while the invitation's GET budget allows; past it
+                // the invitation shows an error and waits for the user.
+                let requeued = PENDING_INVITES.with_mut(|pending| {
+                    pending
+                        .map
+                        .get_mut(&vk)
+                        .is_some_and(|join| join.on_stuck(now_ms()))
                 });
-                SYNC_INFO
-                    .write()
-                    .update_sync_status(&vk, RoomSyncStatus::Disconnected);
+                if requeued {
+                    SYNC_INFO
+                        .write()
+                        .update_sync_status(&vk, RoomSyncStatus::Disconnected);
+                } else {
+                    warn!(
+                        "Invitation for {:?} out of retries, showing an error",
+                        MemberId::from(vk)
+                    );
+                }
             }
         }
 
@@ -790,6 +798,7 @@ impl RoomSynchronizer {
                     if let Some(join) = pending.map.get_mut(&owner_vk) {
                         join.status = PendingRoomStatus::Subscribing;
                         join.subscribing_since = Some(now_ms());
+                        join.get_budget.record_get_sent(now_ms());
                         join.retry_count
                     } else {
                         0
