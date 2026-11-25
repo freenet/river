@@ -177,7 +177,7 @@ pub fn new_room(
                 SecretVersionRecordV1 {
                     version: 0,
                     cipher_spec: RoomCipherSpec::Aes256Gcm,
-                    created_at: crate::signed_time::now(),
+                    created_at: crate::signed_time::now().into(),
                 },
                 &owner,
             ));
@@ -581,7 +581,7 @@ pub fn join(
             room_owner: owner_id,
             author: me,
             content: RoomMessageBody::join_event(),
-            time: crate::signed_time::whole_millis(now),
+            time: crate::signed_time::whole_millis(now).into(),
         },
         sk,
     );

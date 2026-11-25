@@ -80,7 +80,7 @@ impl Room {
             MessageV1 {
                 room_owner: self.oid,
                 author: author.verifying_key().into(),
-                time: at(secs),
+                time: at(secs).into(),
                 content: RoomMessageBody::public(format!("m{secs}")),
             },
             author,
@@ -91,7 +91,7 @@ impl Room {
         AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: self.oid,
-                banned_at: at(secs),
+                banned_at: at(secs).into(),
                 banned_user: target,
             },
             self.oid,

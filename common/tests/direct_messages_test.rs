@@ -592,7 +592,7 @@ fn ban_then_existing_dm_state_still_verifies() {
     state.bans.0.push(AuthorizedUserBan::new(
         UserBan {
             owner_member_id: f.owner_id,
-            banned_at: SystemTime::now(),
+            banned_at: SystemTime::now().into(),
             banned_user: f.alice_id,
         },
         f.owner_id,
@@ -618,7 +618,7 @@ fn post_apply_cleanup_sweeps_banned_sender_dms() {
     state.bans.0.push(AuthorizedUserBan::new(
         UserBan {
             owner_member_id: f.owner_id,
-            banned_at: SystemTime::now(),
+            banned_at: SystemTime::now().into(),
             banned_user: f.alice_id,
         },
         f.owner_id,
@@ -643,7 +643,7 @@ fn post_apply_cleanup_sweeps_banned_recipient_dms() {
     state.bans.0.push(AuthorizedUserBan::new(
         UserBan {
             owner_member_id: f.owner_id,
-            banned_at: SystemTime::now(),
+            banned_at: SystemTime::now().into(),
             banned_user: f.bob_id,
         },
         f.owner_id,
@@ -796,7 +796,7 @@ fn cleanup_drops_purge_envelope_for_non_member() {
     state.bans.0.push(AuthorizedUserBan::new(
         UserBan {
             owner_member_id: f.owner_id,
-            banned_at: SystemTime::now(),
+            banned_at: SystemTime::now().into(),
             banned_user: f.bob_id,
         },
         f.owner_id,

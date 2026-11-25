@@ -184,7 +184,7 @@ pub fn admission_status(
         message: MessageV1 {
             room_owner: owner_id,
             author: id,
-            time: send_time,
+            time: send_time.into(),
             content: RoomMessageBody::public(String::new()),
         },
         // Cleanup does not check a message's signature unless its author's key
@@ -459,7 +459,7 @@ mod tests {
             MessageV1 {
                 room_owner: owner_id,
                 author: MemberId::from(&k.verifying_key()),
-                time: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(at),
+                time: (SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(at)).into(),
                 content: RoomMessageBody::public("hi".into()),
             },
             k,
@@ -636,7 +636,7 @@ mod tests {
             &params.owner,
             crate::room_state::provisional::ProvisionalBan {
                 banned_by: owner_id,
-                banned_at: now,
+                banned_at: now.into(),
                 target,
             },
             &owner(),

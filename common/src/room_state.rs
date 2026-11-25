@@ -2408,7 +2408,8 @@ mod tests {
             AuthorizedUserBan::new(
                 UserBan {
                     owner_member_id: owner_id,
-                    banned_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+                    banned_at: (SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+                        .into(),
                     banned_user: MemberId::from(&SigningKey::from_bytes(&[9; 32]).verifying_key()),
                 },
                 MemberId::from(&by.verifying_key()),
@@ -2444,7 +2445,8 @@ mod tests {
             AuthorizedUserBan::new(
                 UserBan {
                     owner_member_id: owner_id,
-                    banned_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+                    banned_at: (SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+                        .into(),
                     banned_user: target.member.id(),
                 },
                 MemberId::from(&by.verifying_key()),
@@ -2636,7 +2638,8 @@ mod tests {
                 MessageV1 {
                     room_owner: owner_id,
                     author: owner_id,
-                    time: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000 + t),
+                    time: (SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000 + t))
+                        .into(),
                     content: RoomMessageBody::public(format!("m{t}")),
                 },
                 &owner_sk,
@@ -2714,7 +2717,7 @@ mod tests {
                     MessageV1 {
                         room_owner: owner_id,
                         author: owner_id,
-                        time: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(t),
+                        time: (SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(t)).into(),
                         content: RoomMessageBody::public(format!("m{t}")),
                     },
                     &owner_sk,
@@ -2769,7 +2772,7 @@ mod tests {
                 MessageV1 {
                     room_owner: owner_id,
                     author,
-                    time: at(t),
+                    time: at(t).into(),
                     content: RoomMessageBody::public(format!("m{t}")),
                 },
                 sk,
@@ -2799,7 +2802,7 @@ mod tests {
         o.bans = BansV1(vec![AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: at(4000),
+                banned_at: at(4000).into(),
                 banned_user: p.member.id(),
             },
             owner_id,
@@ -2851,7 +2854,7 @@ mod tests {
                 MessageV1 {
                     room_owner: owner_id,
                     author,
-                    time: at(t),
+                    time: at(t).into(),
                     content: RoomMessageBody::public(format!("m{t}")),
                 },
                 sk,
@@ -2866,7 +2869,7 @@ mod tests {
         b.bans = BansV1(vec![AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: at(2),
+                banned_at: at(2).into(),
                 banned_user: p.member.id(),
             },
             owner_id,
@@ -2937,7 +2940,7 @@ mod tests {
         let ban_b_by_a = AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: std::time::SystemTime::now(),
+                banned_at: std::time::SystemTime::now().into(),
                 banned_user: b_id,
             },
             a_id,
@@ -2965,7 +2968,8 @@ mod tests {
         let ban_a_by_owner = AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: std::time::SystemTime::now() + std::time::Duration::from_secs(1),
+                banned_at: (std::time::SystemTime::now() + std::time::Duration::from_secs(1))
+                    .into(),
                 banned_user: a_id,
             },
             owner_id,
@@ -3058,7 +3062,7 @@ mod tests {
             MessageV1 {
                 room_owner: owner_id,
                 author: a_id,
-                time: SystemTime::now(),
+                time: SystemTime::now().into(),
                 content: RoomMessageBody::public("Hello from A".to_string()),
             },
             &a_sk,
@@ -3115,7 +3119,7 @@ mod tests {
             MessageV1 {
                 room_owner: owner_id,
                 author: a_id,
-                time: SystemTime::now(),
+                time: SystemTime::now().into(),
                 content: RoomMessageBody::join_event(),
             },
             &a_sk,
@@ -3204,7 +3208,7 @@ mod tests {
                 room_owner: owner_id,
                 author: joiner_id,
                 content: RoomMessageBody::join_event(),
-                time: SystemTime::now(),
+                time: SystemTime::now().into(),
             },
             &joiner_sk,
         );
@@ -3303,7 +3307,7 @@ mod tests {
             MessageV1 {
                 room_owner: owner_id,
                 author: b_id,
-                time: SystemTime::now(),
+                time: SystemTime::now().into(),
                 content: RoomMessageBody::public("Hello from B".to_string()),
             },
             &b_sk,
@@ -3383,7 +3387,7 @@ mod tests {
         let ban_c_by_a = AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: SystemTime::now(),
+                banned_at: SystemTime::now().into(),
                 banned_user: c_id,
             },
             a_id,
@@ -3462,7 +3466,7 @@ mod tests {
             MessageV1 {
                 room_owner: owner_id,
                 author: t_id,
-                time: SystemTime::now(),
+                time: SystemTime::now().into(),
                 content: RoomMessageBody::public("hi".to_string()),
             },
             &t_sk,
@@ -3473,7 +3477,7 @@ mod tests {
         let ban_t = AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: base,
+                banned_at: base.into(),
                 banned_user: t_id,
             },
             owner_id,
@@ -3484,7 +3488,7 @@ mod tests {
         let ban_absent = AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: base + std::time::Duration::from_secs(10),
+                banned_at: (base + std::time::Duration::from_secs(10)).into(),
                 banned_user: absent,
             },
             owner_id,
@@ -3572,7 +3576,7 @@ mod tests {
             MessageV1 {
                 room_owner: owner_id,
                 author: d_id,
-                time: SystemTime::now(),
+                time: SystemTime::now().into(),
                 content: RoomMessageBody::public("hi".to_string()),
             },
             &d_sk,
@@ -3584,7 +3588,7 @@ mod tests {
         let d_ban1 = AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: base + std::time::Duration::from_secs(10),
+                banned_at: (base + std::time::Duration::from_secs(10)).into(),
                 banned_user: absent1,
             },
             d_id,
@@ -3593,7 +3597,7 @@ mod tests {
         let d_ban2 = AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: base + std::time::Duration::from_secs(11),
+                banned_at: (base + std::time::Duration::from_secs(11)).into(),
                 banned_user: absent2,
             },
             d_id,
@@ -3605,7 +3609,7 @@ mod tests {
         let ban_c_by_b = AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: base,
+                banned_at: base.into(),
                 banned_user: c_id,
             },
             b_id,
@@ -3689,7 +3693,7 @@ mod tests {
             MessageV1 {
                 room_owner: owner_id,
                 author: m_id,
-                time: SystemTime::now(),
+                time: SystemTime::now().into(),
                 content: RoomMessageBody::public("hello".to_string()),
             },
             &m_sk,
@@ -3699,7 +3703,7 @@ mod tests {
             MessageV1 {
                 room_owner: owner_id,
                 author: r_id,
-                time: SystemTime::now() + std::time::Duration::from_secs(1),
+                time: (SystemTime::now() + std::time::Duration::from_secs(1)).into(),
                 content: RoomMessageBody::reaction(msg1_id.clone(), "👍".to_string()),
             },
             &r_sk,
@@ -3732,7 +3736,7 @@ mod tests {
         state.bans.0.push(AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: SystemTime::now(),
+                banned_at: SystemTime::now().into(),
                 banned_user: r_id,
             },
             owner_id,
@@ -3814,7 +3818,7 @@ mod tests {
                     AuthorizedUserBan::new(
                         UserBan {
                             owner_member_id: owner_id,
-                            banned_at: base + std::time::Duration::from_secs(i as u64),
+                            banned_at: (base + std::time::Duration::from_secs(i as u64)).into(),
                             banned_user: absent,
                         },
                         MemberId::from(&sk.verifying_key()),
@@ -3856,7 +3860,7 @@ mod tests {
                 AuthorizedUserBan::new(
                     UserBan {
                         owner_member_id: owner_id,
-                        banned_at: base,
+                        banned_at: base.into(),
                         banned_user: b_id,
                     },
                     a_id,
@@ -3866,7 +3870,7 @@ mod tests {
                 AuthorizedUserBan::new(
                     UserBan {
                         owner_member_id: owner_id,
-                        banned_at: base + std::time::Duration::from_secs(1),
+                        banned_at: (base + std::time::Duration::from_secs(1)).into(),
                         banned_user: a_id,
                     },
                     owner_id,
@@ -3878,7 +3882,7 @@ mod tests {
                 bans.push(AuthorizedUserBan::new(
                     UserBan {
                         owner_member_id: owner_id,
-                        banned_at: base + std::time::Duration::from_secs(100 + i as u64),
+                        banned_at: (base + std::time::Duration::from_secs(100 + i as u64)).into(),
                         banned_user: x_id,
                     },
                     MemberId::from(&sk.verifying_key()),
@@ -3914,7 +3918,7 @@ mod tests {
                 bans: BansV1(vec![AuthorizedUserBan::new(
                     UserBan {
                         owner_member_id: owner_id,
-                        banned_at: SystemTime::now(),
+                        banned_at: SystemTime::now().into(),
                         banned_user: q_id,
                     },
                     owner_id,
@@ -3968,7 +3972,7 @@ mod tests {
                 bans: BansV1(vec![AuthorizedUserBan::new(
                     UserBan {
                         owner_member_id: owner_id,
-                        banned_at: SystemTime::now(),
+                        banned_at: SystemTime::now().into(),
                         banned_user: q_id,
                     },
                     dep_id,
@@ -4213,7 +4217,7 @@ mod tests {
             MessageV1 {
                 room_owner: owner_id,
                 author: a_id,
-                time: SystemTime::now(),
+                time: SystemTime::now().into(),
                 content: RoomMessageBody::public("Hello again!".to_string()),
             },
             &a_sk,
@@ -4408,7 +4412,7 @@ mod tests {
         let ban = AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: SystemTime::now(),
+                banned_at: SystemTime::now().into(),
                 banned_user: a_id,
             },
             owner_id,
@@ -4528,7 +4532,7 @@ mod tests {
             SecretVersionRecordV1 {
                 version: 1,
                 cipher_spec: RoomCipherSpec::Aes256Gcm,
-                created_at: SystemTime::now(),
+                created_at: SystemTime::now().into(),
             },
             &owner_sk,
         );
@@ -4602,7 +4606,7 @@ mod tests {
         let ban_x = AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: SystemTime::now(),
+                banned_at: SystemTime::now().into(),
                 banned_user: x_id,
             },
             owner_id,
@@ -4860,7 +4864,7 @@ mod tests {
             MessageV1 {
                 room_owner: owner_id,
                 author: m_id,
-                time: SystemTime::now(),
+                time: SystemTime::now().into(),
                 content: RoomMessageBody::public("hi".to_string()),
             },
             &m_sk,
@@ -4960,7 +4964,7 @@ mod tests {
                     MessageV1 {
                         room_owner: owner,
                         author: k.verifying_key().into(),
-                        time: at(i as u64),
+                        time: at(i as u64).into(),
                         content: RoomMessageBody::public("x".into()),
                     },
                     k,
@@ -4974,7 +4978,7 @@ mod tests {
                 AuthorizedUserBan::new(
                     UserBan {
                         owner_member_id: owner,
-                        banned_at: at(100_000 + i),
+                        banned_at: at(100_000 + i).into(),
                         banned_user: key(10_000_000 + i).verifying_key().into(),
                     },
                     by.verifying_key().into(),
@@ -5138,7 +5142,7 @@ mod tests {
                 AuthorizedUserBan::new(
                     UserBan {
                         owner_member_id: owner,
-                        banned_at: at(100_000 + i),
+                        banned_at: at(100_000 + i).into(),
                         banned_user: chain[i as usize % chain.len()].verifying_key().into(),
                     },
                     x.verifying_key().into(),
@@ -5163,7 +5167,7 @@ mod tests {
                     MessageV1 {
                         room_owner: owner,
                         author: deepest.verifying_key().into(),
-                        time: at(1),
+                        time: at(1).into(),
                         content: RoomMessageBody::public("x".into()),
                     },
                     deepest,
@@ -5224,7 +5228,7 @@ mod cleanup_pass_tests {
             MessageV1 {
                 room_owner: owner,
                 author: who.verifying_key().into(),
-                time: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + t),
+                time: (SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + t)).into(),
                 content: RoomMessageBody::public(format!("m{t}")),
             },
             who,
@@ -5383,7 +5387,7 @@ mod cleanup_pass_tests {
         let ban = AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner,
-                banned_at: SystemTime::UNIX_EPOCH,
+                banned_at: SystemTime::UNIX_EPOCH.into(),
                 banned_user: other.verifying_key().into(),
             },
             owner,
@@ -5435,7 +5439,7 @@ mod member_loop_tests {
             MessageV1 {
                 room_owner: owner,
                 author: id(who),
-                time: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + t),
+                time: (SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + t)).into(),
                 content: RoomMessageBody::public(format!("m{t}")),
             },
             who,
@@ -5445,7 +5449,7 @@ mod member_loop_tests {
         AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner,
-                banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + t),
+                banned_at: (SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + t)).into(),
                 banned_user: target,
             },
             id(by),

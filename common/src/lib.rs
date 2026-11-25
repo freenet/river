@@ -25,6 +25,7 @@ pub mod migration;
 #[cfg(any(feature = "own-purges", test))]
 pub mod own_purges;
 pub mod room_state;
+pub mod signed_time;
 /// The rooms the web UI stores in the chat delegate: reading them, and adding a
 /// room to them. Gated on the `stored-rooms` feature (client crates only), so
 /// the WASM builds keep byte-identical WASM.
@@ -34,4 +35,5 @@ pub mod util;
 pub mod web_container;
 
 pub use room_state::ChatRoomStateV1;
+pub use signed_time::SignedTime;
 pub use web_container::WebContainerMetadata;

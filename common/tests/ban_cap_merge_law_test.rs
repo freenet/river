@@ -81,7 +81,7 @@ fn world(seed: u64, cap: usize) -> (World, ChatRoomStateV1) {
             MessageV1 {
                 room_owner: owner_id,
                 author: id,
-                time: at(t),
+                time: at(t).into(),
                 content: RoomMessageBody::public(format!("hi {t}")),
             },
             sk,
@@ -153,7 +153,7 @@ fn random_ban(w: &World, rng: &mut StdRng, seed: u64) -> AuthorizedUserBan {
     let pick_q = |rng: &mut StdRng| w.q[rng.gen_range(0..w.q.len())].1;
     let ban = |target: MemberId| UserBan {
         owner_member_id: w.owner_id,
-        banned_at: at(t),
+        banned_at: at(t).into(),
         banned_user: target,
     };
     match rng.gen_range(0..6) {

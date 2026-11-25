@@ -67,7 +67,7 @@ impl Room {
             MessageV1 {
                 room_owner: self.owner,
                 author: id(who),
-                time: at(t),
+                time: at(t).into(),
                 content: RoomMessageBody::public(format!("m{t}")),
             },
             who,
@@ -77,7 +77,7 @@ impl Room {
         AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: self.owner,
-                banned_at: at(t),
+                banned_at: at(t).into(),
                 banned_user: target,
             },
             id(by),

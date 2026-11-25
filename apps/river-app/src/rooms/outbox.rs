@@ -1591,7 +1591,7 @@ fn build(
         let message = MessageV1 {
             room_owner: MemberId::from(&room.stored.owner_vk),
             author: MemberId::from(&sk.verifying_key()),
-            time,
+            time: time.into(),
             content,
         };
         messages.push(AuthorizedMessageV1::new(message, sk));

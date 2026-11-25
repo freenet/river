@@ -448,7 +448,7 @@ fn input_pool(f: &Fix, p: &Bytes, s0: &Bytes) -> Vec<Input> {
         let ban = AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: fixture::t0() + std::time::Duration::from_secs(50_000),
+                banned_at: (fixture::t0() + std::time::Duration::from_secs(50_000)).into(),
                 banned_user: MemberId::from(f.members[i].verifying_key()),
             },
             owner_id,

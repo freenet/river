@@ -448,7 +448,7 @@ pub(crate) fn handle_contract_notification(
         // `created_at`, so UNIX_EPOCH is functionally safe; it's a
         // placeholder until freenet-stdlib's `time::now()` works under
         // wasm32-unknown-unknown for delegates.
-        created_at: UNIX_EPOCH + Duration::from_secs(0),
+        created_at: (UNIX_EPOCH + Duration::from_secs(0)).into(),
     };
     let record_bytes = match cbor_encode(&record) {
         Ok(b) => b,

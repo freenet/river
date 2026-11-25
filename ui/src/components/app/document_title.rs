@@ -1193,7 +1193,7 @@ mod tests {
                 room_owner: MemberId::from(owner_vk),
                 author: MemberId::from(&author_sk.verifying_key()),
                 content,
-                time: UNIX_EPOCH + Duration::from_secs(n),
+                time: (UNIX_EPOCH + Duration::from_secs(n)).into(),
             },
             author_sk,
         )

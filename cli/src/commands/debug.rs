@@ -225,7 +225,7 @@ fn collect_ban_infos(room_state: &ChatRoomStateV1, owner_vk: &VerifyingKey) -> V
             let banned_at_secs = ban
                 .ban
                 .banned_at
-                .duration_since(std::time::UNIX_EPOCH)
+                .duration_since(std::time::UNIX_EPOCH.into())
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             BanInfo {
@@ -273,7 +273,7 @@ fn collect_provisional_ban_infos(
                 banned_at_secs: ban
                     .ban
                     .banned_at
-                    .duration_since(std::time::UNIX_EPOCH)
+                    .duration_since(std::time::UNIX_EPOCH.into())
                     .map(|d| d.as_secs())
                     .unwrap_or(0),
                 provisional: true,
@@ -899,7 +899,8 @@ mod tests {
     ) {
         let ban = UserBan {
             owner_member_id: id(owner),
-            banned_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+            banned_at: (std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000))
+                .into(),
             banned_user: id(target),
         };
         state
@@ -1157,7 +1158,8 @@ mod tests {
 
         let ban = UserBan {
             owner_member_id: id(&owner),
-            banned_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+            banned_at: (std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000))
+                .into(),
             banned_user: id(&alice),
         };
         let forged = sign_struct(&ban, &mallory);
@@ -1592,7 +1594,7 @@ mod tests {
             &owner.verifying_key(),
             ProvisionalBan {
                 banned_by: id(banner),
-                banned_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(7),
+                banned_at: (std::time::UNIX_EPOCH + std::time::Duration::from_secs(7)).into(),
                 target: id(target),
             },
             signer,

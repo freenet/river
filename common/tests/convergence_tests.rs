@@ -50,7 +50,7 @@ fn create_test_msg(
         MessageV1 {
             room_owner: owner_id,
             author: author_id,
-            time: SystemTime::now() + std::time::Duration::from_secs(time_offset_secs),
+            time: (SystemTime::now() + std::time::Duration::from_secs(time_offset_secs)).into(),
             content: RoomMessageBody::public(format!("msg from {:?}", author_id)),
         },
         author_sk,
@@ -400,7 +400,7 @@ fn test_ban_excess_order_convergence() {
     let ban_a = AuthorizedUserBan::new(
         UserBan {
             owner_member_id: owner_id,
-            banned_at: same_time,
+            banned_at: same_time.into(),
             banned_user: member_a.id(),
         },
         owner_id,
@@ -410,7 +410,7 @@ fn test_ban_excess_order_convergence() {
     let ban_b = AuthorizedUserBan::new(
         UserBan {
             owner_member_id: owner_id,
-            banned_at: same_time,
+            banned_at: same_time.into(),
             banned_user: member_b.id(),
         },
         owner_id,
@@ -420,7 +420,7 @@ fn test_ban_excess_order_convergence() {
     let ban_c = AuthorizedUserBan::new(
         UserBan {
             owner_member_id: owner_id,
-            banned_at: same_time,
+            banned_at: same_time.into(),
             banned_user: member_c.id(),
         },
         owner_id,
@@ -506,7 +506,7 @@ fn test_message_prune_order_convergence() {
         MessageV1 {
             room_owner: owner_id,
             author: owner_id,
-            time: same_time,
+            time: same_time.into(),
             content: RoomMessageBody::public("Message A".to_string()),
         },
         &owner_signing_key,
@@ -516,7 +516,7 @@ fn test_message_prune_order_convergence() {
         MessageV1 {
             room_owner: owner_id,
             author: owner_id,
-            time: same_time,
+            time: same_time.into(),
             content: RoomMessageBody::public("Message B".to_string()),
         },
         &owner_signing_key,
@@ -526,7 +526,7 @@ fn test_message_prune_order_convergence() {
         MessageV1 {
             room_owner: owner_id,
             author: owner_id,
-            time: same_time,
+            time: same_time.into(),
             content: RoomMessageBody::public("Message C".to_string()),
         },
         &owner_signing_key,
@@ -649,7 +649,7 @@ fn test_message_delta_idempotency() {
         MessageV1 {
             room_owner: owner_id,
             author: owner_id,
-            time: SystemTime::now(),
+            time: SystemTime::now().into(),
             content: RoomMessageBody::public("Test message".to_string()),
         },
         &owner_signing_key,
@@ -876,7 +876,7 @@ fn test_message_convergence_stress_100_messages() {
             MessageV1 {
                 room_owner: owner_id,
                 author: owner_id,
-                time,
+                time: time.into(),
                 content: RoomMessageBody::public(format!("Message {}", i)),
             },
             &owner_signing_key,
@@ -963,7 +963,7 @@ fn test_ban_convergence_stress_same_timestamps() {
         let ban = AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: same_time,
+                banned_at: same_time.into(),
                 banned_user: member.member.id(),
             },
             owner_id,
@@ -1175,7 +1175,7 @@ fn test_message_varying_limits_convergence() {
             MessageV1 {
                 room_owner: owner_id,
                 author: owner_id,
-                time: base_time + std::time::Duration::from_secs(i as u64),
+                time: (base_time + std::time::Duration::from_secs(i as u64)).into(),
                 content: RoomMessageBody::public(format!("Message {}", i)),
             },
             &owner_signing_key,
@@ -1360,7 +1360,7 @@ fn test_messages_all_identical_timestamps() {
             MessageV1 {
                 room_owner: owner_id,
                 author: owner_id,
-                time: same_time,
+                time: same_time.into(),
                 content: RoomMessageBody::public(format!("Message {}", i)),
             },
             &owner_signing_key,
@@ -1524,7 +1524,7 @@ fn test_concurrent_adds_and_bans() {
         AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: ban_time,
+                banned_at: ban_time.into(),
                 banned_user: members[0].member.id(),
             },
             owner_id,
@@ -1533,7 +1533,7 @@ fn test_concurrent_adds_and_bans() {
         AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: ban_time,
+                banned_at: ban_time.into(),
                 banned_user: members[1].member.id(),
             },
             owner_id,
@@ -1768,7 +1768,7 @@ fn test_regression_ban_excess_identification() {
         let ban = AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: same_time,
+                banned_at: same_time.into(),
                 banned_user: member.member.id(),
             },
             owner_id,
@@ -1843,7 +1843,7 @@ fn test_regression_message_pruning_order() {
             MessageV1 {
                 room_owner: owner_id,
                 author: owner_id,
-                time,
+                time: time.into(),
                 content: RoomMessageBody::public(format!("Message {}", i)),
             },
             &owner_signing_key,
@@ -1949,7 +1949,7 @@ fn test_full_state_merge_commutativity() {
         MessageV1 {
             room_owner: owner_id,
             author: owner_id,
-            time: time_1,
+            time: time_1.into(),
             content: RoomMessageBody::public("Hello from owner".to_string()),
         },
         &owner_signing_key,
@@ -1958,7 +1958,7 @@ fn test_full_state_merge_commutativity() {
         MessageV1 {
             room_owner: owner_id,
             author: member_a.id(),
-            time: time_2,
+            time: time_2.into(),
             content: RoomMessageBody::public("Hello from Alice".to_string()),
         },
         &member_a_sk,
@@ -1967,7 +1967,7 @@ fn test_full_state_merge_commutativity() {
         MessageV1 {
             room_owner: owner_id,
             author: member_b.id(),
-            time: time_3,
+            time: time_3.into(),
             content: RoomMessageBody::public("Hello from Bob".to_string()),
         },
         &member_b_sk,
@@ -2123,7 +2123,7 @@ fn test_regression_combined_scenario() {
             MessageV1 {
                 room_owner: owner_id,
                 author: members[author_idx].0.member.id(),
-                time,
+                time: time.into(),
                 content: RoomMessageBody::public(format!("Message {}", i)),
             },
             &members[author_idx].1,
@@ -2138,7 +2138,7 @@ fn test_regression_combined_scenario() {
         let ban = AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: ban_time,                        // Same timestamp
+                banned_at: ban_time.into(), // Same timestamp
                 banned_user: members[25 + i].0.member.id(), // Ban level-2 members
             },
             owner_id,
@@ -2302,7 +2302,7 @@ fn test_merge_with_bans_from_member_not_in_other_state() {
     let ban_y_by_x = AuthorizedUserBan::new(
         UserBan {
             owner_member_id: owner_id,
-            banned_at: SystemTime::now(),
+            banned_at: SystemTime::now().into(),
             banned_user: member_y_id,
         },
         member_x_id,
@@ -2413,7 +2413,7 @@ fn test_merge_commutativity_with_owner_bans() {
     let ban_a = AuthorizedUserBan::new(
         UserBan {
             owner_member_id: owner_id,
-            banned_at: SystemTime::now(),
+            banned_at: SystemTime::now().into(),
             banned_user: member_a_id,
         },
         owner_id,
@@ -2424,7 +2424,7 @@ fn test_merge_commutativity_with_owner_bans() {
     let ban_d = AuthorizedUserBan::new(
         UserBan {
             owner_member_id: owner_id,
-            banned_at: SystemTime::now() + std::time::Duration::from_secs(1),
+            banned_at: (SystemTime::now() + std::time::Duration::from_secs(1)).into(),
             banned_user: member_d_id,
         },
         owner_id,
@@ -2572,7 +2572,7 @@ fn test_merge_cascade_ban_cleanup() {
     let ban_b_by_a = AuthorizedUserBan::new(
         UserBan {
             owner_member_id: owner_id,
-            banned_at: SystemTime::now(),
+            banned_at: SystemTime::now().into(),
             banned_user: member_b_id,
         },
         member_a_id,
@@ -2583,7 +2583,7 @@ fn test_merge_cascade_ban_cleanup() {
     let ban_a_by_owner = AuthorizedUserBan::new(
         UserBan {
             owner_member_id: owner_id,
-            banned_at: SystemTime::now() + std::time::Duration::from_secs(1),
+            banned_at: (SystemTime::now() + std::time::Duration::from_secs(1)).into(),
             banned_user: member_a_id,
         },
         owner_id,
@@ -2711,7 +2711,7 @@ fn test_merge_cascade_ban_commutativity() {
     let ban_b_by_a = AuthorizedUserBan::new(
         UserBan {
             owner_member_id: owner_id,
-            banned_at: SystemTime::now(),
+            banned_at: SystemTime::now().into(),
             banned_user: member_b_id,
         },
         member_a_id,
@@ -2722,7 +2722,7 @@ fn test_merge_cascade_ban_commutativity() {
     let ban_a_by_owner = AuthorizedUserBan::new(
         UserBan {
             owner_member_id: owner_id,
-            banned_at: SystemTime::now() + std::time::Duration::from_secs(1),
+            banned_at: (SystemTime::now() + std::time::Duration::from_secs(1)).into(),
             banned_user: member_a_id,
         },
         owner_id,
@@ -2840,7 +2840,7 @@ fn test_merge_owner_ban_across_diverged_states() {
     let ban_a = AuthorizedUserBan::new(
         UserBan {
             owner_member_id: owner_id,
-            banned_at: SystemTime::now(),
+            banned_at: SystemTime::now().into(),
             banned_user: member_a_id,
         },
         owner_id,
@@ -3209,7 +3209,8 @@ fn lower_max_user_bans_with_a_stale_peer(held: usize, new_max: usize) -> usize {
         bans.push(AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(i as u64),
+                banned_at: (SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(i as u64))
+                    .into(),
                 banned_user: target.id(),
             },
             a.id(),
@@ -3324,7 +3325,7 @@ fn a_deep_ban_evidence_chain_merges_into_a_fresh_peer() {
         AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+                banned_at: (SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs)).into(),
                 banned_user: target,
             },
             x.id(),
@@ -3522,7 +3523,7 @@ fn timed_msg(r: &EvidenceRoom, author_sk: &SigningKey, t: u64) -> AuthorizedMess
         MessageV1 {
             room_owner: r.owner_id,
             author: author_sk.verifying_key().into(),
-            time: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000 + t),
+            time: (SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000 + t)).into(),
             content: RoomMessageBody::public(format!("m{t}")),
         },
         author_sk,
@@ -3533,7 +3534,8 @@ fn timed_ban(r: &EvidenceRoom, by_sk: &SigningKey, target: MemberId, t: u64) -> 
     AuthorizedUserBan::new(
         UserBan {
             owner_member_id: r.owner_id,
-            banned_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000 + t),
+            banned_at: (SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000 + t))
+                .into(),
             banned_user: target,
         },
         by_sk.verifying_key().into(),

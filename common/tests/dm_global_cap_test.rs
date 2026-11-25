@@ -1302,8 +1302,9 @@ fn a_removal_frees_global_dm_slots_in_both_merge_directions() {
             river_core::room_state::ban::AuthorizedUserBan::new(
                 river_core::room_state::ban::UserBan {
                     owner_member_id: owner_id,
-                    banned_at: std::time::SystemTime::UNIX_EPOCH
-                        + std::time::Duration::from_secs(BASE_TS),
+                    banned_at: (std::time::SystemTime::UNIX_EPOCH
+                        + std::time::Duration::from_secs(BASE_TS))
+                    .into(),
                     banned_user: r.id(3),
                 },
                 owner_id,

@@ -239,8 +239,9 @@ mod tests {
                 AuthorizedUserBan::new(
                     UserBan {
                         owner_member_id: owner_id,
-                        banned_at: std::time::SystemTime::UNIX_EPOCH
-                            + std::time::Duration::from_secs(i),
+                        banned_at: (std::time::SystemTime::UNIX_EPOCH
+                            + std::time::Duration::from_secs(i))
+                        .into(),
                         banned_user: MemberId::from(&target.verifying_key()),
                     },
                     owner_id,
@@ -322,8 +323,9 @@ mod tests {
                         MessageV1 {
                             room_owner: owner_id,
                             author: MemberId::from(&a.verifying_key()),
-                            time: std::time::SystemTime::UNIX_EPOCH
-                                + std::time::Duration::from_secs(i as u64),
+                            time: (std::time::SystemTime::UNIX_EPOCH
+                                + std::time::Duration::from_secs(i as u64))
+                            .into(),
                             content: RoomMessageBody::public(format!("m{i}")),
                         },
                         a,
@@ -410,8 +412,9 @@ mod tests {
                             MessageV1 {
                                 room_owner: owner_id,
                                 author: owner_id,
-                                time: std::time::SystemTime::UNIX_EPOCH
-                                    + std::time::Duration::from_secs(1_000 + i),
+                                time: (std::time::SystemTime::UNIX_EPOCH
+                                    + std::time::Duration::from_secs(1_000 + i))
+                                .into(),
                                 content: RoomMessageBody::public(format!("m{i}")),
                             },
                             &owner_sk,
@@ -567,7 +570,7 @@ mod tests {
                         room_owner: owner_id,
                         author: id,
                         content: RoomMessageBody::public(format!("message {k} from {i}")),
-                        time: at(i as u64 * 10 + k),
+                        time: at(i as u64 * 10 + k).into(),
                     },
                     sk,
                 ));
@@ -581,7 +584,7 @@ mod tests {
                     room_owner: owner_id,
                     author: MemberId::from(&sks[i].verifying_key()),
                     content: RoomMessageBody::edit(target, format!("edited {i}")),
-                    time: at(5_000 + i as u64),
+                    time: at(5_000 + i as u64).into(),
                 },
                 &sks[i],
             ));
@@ -591,7 +594,7 @@ mod tests {
                 AuthorizedUserBan::new(
                     UserBan {
                         owner_member_id: owner_id,
-                        banned_at: at(6_000 + t),
+                        banned_at: at(6_000 + t).into(),
                         banned_user: MemberId::from(&key(500 + t as usize).verifying_key()),
                     },
                     owner_id,
@@ -732,8 +735,9 @@ mod tests {
                         room_owner: owner_id,
                         author: owner_id,
                         content: RoomMessageBody::public(format!("at {secs}")),
-                        time: std::time::SystemTime::UNIX_EPOCH
-                            + std::time::Duration::from_secs(1_700_000_000 + secs),
+                        time: (std::time::SystemTime::UNIX_EPOCH
+                            + std::time::Duration::from_secs(1_700_000_000 + secs))
+                        .into(),
                     },
                     &owner_sk,
                 ));
@@ -774,8 +778,9 @@ mod tests {
                     room_owner: owner_id,
                     author: owner_id,
                     content: RoomMessageBody::edit(target, "edited".to_string()),
-                    time: std::time::SystemTime::UNIX_EPOCH
-                        + std::time::Duration::from_secs(1_700_000_030),
+                    time: (std::time::SystemTime::UNIX_EPOCH
+                        + std::time::Duration::from_secs(1_700_000_030))
+                    .into(),
                 },
                 &owner_sk,
             ));

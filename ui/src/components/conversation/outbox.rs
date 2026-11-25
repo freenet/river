@@ -167,7 +167,8 @@ impl PendingEntry {
         self.messages
             .first()
             .map(|m| m.message.time)
-            .unwrap_or(SystemTime::UNIX_EPOCH)
+            .unwrap_or(SystemTime::UNIX_EPOCH.into())
+            .into()
     }
 }
 
@@ -214,7 +215,7 @@ impl PendingEntry {
                 }
             }
             if let Some(time) = restamp {
-                message.time = time;
+                message.time = time.into();
             }
             let mut bytes = Vec::new();
             if ciborium::ser::into_writer(&message, &mut bytes).is_err() {

@@ -105,7 +105,8 @@ fn build_room(members: usize, messages: usize, msg_len: usize) -> ChatRoomStateV
                 MessageV1 {
                     room_owner: owner_id,
                     author: MemberId::from(&sk.verifying_key()),
-                    time: SystemTime::UNIX_EPOCH + Duration::from_secs(BASE_SECS + i as u64),
+                    time: (SystemTime::UNIX_EPOCH + Duration::from_secs(BASE_SECS + i as u64))
+                        .into(),
                     content: RoomMessageBody::public(format!("{body} {i}")),
                 },
                 sk,

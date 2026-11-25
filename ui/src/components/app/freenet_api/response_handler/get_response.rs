@@ -1946,7 +1946,7 @@ pub(crate) fn build_state_for_put(
         room_owner: MemberId::from(owner_vk),
         author: MemberId::from(&self_vk),
         content: RoomMessageBody::join_event(),
-        time,
+        time: time.into(),
     };
     let auth_join = AuthorizedMessageV1::new(join_msg, invitee_sk);
     state.recent_messages.messages.push(auth_join.clone());
@@ -2488,7 +2488,7 @@ mod tests {
             j2.id(),
             "same time -> same MessageId (deterministic)"
         );
-        assert_eq!(j1.message.time, fixed_time);
+        assert_eq!(j1.message.time, fixed_time.into());
     }
 
     /// freenet/river#292 Task 3/4 — the backward-probe trigger gate.

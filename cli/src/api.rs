@@ -1966,7 +1966,7 @@ pub(crate) fn message_event_json(
         .canonical(msg.message.author)
         .map(|info| unseal_nickname_display(&info.member_info.preferred_nickname, secrets));
 
-    let datetime: DateTime<Utc> = msg.message.time.into();
+    let datetime: DateTime<Utc> = msg.message.time.to_system_time().into();
 
     // Get display content (handles edits and non-text public content like join
     // events; `secrets` decrypts private-room bodies — only a body whose secret
@@ -2028,7 +2028,7 @@ pub(crate) fn reaction_event_json(
         .member_info
         .canonical(msg.message.author)
         .map(|info| unseal_nickname_display(&info.member_info.preferred_nickname, secrets));
-    let datetime: DateTime<Utc> = msg.message.time.into();
+    let datetime: DateTime<Utc> = msg.message.time.to_system_time().into();
 
     let reactions_map: std::collections::HashMap<String, usize> = reactions
         .map(|r| r.iter().map(|(k, v)| (k.clone(), v.len())).collect())
@@ -2082,7 +2082,7 @@ pub(crate) fn deletion_event_json(
         .member_info
         .canonical(msg.message.author)
         .map(|info| unseal_nickname_display(&info.member_info.preferred_nickname, secrets));
-    let datetime: DateTime<Utc> = msg.message.time.into();
+    let datetime: DateTime<Utc> = msg.message.time.to_system_time().into();
 
     json!({
         "type": "delete",
@@ -2563,7 +2563,7 @@ fn build_new_room_state(
         let version_record = SecretVersionRecordV1 {
             version: 0,
             cipher_spec: RoomCipherSpec::Aes256Gcm,
-            created_at: crate::signed_time::now(),
+            created_at: crate::signed_time::now().into(),
         };
         room_state
             .secrets
@@ -4246,7 +4246,7 @@ impl ApiClient {
             room_owner: params.owner_id(),
             author: self_id,
             content: river_core::room_state::message::RoomMessageBody::join_event(),
-            time: crate::signed_time::now(),
+            time: crate::signed_time::now().into(),
         };
         let auth_join_message =
             river_core::room_state::message::AuthorizedMessageV1::new(join_message, signing_key);
@@ -4959,7 +4959,7 @@ impl ApiClient {
             room_owner: MemberId::from(*room_owner_key),
             author: sender_member_id,
             content,
-            time: message_time,
+            time: message_time.into(),
         };
 
         // Sign the message
@@ -5102,7 +5102,7 @@ impl ApiClient {
             room_owner: river_core::room_state::member::MemberId::from(*room_owner_key),
             author: author_member_id(&signing_key),
             content,
-            time: crate::signed_time::now(),
+            time: crate::signed_time::now().into(),
         };
 
         // Sign the message
@@ -5251,7 +5251,7 @@ impl ApiClient {
             room_owner: MemberId::from(*room_owner_key),
             author: author_member_id(&signing_key),
             content,
-            time: crate::signed_time::now(),
+            time: crate::signed_time::now().into(),
         };
 
         // Sign the message
@@ -5324,7 +5324,7 @@ impl ApiClient {
             room_owner: MemberId::from(*room_owner_key),
             author: author_member_id(&signing_key),
             content,
-            time: crate::signed_time::now(),
+            time: crate::signed_time::now().into(),
         };
 
         // Sign the message
@@ -5399,7 +5399,7 @@ impl ApiClient {
             room_owner: MemberId::from(*room_owner_key),
             author: author_member_id(&signing_key),
             content,
-            time: crate::signed_time::now(),
+            time: crate::signed_time::now().into(),
         };
 
         // Sign the message
@@ -5477,7 +5477,7 @@ impl ApiClient {
             room_owner: MemberId::from(*room_owner_key),
             author: author_member_id(&signing_key),
             content,
-            time: crate::signed_time::now(),
+            time: crate::signed_time::now().into(),
         };
 
         // Sign the message
@@ -5602,7 +5602,7 @@ impl ApiClient {
             room_owner: MemberId::from(*room_owner_key),
             author: author_member_id(&signing_key),
             content,
-            time: crate::signed_time::now(),
+            time: crate::signed_time::now().into(),
         };
 
         // Sign the message
@@ -6111,7 +6111,7 @@ impl ApiClient {
                 let msg_id = msg.id();
                 let reactions = room_state.recent_messages.reactions(&msg_id);
                 let author_str = msg.message.author.to_string();
-                let datetime: DateTime<Utc> = msg.message.time.into();
+                let datetime: DateTime<Utc> = msg.message.time.to_system_time().into();
                 let local_time: DateTime<Local> = datetime.into();
                 let display_name = room_state
                     .member_info
@@ -6184,7 +6184,7 @@ impl ApiClient {
         Ok(match format {
             OutputFormat::Human => {
                 let author_str = msg.message.author.to_string();
-                let datetime: DateTime<Utc> = msg.message.time.into();
+                let datetime: DateTime<Utc> = msg.message.time.to_system_time().into();
                 let local_time: DateTime<Local> = datetime.into();
                 let display_name = room_state
                     .member_info
@@ -6279,7 +6279,7 @@ impl ApiClient {
                     })
                     .unwrap_or(author_short);
 
-                let datetime: DateTime<Utc> = msg.message.time.into();
+                let datetime: DateTime<Utc> = msg.message.time.to_system_time().into();
                 let local_time: DateTime<Local> = datetime.into();
 
                 let edited_indicator = if edited { " (edited)" } else { "" };
@@ -7354,7 +7354,7 @@ fn user_ban_delta(
 ) -> ChatRoomStateV1Delta {
     let user_ban = UserBan {
         owner_member_id,
-        banned_at: at,
+        banned_at: at.into(),
         banned_user: target,
     };
     ChatRoomStateV1Delta {
@@ -7485,7 +7485,7 @@ fn provisional_ban_delta(
     };
     let ban = ProvisionalBan {
         banned_by: banner,
-        banned_at: at,
+        banned_at: at.into(),
         target,
     };
     ChatRoomStateV1Delta {
@@ -8552,7 +8552,7 @@ mod migration_recovery_tests {
                 room_owner: owner_vk.into(),
                 author: MemberId::from(&owner_vk),
                 content: RoomMessageBody::public((*text).to_string()),
-                time: std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(i as u64),
+                time: (std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(i as u64)).into(),
             };
             state
                 .recent_messages
@@ -9130,7 +9130,7 @@ mod migration_recovery_tests {
         state.bans.0.push(AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(500),
+                banned_at: (std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(500)).into(),
                 banned_user: member_id,
             },
             owner_id,
@@ -9145,7 +9145,8 @@ mod migration_recovery_tests {
                 SecretVersionRecordV1 {
                     version: 1,
                     cipher_spec: RoomCipherSpec::Aes256Gcm,
-                    created_at: std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(10),
+                    created_at: (std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(10))
+                        .into(),
                 },
                 owner_sk,
             ));
@@ -9185,7 +9186,7 @@ mod migration_recovery_tests {
                     room_owner: owner_id,
                     author: owner_id,
                     content: body,
-                    time: std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(i),
+                    time: (std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(i)).into(),
                 },
                 owner_sk,
             )
@@ -9931,7 +9932,8 @@ mod create_room_tests {
                     MessageV1 {
                         room_owner: owner_id,
                         author: owner_id,
-                        time: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000 + i),
+                        time: (std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000 + i))
+                            .into(),
                         content: RoomMessageBody::public(format!("m{i}")),
                     },
                     owner,
@@ -9945,7 +9947,8 @@ mod create_room_tests {
                     AuthorizedUserBan::new(
                         UserBan {
                             owner_member_id: owner_id,
-                            banned_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(i),
+                            banned_at: (std::time::UNIX_EPOCH + std::time::Duration::from_secs(i))
+                                .into(),
                             banned_user: MemberId::from(
                                 &SigningKey::from_bytes(&{
                                     let mut b = [6u8; 32];
@@ -10067,7 +10070,7 @@ mod create_room_tests {
                 MessageV1 {
                     room_owner: MemberId::from(&owner_vk),
                     author: MemberId::from(&member.verifying_key()),
-                    time: std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000),
+                    time: (std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000)).into(),
                     content: RoomMessageBody::public("by the member".to_string()),
                 },
                 &member,
@@ -10403,7 +10406,7 @@ mod display_text_tests {
             room_owner: MemberId::from(owner_vk),
             author: MemberId::from(&author_sk.verifying_key()),
             content: body,
-            time: SystemTime::UNIX_EPOCH,
+            time: SystemTime::UNIX_EPOCH.into(),
         };
         let authored = AuthorizedMessageV1::new(message, &author_sk);
         let mut state = ChatRoomStateV1::default();
@@ -10560,7 +10563,7 @@ mod display_text_tests {
                     t_nonce,
                     0,
                 ),
-                time: SystemTime::UNIX_EPOCH,
+                time: SystemTime::UNIX_EPOCH.into(),
             },
             &alice_sk,
         );
@@ -10689,7 +10692,7 @@ mod display_text_tests {
                     room_owner: MemberId::from(owner_vk),
                     author: MemberId::from(&author_sk.verifying_key()),
                     content,
-                    time: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+                    time: (SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs)).into(),
                 },
                 &author_sk,
             )
@@ -11174,7 +11177,7 @@ mod monitor_tests {
             content: body,
             // A distinct time per author so two fixture messages never collide
             // on the (author, time)-derived message id.
-            time: SystemTime::UNIX_EPOCH + Duration::from_secs(sk.to_bytes()[0] as u64),
+            time: (SystemTime::UNIX_EPOCH + Duration::from_secs(sk.to_bytes()[0] as u64)).into(),
         };
         AuthorizedMessageV1::new(m, sk)
     }
@@ -11282,7 +11285,7 @@ mod monitor_tests {
                 room_owner: MemberId::from(owner),
                 author: MemberId::from(&sk.verifying_key()),
                 content: RoomMessageBody::public(text.to_string()),
-                time: SystemTime::UNIX_EPOCH, // identical timestamp
+                time: SystemTime::UNIX_EPOCH.into(), // identical timestamp
             };
             AuthorizedMessageV1::new(m, &sk)
         };
@@ -11389,7 +11392,7 @@ mod monitor_tests {
             author: MemberId::from(&sk.verifying_key()),
             content,
             // Distinct non-UNIX-EPOCH time so reaction actions don't collide.
-            time: SystemTime::UNIX_EPOCH + Duration::from_secs(actor as u64),
+            time: (SystemTime::UNIX_EPOCH + Duration::from_secs(actor as u64)).into(),
         };
         AuthorizedMessageV1::new(m, &sk)
     }
@@ -12203,7 +12206,7 @@ mod mention_cli_tests {
             room_owner: MemberId::from(author.verifying_key()),
             author: member_id(&author),
             content: RoomMessageBody::public(text),
-            time: SystemTime::UNIX_EPOCH,
+            time: SystemTime::UNIX_EPOCH.into(),
         };
         AuthorizedMessageV1::new(m, &author)
     }
@@ -12228,7 +12231,7 @@ mod mention_cli_tests {
                 room_owner: MemberId::from(sender.verifying_key()),
                 author: member_id(author),
                 content: RoomMessageBody::public(text.to_string()),
-                time: SystemTime::UNIX_EPOCH,
+                time: SystemTime::UNIX_EPOCH.into(),
             },
             author,
         );
@@ -12244,7 +12247,7 @@ mod mention_cli_tests {
                     "SNAPSHOT AUTHOR MUST NOT RENDER".to_string(),
                     "SNAPSHOT PREVIEW MUST NOT RENDER".to_string(),
                 ),
-                time: SystemTime::UNIX_EPOCH,
+                time: SystemTime::UNIX_EPOCH.into(),
             },
             &sender,
         )
@@ -12660,7 +12663,7 @@ mod mention_cli_tests {
                     room_owner: MemberId::from(&alice.verifying_key()),
                     author: MemberId::from(&alice.verifying_key()),
                     content: body,
-                    time: SystemTime::UNIX_EPOCH,
+                    time: SystemTime::UNIX_EPOCH.into(),
                 },
                 &alice,
             );
@@ -12675,7 +12678,7 @@ mod mention_cli_tests {
                         "SNAPSHOT AUTHOR MUST NOT RENDER".to_string(),
                         "SNAPSHOT PREVIEW MUST NOT RENDER".to_string(),
                     ),
-                    time: SystemTime::UNIX_EPOCH,
+                    time: SystemTime::UNIX_EPOCH.into(),
                 },
                 &sender,
             );
@@ -12731,7 +12734,7 @@ mod mention_cli_tests {
                     nonce,
                     3,
                 ),
-                time: SystemTime::UNIX_EPOCH,
+                time: SystemTime::UNIX_EPOCH.into(),
             },
             &alice,
         );
@@ -12745,7 +12748,7 @@ mod mention_cli_tests {
                     "SNAPSHOT AUTHOR MUST NOT RENDER".to_string(),
                     "SNAPSHOT PREVIEW MUST NOT RENDER".to_string(),
                 ),
-                time: SystemTime::UNIX_EPOCH,
+                time: SystemTime::UNIX_EPOCH.into(),
             },
             &sender,
         );
@@ -12793,7 +12796,7 @@ mod mention_cli_tests {
                     REPLY_CONTENT_VERSION,
                     vec![0xff, 0x00, 0xff],
                 ),
-                time: SystemTime::UNIX_EPOCH,
+                time: SystemTime::UNIX_EPOCH.into(),
             },
             &sender,
         );
@@ -13011,7 +13014,7 @@ mod authorize_send_tests {
                 room_owner: MemberId::from(owner_vk),
                 author: super::author_member_id(&owner),
                 content,
-                time: std::time::SystemTime::now(),
+                time: std::time::SystemTime::now().into(),
             },
             &owner,
         );
@@ -13159,7 +13162,7 @@ mod authorize_send_tests {
         state.bans = BansV1(vec![AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: std::time::SystemTime::UNIX_EPOCH,
+                banned_at: std::time::SystemTime::UNIX_EPOCH.into(),
                 banned_user: MemberId::from(&invitee.verifying_key()),
             },
             owner_id,
@@ -13245,7 +13248,7 @@ mod authorize_send_tests {
                 room_owner: MemberId::from(&owner.verifying_key()),
                 author: MemberId::from(&owner.verifying_key()),
                 content: river_core::room_state::message::RoomMessageBody::public("hi".into()),
-                time: std::time::SystemTime::UNIX_EPOCH,
+                time: std::time::SystemTime::UNIX_EPOCH.into(),
             },
             &owner,
         );
@@ -13272,7 +13275,7 @@ mod authorize_send_tests {
         state.bans = BansV1(vec![AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: std::time::SystemTime::UNIX_EPOCH,
+                banned_at: std::time::SystemTime::UNIX_EPOCH.into(),
                 banned_user: MemberId::from(&member.verifying_key()),
             },
             owner_id,
@@ -15229,7 +15232,8 @@ mod provisional_ban_tests {
             river_core::room_state::message::MessageV1 {
                 room_owner: id(owner),
                 author: id(k),
-                time: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000 + t),
+                time: (std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000 + t))
+                    .into(),
                 content: river_core::room_state::message::RoomMessageBody::public("hi".to_string()),
             },
             k,

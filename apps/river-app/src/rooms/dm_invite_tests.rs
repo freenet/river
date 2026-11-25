@@ -355,7 +355,7 @@ fn every_refusal_is_said_in_fixed_words_and_mints_nothing() {
     banned.stored.room_state.bans.0.push(AuthorizedUserBan::new(
         UserBan {
             owner_member_id: MemberId::from(&banned.stored.owner_vk),
-            banned_at: secs(BASE),
+            banned_at: secs(BASE).into(),
             banned_user: MemberId::from(&SigningKey::from_bytes(&[2; 32]).verifying_key()),
         },
         MemberId::from(&banned.stored.owner_vk),

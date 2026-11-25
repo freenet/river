@@ -352,7 +352,7 @@ impl World {
             MessageV1 {
                 room_owner: self.owner_id,
                 author: author_id,
-                time: self.base_time + Duration::from_secs(t),
+                time: (self.base_time + Duration::from_secs(t)).into(),
                 content: RoomMessageBody::public(text.to_string()),
             },
             sk,
@@ -418,7 +418,7 @@ fn random_op_rich(
                 SecretVersionRecordV1 {
                     version: v,
                     cipher_spec: RoomCipherSpec::Aes256Gcm,
-                    created_at: w.base_time + Duration::from_secs(t),
+                    created_at: (w.base_time + Duration::from_secs(t)).into(),
                 },
                 &w.owner_sk,
             );
@@ -481,7 +481,7 @@ fn random_op_rich(
                 MessageV1 {
                     room_owner: w.owner_id,
                     author: author_id,
-                    time: w.base_time + Duration::from_secs(t),
+                    time: (w.base_time + Duration::from_secs(t)).into(),
                     content: RoomMessageBody::private(
                         1,
                         1,
@@ -754,7 +754,7 @@ fn random_op(
             };
             let ban = UserBan {
                 owner_member_id: w.owner_id,
-                banned_at: w.base_time + Duration::from_secs(t),
+                banned_at: (w.base_time + Duration::from_secs(t)).into(),
                 banned_user: w.pool[target].id,
             };
             let auth = match banner {
@@ -791,7 +791,7 @@ fn op_for(
 fn sign_ban(w: &World, by: Option<usize>, target: usize, at: u64) -> AuthorizedUserBan {
     let ban = UserBan {
         owner_member_id: w.owner_id,
-        banned_at: w.base_time + Duration::from_secs(at),
+        banned_at: (w.base_time + Duration::from_secs(at)).into(),
         banned_user: w.pool[target].id,
     };
     match by {
@@ -1051,7 +1051,7 @@ fn random_op_prov(
             MessageV1 {
                 room_owner: w.owner_id,
                 author: w.prov_ids[j],
-                time: w.base_time + Duration::from_secs(at),
+                time: (w.base_time + Duration::from_secs(at)).into(),
                 content: RoomMessageBody::public(text.to_string()),
             },
             &w.prov[j],
@@ -1259,7 +1259,7 @@ fn random_op_prov(
                 &w.params.owner,
                 ProvisionalBan {
                     banned_by: by_id,
-                    banned_at: w.base_time + Duration::from_secs(t),
+                    banned_at: (w.base_time + Duration::from_secs(t)).into(),
                     target,
                 },
                 by_sk,
@@ -1283,7 +1283,7 @@ fn random_op_prov(
             };
             let ban = UserBan {
                 owner_member_id: w.owner_id,
-                banned_at: w.base_time + Duration::from_secs(t),
+                banned_at: (w.base_time + Duration::from_secs(t)).into(),
                 banned_user: target,
             };
             ChatRoomStateV1Delta {
@@ -1333,7 +1333,7 @@ fn random_op_prov(
                 vec![AuthorizedUserBan::new(
                     UserBan {
                         owner_member_id: w.owner_id,
-                        banned_at: w.base_time + Duration::from_secs(t),
+                        banned_at: (w.base_time + Duration::from_secs(t)).into(),
                         banned_user: victim_id,
                     },
                     w.pool[p].id,
@@ -1400,7 +1400,7 @@ fn random_op_prov(
             let ban = AuthorizedUserBan::new(
                 UserBan {
                     owner_member_id: w.owner_id,
-                    banned_at: w.base_time + Duration::from_secs(t),
+                    banned_at: (w.base_time + Duration::from_secs(t)).into(),
                     banned_user: w.prov_ids[j],
                 },
                 w.pool[b].id,

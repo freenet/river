@@ -336,7 +336,7 @@ pub fn build_join(
             room_owner: MemberId::from(owner_key),
             author: id,
             content: RoomMessageBody::public(options.text.to_string()),
-            time: message_time,
+            time: message_time.into(),
         },
         signing_key,
     );
@@ -679,7 +679,7 @@ mod tests {
             )
             .unwrap();
             let time = delta.recent_messages.unwrap()[0].message.time;
-            let d = time.duration_since(std::time::UNIX_EPOCH).unwrap();
+            let d = time.duration_since(std::time::UNIX_EPOCH.into()).unwrap();
             assert_eq!(d.subsec_nanos() % 1_000_000, 0, "{d:?}");
         }
     }

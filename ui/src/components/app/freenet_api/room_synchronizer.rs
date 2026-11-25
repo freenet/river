@@ -1965,7 +1965,7 @@ mod tests {
         state.bans = BansV1(vec![AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(4_000),
+                banned_at: (SystemTime::UNIX_EPOCH + Duration::from_secs(4_000)).into(),
                 banned_user: banned,
             },
             owner_id,
@@ -1986,7 +1986,7 @@ mod tests {
             room_owner: state.configuration.configuration.owner_member_id,
             author: MemberId::from(&author_sk.verifying_key()),
             content: RoomMessageBody::public(content.to_string()),
-            time: SystemTime::now(),
+            time: SystemTime::now().into(),
         };
         let authorized = AuthorizedMessageV1::new(msg, author_sk);
         state.recent_messages.messages.push(authorized);
@@ -2013,8 +2013,9 @@ mod tests {
                         room_owner: params.owner_id(),
                         author: params.owner_id(),
                         content: RoomMessageBody::public(text.to_string()),
-                        time: SystemTime::UNIX_EPOCH
-                            + std::time::Duration::from_secs(1_700_000_000 + secs),
+                        time: (SystemTime::UNIX_EPOCH
+                            + std::time::Duration::from_secs(1_700_000_000 + secs))
+                        .into(),
                     },
                     &owner_sk,
                 ));
@@ -2130,7 +2131,8 @@ mod tests {
                 AuthorizedUserBan::new(
                     UserBan {
                         owner_member_id: owner_id,
-                        banned_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(i),
+                        banned_at: (SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(i))
+                            .into(),
                         banned_user: MemberId::from(&target.verifying_key()),
                     },
                     owner_id,
@@ -2160,7 +2162,9 @@ mod tests {
             AuthorizedUserBan::new(
                 UserBan {
                     owner_member_id: owner_id,
-                    banned_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(10_000 + i),
+                    banned_at: (SystemTime::UNIX_EPOCH
+                        + std::time::Duration::from_secs(10_000 + i))
+                    .into(),
                     banned_user: MemberId::from(
                         &SigningKey::from_bytes(&[200 + i as u8; 32]).verifying_key(),
                     ),
@@ -2952,7 +2956,7 @@ mod tests {
                 room_owner: state.configuration.configuration.owner_member_id,
                 author: MemberId::from(&owner_sk.verifying_key()),
                 content: RoomMessageBody::public(body.to_string()),
-                time: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+                time: (SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs)).into(),
             };
             state
                 .recent_messages
@@ -3030,7 +3034,7 @@ mod tests {
                 room_owner: params.owner_id(),
                 author: params.owner_id(),
                 content: RoomMessageBody::public(format!("m{secs}")),
-                time: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+                time: (SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs)).into(),
             };
             state
                 .recent_messages
@@ -3134,7 +3138,7 @@ mod tests {
         let ban = AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(9_000),
+                banned_at: (SystemTime::UNIX_EPOCH + Duration::from_secs(9_000)).into(),
                 banned_user: banned_id,
             },
             owner_id,
@@ -3147,7 +3151,7 @@ mod tests {
                     room_owner: owner_id,
                     author: MemberId::from(&sk.verifying_key()),
                     content: RoomMessageBody::public(body.to_string()),
-                    time: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+                    time: (SystemTime::UNIX_EPOCH + Duration::from_secs(secs)).into(),
                 },
                 sk,
             )
@@ -3302,7 +3306,7 @@ mod tests {
                     room_owner: room_state.configuration.configuration.owner_member_id,
                     author: MemberId::from(&owner_sk.verifying_key()),
                     content: RoomMessageBody::public(body.to_string()),
-                    time: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+                    time: (SystemTime::UNIX_EPOCH + Duration::from_secs(secs)).into(),
                 },
                 &owner_sk,
             )

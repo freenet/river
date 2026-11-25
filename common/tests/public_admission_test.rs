@@ -196,7 +196,7 @@ impl Room {
             &self.params.owner,
             ProvisionalBan {
                 banned_by: id,
-                banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(at),
+                banned_at: (SystemTime::UNIX_EPOCH + Duration::from_secs(at)).into(),
                 target,
             },
             key,
@@ -216,7 +216,7 @@ impl Room {
         AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: self.owner_id(),
-                banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(at),
+                banned_at: (SystemTime::UNIX_EPOCH + Duration::from_secs(at)).into(),
                 banned_user: target,
             },
             id,
@@ -273,7 +273,7 @@ pub fn msg_of(owner_id: MemberId, k: &SigningKey, t: u64, text: &str) -> Authori
         MessageV1 {
             room_owner: owner_id,
             author: id_of(k),
-            time: SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000 + t),
+            time: (SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000 + t)).into(),
             content: RoomMessageBody::public(text.to_string()),
         },
         k,

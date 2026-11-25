@@ -875,7 +875,7 @@ fn ban_of(w: &World, who: &SigningKey) -> river_core::room_state::ban::Authorize
     river_core::room_state::ban::AuthorizedUserBan::new(
         river_core::room_state::ban::UserBan {
             owner_member_id: MemberId::from(&w.owner.verifying_key()),
-            banned_at: std::time::SystemTime::now(),
+            banned_at: std::time::SystemTime::now().into(),
             banned_user: MemberId::from(&who.verifying_key()),
         },
         MemberId::from(&w.owner.verifying_key()),

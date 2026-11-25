@@ -94,13 +94,13 @@ mod tests {
     /// check fails for the same reason on every platform.
     fn decoded_message(bytes: &[u8], sig: ed25519_dalek::Signature) -> AuthorizedMessageV1 {
         let mut m: MessageV1 = ciborium::de::from_reader(bytes).unwrap();
-        m.time = windows_decode(m.time);
+        m.time = windows_decode(m.time.into()).into();
         AuthorizedMessageV1::with_signature(m, sig)
     }
 
     fn decoded_ban(bytes: &[u8], by: MemberId, sig: ed25519_dalek::Signature) -> AuthorizedUserBan {
         let mut b: UserBan = ciborium::de::from_reader(bytes).unwrap();
-        b.banned_at = windows_decode(b.banned_at);
+        b.banned_at = windows_decode(b.banned_at.into()).into();
         AuthorizedUserBan::with_signature(b, by, sig)
     }
 

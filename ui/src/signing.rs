@@ -777,7 +777,7 @@ mod tests {
             room_owner: MemberId::from(&owner_vk),
             author: MemberId::from(&self_sk.verifying_key()),
             content: RoomMessageBody::public("hello".to_string()),
-            time: std::time::SystemTime::UNIX_EPOCH,
+            time: std::time::SystemTime::UNIX_EPOCH.into(),
         };
 
         // Exactly what `conversation.rs` puts in the outbox, and what the
@@ -942,7 +942,7 @@ mod tests {
             room_owner: MemberId::from(owner_vk),
             author: MemberId::from(&author_sk.verifying_key()),
             content: RoomMessageBody::public("test".to_string()),
-            time: std::time::SystemTime::UNIX_EPOCH,
+            time: std::time::SystemTime::UNIX_EPOCH.into(),
         };
         let mut msg_bytes = Vec::new();
         ciborium::ser::into_writer(&msg, &mut msg_bytes).unwrap();

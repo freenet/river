@@ -88,7 +88,7 @@ fn test_private_room_creation_and_encryption() {
     let secret_version = SecretVersionRecordV1 {
         version: 0,
         cipher_spec: RoomCipherSpec::Aes256Gcm,
-        created_at: SystemTime::now(),
+        created_at: SystemTime::now().into(),
     };
 
     let auth_secret_version = AuthorizedSecretVersionRecord::new(secret_version, &owner_sk);
@@ -167,7 +167,7 @@ fn test_private_room_member_addition_with_secrets() {
     let secret_version = SecretVersionRecordV1 {
         version: 0,
         cipher_spec: RoomCipherSpec::Aes256Gcm,
-        created_at: SystemTime::now(),
+        created_at: SystemTime::now().into(),
     };
 
     room_state.secrets = RoomSecretsV1 {
@@ -294,7 +294,7 @@ fn test_secret_rotation() {
             SecretVersionRecordV1 {
                 version: 0,
                 cipher_spec: RoomCipherSpec::Aes256Gcm,
-                created_at: SystemTime::now(),
+                created_at: SystemTime::now().into(),
             },
             &owner_sk,
         )],
@@ -335,7 +335,7 @@ fn test_secret_rotation() {
             SecretVersionRecordV1 {
                 version: 1,
                 cipher_spec: RoomCipherSpec::Aes256Gcm,
-                created_at: SystemTime::now(),
+                created_at: SystemTime::now().into(),
             },
             &owner_sk,
         )],
@@ -465,7 +465,7 @@ fn test_ban_member_excludes_from_new_secrets() {
             SecretVersionRecordV1 {
                 version: 0,
                 cipher_spec: RoomCipherSpec::Aes256Gcm,
-                created_at: SystemTime::now(),
+                created_at: SystemTime::now().into(),
             },
             &owner_sk,
         )],
@@ -509,7 +509,7 @@ fn test_ban_member_excludes_from_new_secrets() {
     // Ban member1
     let ban = UserBan {
         owner_member_id: owner_id,
-        banned_at: SystemTime::now(),
+        banned_at: SystemTime::now().into(),
         banned_user: member1_id,
     };
 
@@ -529,7 +529,7 @@ fn test_ban_member_excludes_from_new_secrets() {
             SecretVersionRecordV1 {
                 version: 1,
                 cipher_spec: RoomCipherSpec::Aes256Gcm,
-                created_at: SystemTime::now(),
+                created_at: SystemTime::now().into(),
             },
             &owner_sk,
         )],
@@ -632,7 +632,7 @@ fn test_encrypted_messages_in_private_room() {
             [0u8; 12],
             0,
         ),
-        time: SystemTime::now(),
+        time: SystemTime::now().into(),
     };
 
     room_state
@@ -689,7 +689,7 @@ fn test_join_event_accepted_in_private_room() {
             SecretVersionRecordV1 {
                 version: 0,
                 cipher_spec: RoomCipherSpec::Aes256Gcm,
-                created_at: SystemTime::now(),
+                created_at: SystemTime::now().into(),
             },
             &owner_sk,
         )],
@@ -731,7 +731,7 @@ fn test_join_event_accepted_in_private_room() {
             room_owner: owner_id,
             author: joiner_id,
             content: RoomMessageBody::join_event(),
-            time: SystemTime::now(),
+            time: SystemTime::now().into(),
         },
         &joiner_sk,
     );
@@ -840,7 +840,7 @@ fn delegate_driven_rotation_round_trip() {
     let record = SecretVersionRecordV1 {
         version: new_version,
         cipher_spec: RoomCipherSpec::Aes256Gcm,
-        created_at: SystemTime::UNIX_EPOCH,
+        created_at: SystemTime::UNIX_EPOCH.into(),
     };
     let record_sig = owner_sk.sign(&cbor_bytes(&record));
     let authorized_record = AuthorizedSecretVersionRecord::with_signature(record, record_sig);
@@ -1117,7 +1117,7 @@ fn message_at_older_or_newer_known_secret_version_is_accepted() {
                 SecretVersionRecordV1 {
                     version: 0,
                     cipher_spec: RoomCipherSpec::Aes256Gcm,
-                    created_at: SystemTime::now(),
+                    created_at: SystemTime::now().into(),
                 },
                 &owner_sk,
             ),
@@ -1125,7 +1125,7 @@ fn message_at_older_or_newer_known_secret_version_is_accepted() {
                 SecretVersionRecordV1 {
                     version: 1,
                     cipher_spec: RoomCipherSpec::Aes256Gcm,
-                    created_at: SystemTime::now(),
+                    created_at: SystemTime::now().into(),
                 },
                 &owner_sk,
             ),
@@ -1164,7 +1164,7 @@ fn message_at_older_or_newer_known_secret_version_is_accepted() {
         MessageV1 {
             room_owner: owner_id,
             author: owner_id,
-            time: SystemTime::now(),
+            time: SystemTime::now().into(),
             content: RoomMessageBody::private_text(vec![9, 9, 9, 9], [0u8; 12], 1),
         },
         &owner_sk,
@@ -1198,7 +1198,7 @@ fn message_at_older_or_newer_known_secret_version_is_accepted() {
         MessageV1 {
             room_owner: owner_id,
             author: owner_id,
-            time: SystemTime::now(),
+            time: SystemTime::now().into(),
             content: RoomMessageBody::private_text(vec![7, 7, 7, 7], [0u8; 12], 99),
         },
         &owner_sk,
@@ -1282,7 +1282,7 @@ fn single_member_missing_blob_does_not_freeze_room() {
             SecretVersionRecordV1 {
                 version: 1,
                 cipher_spec: RoomCipherSpec::Aes256Gcm,
-                created_at: SystemTime::now(),
+                created_at: SystemTime::now().into(),
             },
             &owner_sk,
         )],
@@ -1320,7 +1320,7 @@ fn single_member_missing_blob_does_not_freeze_room() {
         MessageV1 {
             room_owner: owner_id,
             author: alice_id,
-            time: SystemTime::now(),
+            time: SystemTime::now().into(),
             content: RoomMessageBody::private_text(vec![1, 2, 3, 4], [0u8; 12], 1),
         },
         &alice_sk,
@@ -1378,7 +1378,7 @@ fn secrets_apply_delta_is_transactional_on_failure() {
     let v1_record = SecretVersionRecordV1 {
         version: 1,
         cipher_spec: RoomCipherSpec::Aes256Gcm,
-        created_at: SystemTime::now(),
+        created_at: SystemTime::now().into(),
     };
     let auth_v1 = AuthorizedSecretVersionRecord::new(v1_record, &owner_sk);
 
@@ -1461,7 +1461,7 @@ fn delta_with_rotation_plus_message_at_new_version_applies_atomically() {
             SecretVersionRecordV1 {
                 version: 0,
                 cipher_spec: RoomCipherSpec::Aes256Gcm,
-                created_at: SystemTime::now(),
+                created_at: SystemTime::now().into(),
             },
             &owner_sk,
         )],
@@ -1487,7 +1487,7 @@ fn delta_with_rotation_plus_message_at_new_version_applies_atomically() {
         SecretVersionRecordV1 {
             version: 1,
             cipher_spec: RoomCipherSpec::Aes256Gcm,
-            created_at: SystemTime::now(),
+            created_at: SystemTime::now().into(),
         },
         &owner_sk,
     );
@@ -1512,7 +1512,7 @@ fn delta_with_rotation_plus_message_at_new_version_applies_atomically() {
         MessageV1 {
             room_owner: owner_id,
             author: owner_id,
-            time: SystemTime::now(),
+            time: SystemTime::now().into(),
             content: RoomMessageBody::private_text(vec![5, 5, 5, 5], [0u8; 12], 1),
         },
         &owner_sk,

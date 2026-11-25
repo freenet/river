@@ -579,7 +579,7 @@ fn join_time(r: &ClientRequest<'_>) -> SystemTime {
     };
     let d: river_core::room_state::ChatRoomStateV1Delta =
         ciborium::de::from_reader(d.as_ref()).unwrap();
-    d.recent_messages.unwrap()[0].message.time
+    d.recent_messages.unwrap()[0].message.time.into()
 }
 
 /// A browser tab accepted the same invitation and joined first: the room as read already has
@@ -761,7 +761,10 @@ fn a_join_retried_after_its_store_landed_still_sends_the_join() {
     expect_read(&mut w, &slot);
     w.on_delegate(&read_answer(&slot, Some(landed), 1));
     let update = next(&mut w);
-    assert!(join_time(&update) > earlier_time, "a fresh join time");
+    assert!(
+        join_time(&update) > earlier_time.into(),
+        "a fresh join time"
+    );
 }
 
 /// A join that failed with Try again blocks a second paste of the same invitation.
@@ -1868,7 +1871,7 @@ mod importing {
             .push(river_core::room_state::ban::AuthorizedUserBan::new(
                 river_core::room_state::ban::UserBan {
                     owner_member_id: owner_id,
-                    banned_at: SystemTime::now(),
+                    banned_at: SystemTime::now().into(),
                     banned_user: river_core::room_state::member::MemberId::from(
                         &world.member.verifying_key(),
                     ),

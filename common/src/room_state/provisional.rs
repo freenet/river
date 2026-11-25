@@ -21,12 +21,12 @@ use crate::room_state::configuration::Configuration;
 use crate::room_state::member::{AuthorizedMember, MemberId};
 use crate::room_state::privacy::PrivacyMode;
 use crate::room_state::ChatRoomParametersV1;
+use crate::signed_time::SignedTime;
 use crate::ChatRoomStateV1;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::time::SystemTime;
 
 /// Signing domain of a provisional member's self-signature.
 pub const ENTRY_SIGNING_TAG: &[u8] = b"river-provisional-member/v1";
@@ -218,7 +218,7 @@ pub struct AuthorizedProvisionalMember {
 pub struct ProvisionalBan {
     pub banned_by: MemberId,
     /// Display only; never used to order anything.
-    pub banned_at: SystemTime,
+    pub banned_at: SignedTime,
     pub target: MemberId,
 }
 
@@ -1144,6 +1144,7 @@ mod tests {
     use super::*;
     use ed25519_dalek::Verifier;
     use freenet_scaffold::util::FastHash;
+    use std::time::SystemTime;
 
     fn owner() -> SigningKey {
         SigningKey::from_bytes(&[1u8; 32])
@@ -1169,7 +1170,8 @@ mod tests {
             &owner().verifying_key(),
             ProvisionalBan {
                 banned_by: MemberId::from(&owner().verifying_key()),
-                banned_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+                banned_at: (SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000))
+                    .into(),
                 target: MemberId(FastHash(2)),
             },
             &owner(),
@@ -1417,7 +1419,7 @@ mod tests {
                     MessageV1 {
                         room_owner: owner_id,
                         author: x_id,
-                        time: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(5),
+                        time: (SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(5)).into(),
                         content: RoomMessageBody::public("under another key".to_string()),
                     },
                     &y,

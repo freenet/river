@@ -1580,7 +1580,7 @@ mod notify_gate_tests {
                 room_owner: author,
                 author,
                 content,
-                time: SystemTime::UNIX_EPOCH,
+                time: SystemTime::UNIX_EPOCH.into(),
             },
             author_sk,
         )

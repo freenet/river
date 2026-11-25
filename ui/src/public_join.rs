@@ -248,7 +248,7 @@ pub fn build_submission_many(
                     room_owner: MemberId::from(owner_vk),
                     author: id,
                     content: RoomMessageBody::public(text.clone()),
-                    time: now + std::time::Duration::from_millis(i as u64),
+                    time: (now + std::time::Duration::from_millis(i as u64)).into(),
                 },
                 signing_key,
             )
@@ -1505,7 +1505,7 @@ mod tests {
             &owner_vk,
             ProvisionalBan {
                 banned_by: MemberId::from(&owner_vk),
-                banned_at: SystemTime::now(),
+                banned_at: SystemTime::now().into(),
                 target: MemberId::from(&sk.verifying_key()),
             },
             &owner(),
@@ -1764,7 +1764,7 @@ mod tests {
                 &owner_vk,
                 ProvisionalBan {
                     banned_by: MemberId::from(&owner_vk),
-                    banned_at: now,
+                    banned_at: now.into(),
                     target: MemberId::from(&sk.verifying_key()),
                 },
                 &owner(),

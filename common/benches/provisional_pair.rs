@@ -58,7 +58,7 @@ fn msg(owner_id: MemberId, k: &SigningKey, t: u64) -> AuthorizedMessageV1 {
         MessageV1 {
             room_owner: owner_id,
             author: k.verifying_key().into(),
-            time: SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000 + t),
+            time: (SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000 + t)).into(),
             content: RoomMessageBody::public(format!("benchmark message number {t}")),
         },
         k,
@@ -167,7 +167,8 @@ fn build(
                     &params.owner,
                     ProvisionalBan {
                         banned_by: owner_id,
-                        banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+                        banned_at: (SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000))
+                            .into(),
                         target: sk(900_000 + i).verifying_key().into(),
                     },
                     &owner,
@@ -310,7 +311,8 @@ fn main() {
                     &params.owner,
                     ProvisionalBan {
                         banned_by: owner_id,
-                        banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+                        banned_at: (SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000))
+                            .into(),
                         target: sk(950_000 + i).verifying_key().into(),
                     },
                     &owner,

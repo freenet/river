@@ -35,7 +35,7 @@ pub fn msg(owner_id: MemberId, k: &SigningKey, t: u64) -> AuthorizedMessageV1 {
         MessageV1 {
             room_owner: owner_id,
             author: k.verifying_key().into(),
-            time: t0() + Duration::from_secs(t),
+            time: (t0() + Duration::from_secs(t)).into(),
             content: RoomMessageBody::public(format!(
                 "benchmark message number {t} with a typical sentence of chat text in it"
             )),
@@ -205,7 +205,7 @@ pub fn build(pool: usize) -> Fix {
                 AuthorizedUserBan::new(
                     UserBan {
                         owner_member_id: owner_id,
-                        banned_at: t0(),
+                        banned_at: t0().into(),
                         banned_user: all[i].verifying_key().into(),
                     },
                     owner_id,
@@ -228,7 +228,7 @@ pub fn build(pool: usize) -> Fix {
                 &params.owner,
                 ProvisionalBan {
                     banned_by: owner_id,
-                    banned_at: t0(),
+                    banned_at: t0().into(),
                     target: sk(900_000 + i).verifying_key().into(),
                 },
                 &owner,

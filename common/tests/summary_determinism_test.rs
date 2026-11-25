@@ -157,7 +157,7 @@ fn messages_summary_serialization_is_order_independent() {
     // The horizon is a single key, identical on both sides — only the id
     // collection can be order-sensitive.
     let horizon = RetentionHorizon::OldestRetained(MessageOrderKey {
-        time: SystemTime::UNIX_EPOCH + Duration::from_secs(42),
+        time: (SystemTime::UNIX_EPOCH + Duration::from_secs(42)).into(),
         id: MessageId(FastHash(0)),
     });
 
@@ -196,7 +196,7 @@ fn messages_horizon_is_independent_of_state_vec_order() {
             MessageV1 {
                 room_owner: owner_id,
                 author: owner_id,
-                time: SystemTime::UNIX_EPOCH + Duration::from_secs(100 + i),
+                time: (SystemTime::UNIX_EPOCH + Duration::from_secs(100 + i)).into(),
                 content: RoomMessageBody::public(format!("m{i}")),
             },
             &sk,
@@ -315,7 +315,7 @@ fn top_level_summary_serialization_is_order_independent() {
         let recent_messages = MessagesSummary {
             message_ids: (0..N).map(|i| MessageId(FastHash(order(i)))).collect(),
             horizon: RetentionHorizon::OldestRetained(MessageOrderKey {
-                time: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+                time: (SystemTime::UNIX_EPOCH + Duration::from_secs(1)).into(),
                 id: MessageId(FastHash(0)),
             }),
         };
@@ -648,7 +648,8 @@ fn bans_summary_bytes_per_entry() {
             AuthorizedUserBan::new(
                 UserBan {
                     owner_member_id: owner_id,
-                    banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + i),
+                    banned_at: (SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + i))
+                        .into(),
                     banned_user: MemberId::from(&target.verifying_key()),
                 },
                 owner_id,
@@ -716,7 +717,7 @@ fn provisional_summary_serialization_is_order_independent() {
                 &owner.verifying_key(),
                 ProvisionalBan {
                     banned_by: MemberId::from(&owner.verifying_key()),
-                    banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(i as u64),
+                    banned_at: (SystemTime::UNIX_EPOCH + Duration::from_secs(i as u64)).into(),
                     target: member_id(i),
                 },
                 &owner,

@@ -158,7 +158,7 @@ fn message(owner: &SigningKey, time: SystemTime, text: &str) -> AuthorizedMessag
         MessageV1 {
             room_owner: MemberId::from(&owner.verifying_key()),
             author: MemberId::from(&owner.verifying_key()),
-            time,
+            time: time.into(),
             content: RoomMessageBody::public(text.into()),
         },
         owner,
@@ -3240,7 +3240,7 @@ fn message_with(author: &SigningKey, content: RoomMessageBody) -> AuthorizedMess
         MessageV1 {
             room_owner: MemberId::from(&author.verifying_key()),
             author: MemberId::from(&author.verifying_key()),
-            time: SystemTime::now(),
+            time: SystemTime::now().into(),
             content,
         },
         author,
@@ -5292,7 +5292,7 @@ fn room_with_nameless_member(seed: u8) -> (TestRoom, SigningKey) {
             MessageV1 {
                 room_owner: owner_id,
                 author: MemberId::from(&member.verifying_key()),
-                time: SystemTime::now() - Duration::from_secs(10),
+                time: (SystemTime::now() - Duration::from_secs(10)).into(),
                 content: RoomMessageBody::public("hello".into()),
             },
             &member,

@@ -602,7 +602,7 @@ fn ban(f: &Fixture, who: MemberId) -> AuthorizedUserBan {
     AuthorizedUserBan::new(
         UserBan {
             owner_member_id: f.owner_id(),
-            banned_at: at(BASE),
+            banned_at: at(BASE).into(),
             banned_user: who,
         },
         f.owner_id(),
@@ -1035,7 +1035,7 @@ fn a_waiting_message_is_sealed_again_under_a_newer_secret_keeping_its_time() {
     assert_eq!(version, 1);
     assert_eq!(TextContentV1::decode(&plain).unwrap().text, "second");
     // Stamped when it was written (the clock's second reading), not now.
-    assert_eq!(messages[0].message.time, at(BASE + 1));
+    assert_eq!(messages[0].message.time, at(BASE + 1).into());
 }
 
 /// A public room where `other` is a member too, and the room's key on this computer switches
@@ -4853,7 +4853,7 @@ fn every_message_the_outbox_signs_is_stamped_a_whole_millisecond() {
         let messages = sent(&mut outbox, &room, action);
         assert!(!messages.is_empty());
         for m in messages {
-            assert_whole_ms(m.message.time);
+            assert_whole_ms(m.message.time.into());
         }
     }
 }

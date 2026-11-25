@@ -973,7 +973,7 @@ mod tests {
         state.bans = BansV1(vec![AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: id(&owner),
-                banned_at: std::time::UNIX_EPOCH,
+                banned_at: std::time::UNIX_EPOCH.into(),
                 banned_user: id(&moderator),
             },
             id(&owner),

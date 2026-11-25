@@ -67,7 +67,7 @@ pub(super) fn reaction_ranks_for(
             // A duplicate does not restart an interval; another emoji by the
             // same member does not terminate this one. The contract allows it.
             ACTION_TYPE_REACTION => {
-                standing.entry(key).or_insert(message.message.time);
+                standing.entry(key).or_insert(message.message.time.into());
             }
             ACTION_TYPE_REMOVE_REACTION => {
                 standing.remove(&key);
@@ -131,7 +131,7 @@ mod tests {
             MessageV1 {
                 room_owner: member(1),
                 author: member(author),
-                time: UNIX_EPOCH + Duration::from_secs(second),
+                time: (UNIX_EPOCH + Duration::from_secs(second)).into(),
                 content,
             },
             &key(author),
@@ -212,7 +212,11 @@ mod tests {
                     .expect("fixture actions are signed by keys 2..10");
                 signed(
                     author,
-                    m.message.time.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+                    m.message
+                        .time
+                        .duration_since(UNIX_EPOCH.into())
+                        .unwrap()
+                        .as_secs(),
                     SealInput::Action(action).seal(&SECRET, SECRET_VERSION),
                 )
             })
@@ -409,7 +413,8 @@ mod tests {
         // Model a projection held while some retained action bytes cannot be
         // replayed. It is authoritative even when the order cannot be known.
         gap.messages.retain(|m| {
-            !m.message.content.is_action() || m.message.time != UNIX_EPOCH + Duration::from_secs(3)
+            !m.message.content.is_action()
+                || m.message.time != (UNIX_EPOCH + Duration::from_secs(3)).into()
         });
         assert_eq!(shown(&gap, &secrets, &id), names(&["z", "a"]));
         assert_eq!(gap.reactions(&id), state.reactions(&id));

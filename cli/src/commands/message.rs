@@ -222,7 +222,7 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                 #[allow(clippy::disallowed_methods)]
                 let cutoff_time =
                     std::time::SystemTime::now() - std::time::Duration::from_secs(minutes * 60);
-                messages.retain(|msg| msg.message.time >= cutoff_time);
+                messages.retain(|msg| msg.message.time >= cutoff_time.into());
             }
 
             // Sort by time (newest first) and limit
@@ -264,7 +264,7 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                                 })
                                 .unwrap_or(author_short);
 
-                            let datetime: DateTime<Utc> = msg.message.time.into();
+                            let datetime: DateTime<Utc> = msg.message.time.to_system_time().into();
                             let local_time: DateTime<Local> = datetime.into();
 
                             // Get display content (handles edits, non-text
@@ -364,7 +364,7 @@ pub async fn execute(command: MessageCommands, api: ApiClient, format: OutputFor
                                     )
                                 });
 
-                            let datetime: DateTime<Utc> = msg.message.time.into();
+                            let datetime: DateTime<Utc> = msg.message.time.to_system_time().into();
 
                             // Get display content (handles edits, non-text
                             // public content like join events, and — via

@@ -43,7 +43,7 @@ fn msg(owner: MemberId, s: &SigningKey, t: u64) -> AuthorizedMessageV1 {
         MessageV1 {
             room_owner: owner,
             author: id(s),
-            time: at(t),
+            time: at(t).into(),
             content: RoomMessageBody::public(format!("m{t}")),
         },
         s,
@@ -53,7 +53,7 @@ fn ban(owner: MemberId, by: &SigningKey, target: MemberId, t: u64) -> Authorized
     AuthorizedUserBan::new(
         UserBan {
             owner_member_id: owner,
-            banned_at: at(t),
+            banned_at: at(t).into(),
             banned_user: target,
         },
         id(by),
@@ -65,7 +65,7 @@ fn vrec(o: &SigningKey, v: u32, secs: u64) -> AuthorizedSecretVersionRecord {
         SecretVersionRecordV1 {
             version: v,
             cipher_spec: RoomCipherSpec::Aes256Gcm,
-            created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+            created_at: (SystemTime::UNIX_EPOCH + Duration::from_secs(secs)).into(),
         },
         o,
     )
@@ -305,7 +305,7 @@ fn normalized_returns_a_cleanup_fixpoint() {
         .recent_messages
         .messages
         .iter()
-        .map(|m| m.message.time)
+        .map(|m| std::time::SystemTime::from(m.message.time))
         .collect();
     assert_eq!(times, vec![at(10), at(20)]);
 

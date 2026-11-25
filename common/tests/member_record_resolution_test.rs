@@ -50,7 +50,7 @@ fn msg(owner: MemberId, author: MemberId, s: &SigningKey, t: u64) -> AuthorizedM
         MessageV1 {
             room_owner: owner,
             author,
-            time: at(t),
+            time: at(t).into(),
             content: RoomMessageBody::public(format!("m{t}")),
         },
         s,
@@ -156,7 +156,7 @@ fn a_held_record_is_kept_over_one_issued_by_another_inviter() {
     let ban = AuthorizedUserBan::new(
         UserBan {
             owner_member_id: f.owner,
-            banned_at: at(10),
+            banned_at: at(10).into(),
             banned_user: f.n,
         },
         f.x,
@@ -533,7 +533,7 @@ fn a_delta_of_one_more_new_record_than_the_bound_is_refused_and_the_bound_itself
         AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: f.owner,
-                banned_at: at(i),
+                banned_at: at(i).into(),
                 banned_user: {
                     let mut b = [0u8; 32];
                     b[..8].copy_from_slice(&(i + 90_000).to_le_bytes());

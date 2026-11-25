@@ -225,7 +225,7 @@ fn signs_secret_version_record_correctly() {
     let record = SecretVersionRecordV1 {
         version: 3,
         cipher_spec: RoomCipherSpec::Aes256Gcm,
-        created_at: UNIX_EPOCH,
+        created_at: UNIX_EPOCH.into(),
     };
     let bytes = cbor(&record);
     let sig = owner_sk.sign(&bytes);
@@ -264,7 +264,7 @@ fn rotates_on_member_set_change_after_state_apply() {
     let record = SecretVersionRecordV1 {
         version: new_version,
         cipher_spec: RoomCipherSpec::Aes256Gcm,
-        created_at: UNIX_EPOCH,
+        created_at: UNIX_EPOCH.into(),
     };
     let record_sig = owner_sk.sign(&cbor(&record));
     let authorized_record = AuthorizedSecretVersionRecord::with_signature(record, record_sig);
@@ -335,7 +335,7 @@ fn concurrent_rotations_produce_identical_signed_records() {
     let record_a = SecretVersionRecordV1 {
         version: 7,
         cipher_spec: RoomCipherSpec::Aes256Gcm,
-        created_at: UNIX_EPOCH,
+        created_at: UNIX_EPOCH.into(),
     };
     let record_b = record_a.clone();
 
@@ -396,7 +396,7 @@ fn ciborium_serialization_is_deterministic_for_signed_structs() {
         let record = SecretVersionRecordV1 {
             version,
             cipher_spec: RoomCipherSpec::Aes256Gcm,
-            created_at: UNIX_EPOCH + std::time::Duration::from_secs(secs),
+            created_at: (UNIX_EPOCH + std::time::Duration::from_secs(secs)).into(),
         };
         let bytes_a = cbor(&record);
         let bytes_b = cbor(&record);

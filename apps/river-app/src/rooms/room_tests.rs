@@ -75,7 +75,7 @@ impl Fixture {
             MessageV1 {
                 room_owner: self.owner_id(),
                 author: MemberId::from(&author.verifying_key()),
-                time: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+                time: (SystemTime::UNIX_EPOCH + Duration::from_secs(secs)).into(),
                 content,
             },
             author,
@@ -131,7 +131,7 @@ impl Fixture {
         let record = SecretVersionRecordV1 {
             version: 0,
             cipher_spec: RoomCipherSpec::Aes256Gcm,
-            created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+            created_at: (SystemTime::UNIX_EPOCH + Duration::from_secs(1)).into(),
         };
         state.secrets.versions.push(AuthorizedSecretVersionRecord {
             owner_signature: sign_struct(&record, &self.owner),
@@ -370,7 +370,8 @@ pub(super) fn add_secret(
         let record = SecretVersionRecordV1 {
             version,
             cipher_spec: RoomCipherSpec::Aes256Gcm,
-            created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(u64::from(version) + 1),
+            created_at: (SystemTime::UNIX_EPOCH + Duration::from_secs(u64::from(version) + 1))
+                .into(),
         };
         state.secrets.versions.push(AuthorizedSecretVersionRecord {
             owner_signature: sign_struct(&record, &f.owner),
@@ -605,7 +606,7 @@ fn any_message_time_shows_without_panicking() {
                 MessageV1 {
                     room_owner: f.owner_id(),
                     author: f.owner_id(),
-                    time: t,
+                    time: t.into(),
                     content: RoomMessageBody::private_text(ct, nonce, 0),
                 },
                 &f.owner,
@@ -809,7 +810,7 @@ fn state_with_only_the_reply(mut state: ChatRoomStateV1) -> ChatRoomStateV1 {
         .recent_messages
         .messages
         .iter()
-        .filter(|m| m.message.time == SystemTime::UNIX_EPOCH + Duration::from_secs(120))
+        .filter(|m| m.message.time == (SystemTime::UNIX_EPOCH + Duration::from_secs(120)).into())
         .cloned()
         .collect();
     assert_eq!(state.recent_messages.messages.len(), 1);
@@ -898,7 +899,7 @@ fn a_reply_that_arrives_before_its_target_becomes_a_jump_when_the_target_does() 
         .recent_messages
         .messages
         .iter()
-        .find(|m| m.message.time == SystemTime::UNIX_EPOCH + Duration::from_secs(60))
+        .find(|m| m.message.time == (SystemTime::UNIX_EPOCH + Duration::from_secs(60)).into())
         .cloned()
         .expect("the target");
     let mut live = LiveRoom::new(f.stored(state_with_only_the_reply(full.clone())));

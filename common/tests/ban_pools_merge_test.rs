@@ -87,7 +87,7 @@ fn run(owner_n: usize, other_n: usize, receiver_cap: usize, owner_newer: bool) {
         AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner,
-                banned_at: at(t),
+                banned_at: at(t).into(),
                 banned_user: target(i),
             },
             by,
@@ -120,7 +120,7 @@ fn run(owner_n: usize, other_n: usize, receiver_cap: usize, owner_newer: bool) {
                 MessageV1 {
                     room_owner: owner,
                     author: a_id,
-                    time: at(1),
+                    time: at(1).into(),
                     content: RoomMessageBody::public("hi".into()),
                 },
                 &a,
@@ -214,7 +214,7 @@ fn deputy_bans_are_judged_live_in_both_directions() {
             MessageV1 {
                 room_owner: owner,
                 author: MemberId::from(&s.verifying_key()),
-                time: at(t),
+                time: at(t).into(),
                 content: RoomMessageBody::public(format!("m{t}")),
             },
             s,
@@ -236,7 +236,7 @@ fn deputy_bans_are_judged_live_in_both_directions() {
         AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner,
-                banned_at: at(t),
+                banned_at: at(t).into(),
                 banned_user: target,
             },
             by,

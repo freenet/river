@@ -376,7 +376,7 @@ fn what_is_refused_before_anything_is_queued() {
     banned.stored.room_state.bans.0.push(AuthorizedUserBan::new(
         UserBan {
             owner_member_id: f.owner_id(),
-            banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(BASE),
+            banned_at: (SystemTime::UNIX_EPOCH + Duration::from_secs(BASE)).into(),
             banned_user: f.me_id(),
         },
         f.owner_id(),

@@ -273,7 +273,7 @@ pub fn build(room: &LiveRoom, target: MemberId, time: SystemTime) -> Result<Mode
     let ban = AuthorizedUserBan::new(
         UserBan {
             owner_member_id: owner,
-            banned_at: time,
+            banned_at: time.into(),
             banned_user: target,
         },
         me,
@@ -355,7 +355,7 @@ pub fn preview(room: &LiveRoom, target: MemberId) -> BanPreview {
     let ban = AuthorizedUserBan::new(
         UserBan {
             owner_member_id: MemberId::from(&room.stored.owner_vk),
-            banned_at: crate::signed_time::now(),
+            banned_at: crate::signed_time::now().into(),
             banned_user: target,
         },
         me,
@@ -447,7 +447,7 @@ fn rotation(
         SecretVersionRecordV1 {
             version: new_version,
             cipher_spec: RoomCipherSpec::Aes256Gcm,
-            created_at: time,
+            created_at: time.into(),
         },
         sk,
     );

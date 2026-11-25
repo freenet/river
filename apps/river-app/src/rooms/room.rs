@@ -704,7 +704,7 @@ impl LiveRoom {
                 id,
                 key: message_key(&m.id()),
                 author: ids.of(m.message.author),
-                time: minutes(m.message.time),
+                time: minutes(m.message.time.into()),
                 text: texts[i].clone(),
                 source: written[i].clone().unwrap_or_default(),
                 md: written[i]
@@ -882,7 +882,7 @@ impl LiveRoom {
             let secs = m
                 .message
                 .time
-                .duration_since(SystemTime::UNIX_EPOCH)
+                .duration_since(SystemTime::UNIX_EPOCH.into())
                 .map_or(0, |d| d.as_secs());
             let name = self.nickname(m.message.author, me);
             match out.last_mut() {
@@ -892,12 +892,12 @@ impl LiveRoom {
                         && secs - last_secs < JOIN_FOLD_SECS =>
                 {
                     j.names.push(name);
-                    j.time = minutes(m.message.time);
+                    j.time = minutes(m.message.time.into());
                 }
                 _ => out.push(Join {
                     key: message_key(&m.id()),
                     names: vec![name],
-                    time: minutes(m.message.time),
+                    time: minutes(m.message.time.into()),
                     before,
                 }),
             }
