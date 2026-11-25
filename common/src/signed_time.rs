@@ -104,8 +104,62 @@ impl SignedTime {
 
     /// The platform time. On Windows the nanoseconds are floored to 100 ns: use this
     /// for display and clock comparisons, never to rebuild signed bytes.
+    ///
+    /// Never panics: a value past what the platform clock can hold (Windows stops well
+    /// before `i64::MAX` seconds) is clamped to the latest representable time. The signed
+    /// value itself is unchanged.
     pub fn to_system_time(self) -> SystemTime {
-        UNIX_EPOCH + self.since_epoch()
+        clamped_system_time(self.since_epoch(), |d| UNIX_EPOCH.checked_add(d))
+    }
+}
+
+/// `add(d)` is the platform's checked "epoch plus `d`". If it refuses `d`, return the latest
+/// time it accepts (to the nanosecond where it can).
+fn clamped_system_time(d: Duration, add: impl Fn(Duration) -> Option<SystemTime>) -> SystemTime {
+    if let Some(t) = add(d) {
+        return t;
+    }
+    // Binary search for the largest whole-second offset the platform holds.
+    let (mut lo, mut hi) = (0u64, d.as_secs());
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if add(Duration::from_secs(mid)).is_some() {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let whole = Duration::from_secs(lo);
+    add(whole + Duration::from_nanos(u64::from(NANOS_PER_SEC - 1)))
+        .or_else(|| add(whole))
+        .unwrap_or(UNIX_EPOCH)
+}
+
+#[cfg(test)]
+mod clamp_tests {
+    use super::*;
+
+    #[test]
+    fn out_of_range_values_clamp_to_the_platform_limit() {
+        // A platform that holds only up to 1000 s after the epoch.
+        let limit = Duration::from_secs(1000);
+        let add = |d: Duration| {
+            if d <= limit {
+                UNIX_EPOCH.checked_add(d)
+            } else {
+                None
+            }
+        };
+        let t = clamped_system_time(Duration::new(5000, 7), add);
+        assert_eq!(t, UNIX_EPOCH + limit);
+        // In range: exact.
+        let t = clamped_system_time(Duration::new(10, 7), add);
+        assert_eq!(t, UNIX_EPOCH + Duration::new(10, 7));
+        // A platform that refuses everything yields the epoch rather than panicking.
+        assert_eq!(
+            clamped_system_time(Duration::new(5, 0), |_| None),
+            UNIX_EPOCH
+        );
     }
 }
 

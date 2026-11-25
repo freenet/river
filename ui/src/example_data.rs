@@ -22,7 +22,7 @@ use river_core::{
     ChatRoomStateV1,
 };
 use std::collections::HashMap;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
 
 /// How many alternating-author filler messages the deep-history fixture seeds.
 ///
@@ -1174,16 +1174,18 @@ fn distinct_full_names() -> [String; 3] {
     names.try_into().expect("three names")
 }
 
-fn get_time_from_millis(ms: u64) -> SystemTime {
+fn get_time_from_millis(ms: u64) -> river_core::SignedTime {
     // Use WASM-compatible time function
-    crate::util::get_current_system_time()
-        - Duration::from_millis(
-            crate::util::get_current_system_time()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or(Duration::from_secs(0))
-                .as_millis() as u64
-                - ms,
-        )
+    river_core::SignedTime::from(
+        crate::util::get_current_system_time()
+            - Duration::from_millis(
+                crate::util::get_current_system_time()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or(Duration::from_secs(0))
+                    .as_millis() as u64
+                    - ms,
+            ),
+    )
 }
 
 // Test function to create the example data

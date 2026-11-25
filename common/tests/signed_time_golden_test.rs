@@ -119,7 +119,9 @@ fn encodes_exactly_as_system_time_in_every_format() {
         let Some(st) = UNIX_EPOCH.checked_add(Duration::new(secs, nanos)) else {
             continue; // the platform clock cannot hold it; covered by the range test below
         };
-        let t = SignedTime::new(secs, nanos).unwrap();
+        // The value the platform clock actually holds (Windows floors to 100 ns); the exact
+        // raw timestamps are checked separately in `raw_timestamps_encode_exactly`.
+        let t = SignedTime::from(st);
         assert_eq!(cbor(&t), cbor(&st), "cbor {secs}.{nanos:09}");
         assert_eq!(json(&t), json(&st), "json {secs}.{nanos:09}");
         assert_eq!(bin(&t), bin(&st), "bincode {secs}.{nanos:09}");
@@ -185,7 +187,12 @@ fn decodes_everything_system_time_decodes_to_the_same_value() {
         };
         let bytes = cbor(&st);
         let t: SignedTime = from_cbor(&bytes);
-        assert_eq!((t.secs(), t.nanos()), (secs, nanos));
+        let held = SignedTime::from(st);
+        assert_eq!(t, held, "{secs}.{nanos:09}");
+        // Where the platform keeps full nanoseconds, nothing was floored.
+        if st.duration_since(UNIX_EPOCH).unwrap().subsec_nanos() == nanos {
+            assert_eq!((t.secs(), t.nanos()), (secs, nanos));
+        }
         let j: SignedTime = serde_json::from_str(&json(&st)).unwrap();
         assert_eq!(j, t);
         let b: SignedTime = bincode::deserialize(&bin(&st)).unwrap();
@@ -228,6 +235,9 @@ fn accepts_and_rejects_what_system_time_does() {
         match (old, new) {
             (Ok(o), Ok(n)) => assert_eq!(n.to_system_time(), o, "{input}"),
             (Err(_), Err(_)) => {}
+            // A value the platform clock cannot hold (Windows ends far below i64::MAX seconds)
+            // is rejected by `SystemTime` but kept exactly by `SignedTime`.
+            (Err(_), Ok(n)) if UNIX_EPOCH.checked_add(n.since_epoch()).is_none() => {}
             (o, n) => panic!("{input}: SystemTime {o:?} but SignedTime {n:?}"),
         }
     }
@@ -252,6 +262,7 @@ fn accepts_and_rejects_what_system_time_does() {
         match (old, new) {
             (Ok(o), Ok(n)) => assert_eq!(n.to_system_time(), o),
             (Err(_), Err(_)) => {}
+            (Err(_), Ok(n)) if UNIX_EPOCH.checked_add(n.since_epoch()).is_none() => {}
             (o, n) => panic!("cbor {secs}.{nanos}: SystemTime {o:?} but SignedTime {n:?}"),
         }
     }
@@ -268,10 +279,7 @@ fn order_matches_system_time() {
             ) else {
                 continue;
             };
-            let (ta, tb) = (
-                SignedTime::new(a.0, a.1).unwrap(),
-                SignedTime::new(b.0, b.1).unwrap(),
-            );
+            let (ta, tb) = (SignedTime::from(sa), SignedTime::from(sb));
             assert_eq!(ta.cmp(&tb), sa.cmp(&sb));
         }
     }
@@ -417,5 +425,50 @@ fn now_is_a_whole_millisecond() {
         let t = SignedTime::now();
         assert_eq!(t.nanos() % 1_000_000, 0);
         assert_eq!(t.whole_millis(), t);
+    }
+}
+
+/// The exact timestamps (including ones a Windows `SystemTime` cannot hold) encode as the
+/// same bytes as a plain struct of the two integers, which is the `SystemTime` wire layout.
+#[test]
+fn raw_timestamps_encode_exactly() {
+    #[derive(Serialize)]
+    #[serde(rename = "SystemTime")]
+    struct Raw {
+        secs_since_epoch: u64,
+        nanos_since_epoch: u32,
+    }
+    for (secs, nanos) in sample_times() {
+        let t = SignedTime::new(secs, nanos).unwrap();
+        let raw = Raw {
+            secs_since_epoch: secs,
+            nanos_since_epoch: nanos,
+        };
+        assert_eq!(cbor(&t), cbor(&raw), "cbor {secs}.{nanos:09}");
+        assert_eq!(json(&t), json(&raw), "json {secs}.{nanos:09}");
+        assert_eq!(bin(&t), bin(&raw), "bincode {secs}.{nanos:09}");
+    }
+}
+
+/// Display conversion must never panic, whatever the signed value, and must leave it alone.
+#[test]
+fn display_conversion_clamps_instead_of_panicking() {
+    for t in [
+        SignedTime::new(i64::MAX as u64, 999_999_999).unwrap(),
+        SignedTime::new(u32::MAX as u64, 7).unwrap(),
+        SignedTime::new(1_700_000_000, 123_456_789).unwrap(),
+        SignedTime::UNIX_EPOCH,
+    ] {
+        let st: SystemTime = t.into();
+        assert!(st >= UNIX_EPOCH);
+        // The signed value is untouched by the conversion.
+        assert_eq!(t, t.clone());
+        if let Some(exact) = UNIX_EPOCH.checked_add(t.since_epoch()) {
+            assert_eq!(st, exact);
+        } else {
+            // Out of platform range: clamped to the latest time the clock can hold.
+            assert!(UNIX_EPOCH.checked_add(t.since_epoch()).is_none());
+            assert!(st < UNIX_EPOCH + Duration::from_secs(i64::MAX as u64));
+        }
     }
 }
