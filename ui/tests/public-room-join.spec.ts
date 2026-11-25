@@ -33,15 +33,33 @@ async function openRoom(page: Page, kind: Kind) {
   await expect(page.getByTestId("viewed-room-name")).toBeVisible();
 }
 
+// The first Send of a visitor asks for a display name (one prompt, prefilled).
+// Escape keeps the generated default, as a visitor who skips it does. Pass
+// `name` to choose one.
+async function sendFirst(page: Page, name?: string) {
+  await page.getByTestId("viewed-room-send").click();
+  const input = page.getByTestId("viewed-room-nickname-input");
+  await expect(input).toBeVisible();
+  if (name === undefined) {
+    await input.press("Escape");
+  } else {
+    await input.fill(name);
+    await page.getByTestId("viewed-room-nickname-continue").click();
+  }
+  await expect(page.getByTestId("viewed-room-nickname-modal")).toHaveCount(0);
+}
+
 test("the composer is enabled and Send before admission queues, then posts exactly once", async ({ page }) => {
   const panics = panicsOf(page);
   await openRoom(page, "open");
   const composer = page.getByTestId("viewed-room-composer");
   await expect(composer).toBeEnabled();
-  await expect(page.getByTestId("viewed-room-join")).toBeVisible();
+  // No Join button, no read-only label: a visitor just writes.
+  await expect(page.getByTestId("viewed-room-join")).toHaveCount(0);
+  await expect(page.getByTestId("viewed-room")).not.toContainText("read-only");
 
   await composer.fill("Hello from a visitor");
-  await page.getByTestId("viewed-room-send").click();
+  await sendFirst(page);
 
   // The room becomes a member room: the viewer is gone, the room is selected.
   await expect(page.getByTestId("viewed-room")).toHaveCount(0, { timeout: 30_000 });
@@ -52,19 +70,31 @@ test("the composer is enabled and Send before admission queues, then posts exact
   expect(panics).toEqual([]);
 });
 
-test("Join alone proves the work, then the first message makes the visitor a member", async ({ page }) => {
+test("typing starts the proof quietly, and the first message makes the visitor a member", async ({ page }) => {
   const panics = panicsOf(page);
   await openRoom(page, "open");
-  await page.getByTestId("viewed-room-join").click();
-  await expect(page.getByTestId("viewed-room-join-ready")).toBeVisible({ timeout: 30_000 });
-  // Nothing is posted and the viewer is still a viewer.
+  // Opening the link starts nothing: no key exists until the visitor interacts.
+  expect(await callRiverTest(page, "joinSessionKey")).toBe("");
+  await page.getByTestId("viewed-room-composer").fill("First post");
+  await expect.poll(() => callRiverTest(page, "joinSessionKey")).not.toBe("");
+  // Nothing is posted, nothing is announced, and the viewer is still a viewer.
   await expect(page.getByTestId("viewed-room")).toBeVisible();
   await expect(page.getByTestId("viewed-room-pending-message")).toHaveCount(0);
+  await expect(page.getByTestId("viewed-room")).not.toContainText("bot");
 
-  await page.getByTestId("viewed-room-composer").fill("First post");
-  await page.getByTestId("viewed-room-send").click();
+  await sendFirst(page);
   await expect(page.getByTestId("viewed-room")).toHaveCount(0, { timeout: 30_000 });
   expect(await callRiverTest(page, "roomMessageCount", "First post")).toBe(1);
+  expect(panics).toEqual([]);
+});
+
+test("the display name chosen at the first message is the one posted", async ({ page }) => {
+  const panics = panicsOf(page);
+  await openRoom(page, "open");
+  await page.getByTestId("viewed-room-composer").fill("Named post");
+  await sendFirst(page, "Quinn");
+  await expect(page.getByTestId("viewed-room")).toHaveCount(0, { timeout: 30_000 });
+  expect(await callRiverTest(page, "currentRoomSelfNickname")).toBe("Quinn");
   expect(panics).toEqual([]);
 });
 
@@ -73,11 +103,14 @@ test("a queued message is shown as pending and is not lost when the join is canc
   await openRoom(page, "hard");
   await callRiverTest(page, "holdSolver", true);
   await page.getByTestId("viewed-room-composer").fill("Keep this draft");
-  await page.getByTestId("viewed-room-send").click();
+  await sendFirst(page);
 
-  // Pending, not posted: shown apart from the room's messages, with Cancel.
+  // Pending, not posted: shown apart from the room's messages, with a quiet
+  // delay notice and Cancel. No talk of bots or proofs.
   await expect(page.getByTestId("viewed-room-pending-message")).toContainText("Keep this draft");
-  await expect(page.getByTestId("viewed-room-join-progress")).toBeVisible();
+  await expect(page.getByTestId("viewed-room-sending-notice")).toContainText("Sending in a moment");
+  await expect(page.getByTestId("viewed-room-sending-notice")).toContainText("spam");
+  await expect(page.getByTestId("viewed-room")).not.toContainText("proof");
   await expect(page.getByTestId("viewed-room")).toBeVisible();
 
   await page.getByTestId("viewed-room-join-cancel").click();
@@ -88,7 +121,7 @@ test("a queued message is shown as pending and is not lost when the join is canc
   expect(await callRiverTest(page, "roomMessageCount", "Keep this draft")).toBe(0);
   // Nothing was posted and the visitor is not a member.
   await expect(page.getByTestId("viewed-room")).toBeVisible();
-  await expect(page.getByTestId("viewed-room-join")).toBeVisible();
+  await expect(page.getByTestId("viewed-room-join")).toHaveCount(0);
   expect(panics).toEqual([]);
 });
 
@@ -97,8 +130,8 @@ test("a banned key is told so, and the draft comes back", async ({ page }) => {
   await openRoom(page, "hard");
   await callRiverTest(page, "holdSolver", true);
   await page.getByTestId("viewed-room-composer").fill("Hello");
-  await page.getByTestId("viewed-room-send").click();
-  await expect(page.getByTestId("viewed-room-join-progress")).toBeVisible();
+  await sendFirst(page);
+  await expect(page.getByTestId("viewed-room-sending-notice")).toBeVisible();
 
   await expect.poll(() => callRiverTest(page, "banJoiner", "hard")).toBe(true);
   await expect(page.getByTestId("viewed-room-join-error")).toContainText("banned", { timeout: 30_000 });
@@ -112,7 +145,7 @@ test("a full room says so, offers a retry later, and keeps the draft", async ({ 
   const panics = panicsOf(page);
   await openRoom(page, "full");
   await page.getByTestId("viewed-room-composer").fill("Too late");
-  await page.getByTestId("viewed-room-send").click();
+  await sendFirst(page);
 
   await expect(page.getByTestId("viewed-room-join-error")).toContainText("open-member slots", { timeout: 30_000 });
   await expect(page.getByTestId("viewed-room-composer")).toHaveValue("Too late");
@@ -140,7 +173,7 @@ for (const forget of [false, true]) {
     const panics = panicsOf(page);
     await openRoom(page, "open");
     await page.getByTestId("viewed-room-composer").fill("Joined");
-    await page.getByTestId("viewed-room-send").click();
+    await sendFirst(page);
     await expect(page.getByTestId("viewed-room")).toHaveCount(0, { timeout: 30_000 });
     expect(await callRiverTest(page, "roomMessageCount", "Joined")).toBe(1);
     const keyBefore = await callRiverTest(page, "currentRoomSelfKey");
@@ -178,8 +211,8 @@ test("messages sent while solving are all queued, shown pending, and post exactl
   await callRiverTest(page, "holdSolver", true);
   const composer = page.getByTestId("viewed-room-composer");
   await composer.fill("first queued");
-  await page.getByTestId("viewed-room-send").click();
-  await expect(page.getByTestId("viewed-room-join-progress")).toBeVisible();
+  await sendFirst(page);
+  await expect(page.getByTestId("viewed-room-sending-notice")).toBeVisible();
   await composer.fill("second queued");
   await composer.press("Enter");
   await expect(page.getByTestId("viewed-room-pending-message")).toHaveCount(2);
@@ -197,7 +230,7 @@ test("a message too long for the room is refused before any work, and kept in th
   await openRoom(page, "open");
   const long = "x".repeat(5000);
   await page.getByTestId("viewed-room-composer").fill(long);
-  await page.getByTestId("viewed-room-send").click();
+  await sendFirst(page);
   await expect(page.getByTestId("viewed-room-join-notice")).toContainText("longer than the room allows");
   await expect(page.getByTestId("viewed-room-composer")).toHaveValue(long);
   await expect(page.getByTestId("viewed-room-join-progress")).toHaveCount(0);
@@ -210,7 +243,7 @@ test("closing the viewer mid-solve keeps the queued text and posts nothing", asy
   await openRoom(page, "open");
   await callRiverTest(page, "holdSolver", true);
   await page.getByTestId("viewed-room-composer").fill("do not lose me");
-  await page.getByTestId("viewed-room-send").click();
+  await sendFirst(page);
   await expect(page.getByTestId("viewed-room-pending-message")).toHaveCount(1);
   await page.getByTestId("viewed-room-close").click();
   await expect(page.getByTestId("viewed-room")).toHaveCount(0);
@@ -245,7 +278,7 @@ test("a draft typed while the join solves is in the member room's composer after
   await callRiverTest(page, "holdSolver", true);
   const composer = page.getByTestId("viewed-room-composer");
   await composer.fill("sent one");
-  await page.getByTestId("viewed-room-send").click();
+  await sendFirst(page);
   await expect(page.getByTestId("viewed-room-pending-message")).toHaveCount(1);
   await composer.fill("typed but not sent");
   await callRiverTest(page, "holdSolver", false);
@@ -260,7 +293,7 @@ test("a draft typed while a re-admission solves is in the member composer afterw
   const panics = panicsOf(page);
   await openRoom(page, "open");
   await page.getByTestId("viewed-room-composer").fill("Joined");
-  await page.getByTestId("viewed-room-send").click();
+  await sendFirst(page);
   await expect(page.getByTestId("viewed-room")).toHaveCount(0, { timeout: 30_000 });
   expect(await callRiverTest(page, "pruneJoiner", true)).toBe(true);
   await expect(page.getByTestId("viewed-room-join-idle")).toContainText("removed you for being quiet");
@@ -282,19 +315,19 @@ test("switching to another room mid-solve leaves that room idle and returns the 
   await openRoom(page, "open");
   await callRiverTest(page, "holdSolver", true);
   await page.getByTestId("viewed-room-composer").fill("for the open room");
-  await page.getByTestId("viewed-room-send").click();
+  await sendFirst(page);
   await expect(page.getByTestId("viewed-room-pending-message")).toHaveCount(1);
 
   await callRiverTest(page, "viewRoom", "hard");
   await expect(page.getByTestId("viewed-room-name")).toHaveText("Hard Join Room");
-  // The other room shows an idle join with nothing pending.
-  await expect(page.getByTestId("viewed-room-join-idle")).toBeVisible();
+  // The other room shows nothing pending and no delay notice.
+  await expect(page.getByTestId("viewed-room-sending-notice")).toHaveCount(0);
   await expect(page.getByTestId("viewed-room-pending-message")).toHaveCount(0);
   await expect(page.getByTestId("viewed-room-composer")).toHaveValue("");
 
   // Sending there starts that room's own join; the first room's text goes back to it.
   await page.getByTestId("viewed-room-composer").fill("for the hard room");
-  await page.getByTestId("viewed-room-send").click();
+  await sendFirst(page);
   await expect(page.getByTestId("viewed-room-pending-message")).toHaveCount(1);
   await expect(page.getByTestId("viewed-room-pending-message")).toContainText("for the hard room");
   await callRiverTest(page, "viewRoom", "open");

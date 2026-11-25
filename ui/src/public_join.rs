@@ -458,6 +458,10 @@ pub struct Machine {
     /// the composer closes: the member room's composer may be built before the
     /// join composer is dropped).
     draft: Option<(VerifyingKey, String)>,
+    /// The display name the visitor chose in the prompt shown at their first
+    /// message. Kept across a cancel (the key is not), dropped when the join
+    /// ends or the viewer closes.
+    nickname: Option<String>,
 }
 
 impl Machine {
@@ -475,6 +479,7 @@ impl Machine {
             readmit: false,
             joined: None,
             draft: None,
+            nickname: None,
         }
     }
 
@@ -541,6 +546,7 @@ impl Machine {
         self.generation += 1;
         self.hand_back_all();
         self.clear_secrets();
+        self.nickname = None;
         self.phase = JoinPhase::Idle;
         self.notice = None;
     }
@@ -725,6 +731,7 @@ impl Machine {
     /// remembered.
     pub fn reset(&mut self) {
         self.cancel();
+        self.nickname = None;
         self.owner = None;
     }
 
@@ -735,6 +742,7 @@ impl Machine {
         }
         let posted = std::mem::take(&mut self.in_flight);
         self.joined = self.owner;
+        self.nickname = None;
         self.clear_secrets();
         self.owner = None;
         self.notice = None;
@@ -772,6 +780,11 @@ impl Machine {
                 None
             }
         }
+    }
+
+    /// The nickname the visitor chose, if any.
+    fn chosen_nickname(&self) -> Option<String> {
+        self.nickname.clone()
     }
 
     fn submit_inputs(
@@ -1045,6 +1058,38 @@ pub fn send(owner_vk: VerifyingKey, text: String) {
     act(action, owner_vk);
 }
 
+/// The pass for a visitor who is about to write: the proof of work starts on
+/// the first focus or keystroke in the composer, not when the page opens, so a
+/// bot or a link previewer that never interacts is not charged. The one place
+/// that decides when it starts. A no-op unless the join is idle for this room.
+pub fn start_on_interaction(owner_vk: VerifyingKey) {
+    let idle = {
+        let m = machine();
+        match (&m.owner, &m.phase) {
+            (Some(o), p) if *o == owner_vk => matches!(p, JoinPhase::Idle),
+            (Some(_), p) => !matches!(p, JoinPhase::Submitting),
+            (None, _) => true,
+        }
+    };
+    if idle && matches!(viewed_state(), Some((o, _)) if o == owner_vk) {
+        start(owner_vk);
+    }
+}
+
+/// The display name this join would publish if the visitor chooses none, once
+/// a key exists (it is derived from the key).
+pub fn default_nickname() -> Option<String> {
+    machine()
+        .signing_key
+        .as_ref()
+        .map(|k| crate::nickname::generate_default_nickname(&k.verifying_key()))
+}
+
+/// Record the display name the visitor chose. Read when the entry is posted.
+pub fn set_nickname(name: String) {
+    machine().nickname = Some(name.trim().to_string());
+}
+
 /// Take the text handed back to `owner`'s composer, if any.
 pub fn take_returned(owner_vk: &VerifyingKey) -> Option<String> {
     let taken = machine().take_returned(owner_vk);
@@ -1185,6 +1230,9 @@ fn nickname_for(owner_vk: &VerifyingKey, signing_key: &SigningKey, readmit: bool
         if let Some(n) = kept {
             return n;
         }
+    }
+    if let Some(chosen) = machine().chosen_nickname() {
+        return chosen;
     }
     crate::nickname::generate_default_nickname(&signing_key.verifying_key())
 }
@@ -1859,6 +1907,43 @@ mod tests {
         assert_eq!(m.succeed(g), None);
         // "three" came back to the box it was typed in, it was not posted.
         assert_eq!(returned(&mut m, &a), "three");
+    }
+
+    #[test]
+    fn a_chosen_name_survives_a_cancel_and_ends_with_the_join() {
+        let (a, mut m) = (vk(1), Machine::new());
+        // The proof starts on interaction, before any message: the machine
+        // holds a key and waits, and the visitor can still choose a name.
+        let Action::Solve(g) = m.start(a, fresh()) else {
+            panic!("start solves");
+        };
+        m.nickname = Some("Quinn".into());
+        assert_eq!(m.chosen_nickname().as_deref(), Some("Quinn"));
+        // A cancel forgets the key but not the name the visitor typed.
+        m.cancel();
+        assert_eq!(m.chosen_nickname().as_deref(), Some("Quinn"));
+        // A finished join and a closed viewer both end it.
+        let Action::Solve(g2) = m.send(a, "hi", limits(), fresh()) else {
+            panic!("send solves");
+        };
+        assert_ne!(g, g2);
+        assert_eq!(m.solved(g2, some_entry()), Action::Submit(g2));
+        m.succeed(g2);
+        assert_eq!(m.chosen_nickname(), None);
+        m.nickname = Some("Quinn".into());
+        m.reset();
+        assert_eq!(m.chosen_nickname(), None);
+    }
+
+    #[test]
+    fn a_proof_started_before_any_message_waits_ready_and_posts_the_first_message() {
+        let (a, mut m) = (vk(1), Machine::new());
+        let Action::Solve(g) = m.start(a, fresh()) else {
+            panic!("start solves");
+        };
+        assert_eq!(m.solved(g, some_entry()), Action::Nothing);
+        assert!(m.ui().queued.is_empty(), "nothing is shown as pending");
+        assert_eq!(m.send(a, "first", limits(), fresh()), Action::Submit(g));
     }
 
     #[test]

@@ -582,6 +582,9 @@ pub fn RoomList() -> Element {
                     RoomListDisplay::List => rsx! {},
                 }
 
+                // The room opened from a link: a row that is never saved.
+                crate::components::viewed_room::ViewedRailRow {}
+
                 {room_items.read().iter().enumerate().map(|(idx, (room_key, room_name, is_current, awaiting_sync, is_private, unread, unread_is_mentions, sync_error))| {
                     let room_key = *room_key;
                     let room_name = room_name.clone();
