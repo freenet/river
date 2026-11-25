@@ -116,6 +116,8 @@ mod volatile_value_binding_audit {
         r#"components/room_list/create_room_modal.rs <input> "{nickname}""#,
         r#"components/room_list/create_room_modal.rs <input> "{room_name}""#,
         r#"components/room_list/edit_room_modal.rs <input> "{input_value}""#,
+        // Display-name prompt at a visitor's first message: `oninput` writes every keystroke.
+        r#"components/viewed_room.rs <input> "{nickname}""#,
         r#"components/room_list/edit_room_modal.rs <input> "{max_members_input}""#,
         r#"components/room_list/edit_room_modal.rs <textarea> "{description}""#,
         r#"components/room_list/join_with_code_modal.rs <textarea> "{code_input}""#,

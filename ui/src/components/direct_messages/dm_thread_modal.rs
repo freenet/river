@@ -318,7 +318,7 @@ fn DmThreadModalBody(room: VerifyingKey, peer: MemberId) -> Element {
                                     target_room_data.map(|rd| rd.can_participate()),
                                 );
                                 let room_label = target_room_data
-                                    .map(|rd| rd.display_name())
+                                    .map(|rd| rd.display_name_for_text())
                                     .unwrap_or_else(|| {
                                         format!("Room {}", short_vk_prefix(&payload.room_owner_vk))
                                     });

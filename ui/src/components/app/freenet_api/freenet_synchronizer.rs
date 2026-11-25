@@ -869,6 +869,7 @@ impl FreenetSynchronizer {
                             }
                             Err(e) => {
                                 error!("Received error in API response: {}", e);
+                                crate::public_room::deliver_error(&e.to_string());
                                 crate::components::app::chat_delegate::note_sweep_error(
                                     &e.to_string(),
                                 );

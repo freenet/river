@@ -754,7 +754,9 @@ pub fn App() -> Element {
                         (false, Some(false)) => "hidden",
                     }
                 },
-                if !viewing_room {
+                if viewing_room {
+                    crate::components::viewed_room::ViewedMemberList {}
+                } else {
                     MemberList {}
                 }
             }

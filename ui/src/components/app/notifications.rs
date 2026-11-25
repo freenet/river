@@ -1203,8 +1203,11 @@ pub fn notify_new_messages(
     // (user is looking at this room right now)
     let doc_visible = is_document_visible();
     if doc_visible {
-        if let Some(current_key) = CURRENT_ROOM.read().owner_key {
-            if current_key == *room_key {
+        // The open room: the selected one, or none while a room opened from a
+        // link is shown (the selected room is hidden behind it, so a message
+        // there is not being looked at).
+        if let Some(current_key) = super::document_title::open_room_key() {
+            if is_active_room(&current_key, room_key) {
                 info!(
                     "Room {:?} is currently active and visible, skipping notification",
                     MemberId::from(*room_key)
@@ -2761,5 +2764,45 @@ mod notify_gate_tests {
             &secrets,
             &[]
         ));
+    }
+}
+
+/// Whether `room_key` is the room the reader has open.
+fn is_active_room(
+    open: &ed25519_dalek::VerifyingKey,
+    room_key: &ed25519_dalek::VerifyingKey,
+) -> bool {
+    open == room_key
+}
+
+#[cfg(test)]
+mod active_room_tests {
+    use super::*;
+
+    #[test]
+    fn only_the_open_room_is_active() {
+        let a = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key();
+        let b = ed25519_dalek::SigningKey::from_bytes(&[2; 32]).verifying_key();
+        assert!(is_active_room(&a, &a));
+        assert!(!is_active_room(&a, &b));
+    }
+
+    /// A message in the room selected before a link room opened is not being
+    /// looked at, so notification suppression must use the same "open room"
+    /// as the title and the unread counts, never `CURRENT_ROOM` directly.
+    #[test]
+    fn suppression_uses_the_open_room_not_the_selected_one() {
+        let src = include_str!("notifications.rs");
+        let prod = src
+            .rsplit_once("#[cfg(test)]\nmod active_room_tests")
+            .unwrap()
+            .0;
+        let at = prod
+            .find("pub fn notify_new_messages(")
+            .expect("notify_new_messages");
+        let body = &prod[at..at + 4000.min(prod.len() - at)];
+        let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+        assert!(body.contains("open_room_key()"));
+        assert!(!body.contains("CURRENT_ROOM.read()"));
     }
 }

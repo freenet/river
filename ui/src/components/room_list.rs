@@ -273,6 +273,16 @@ pub fn RoomList() -> Element {
         // it re-poll a macrotask later instead.
         crate::util::signal_guard::anchor();
         let current_room_key = CURRENT_ROOM.read().owner_key;
+        // While a room opened from a link is shown, its own row is the
+        // selected one; the room selected before it is not also highlighted.
+        let current_room_key = match crate::public_room::VIEWED_ROOM.try_read() {
+            Ok(viewed) if viewed.is_some() => None,
+            Ok(_) => current_room_key,
+            Err(_) => {
+                crate::util::signal_guard::schedule_nudge();
+                current_room_key
+            }
+        };
         // While another mobile panel replaces the chat, Latest is hidden with
         // it, so the open room's row badges its unread messages too
         // (`.claude/rules/history-scrolling.md`).
@@ -581,6 +591,9 @@ pub fn RoomList() -> Element {
                     },
                     RoomListDisplay::List => rsx! {},
                 }
+
+                // The room opened from a link: a row that is never saved.
+                crate::components::viewed_room::ViewedRailRow {}
 
                 {room_items.read().iter().enumerate().map(|(idx, (room_key, room_name, is_current, awaiting_sync, is_private, unread, unread_is_mentions, sync_error))| {
                     let room_key = *room_key;

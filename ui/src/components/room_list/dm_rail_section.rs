@@ -787,7 +787,7 @@ fn build_archived_view() -> Option<Vec<ArchivedEntry>> {
         let Some(self_id) = room_data.self_member_id() else {
             continue;
         };
-        let room_name = room_data.display_name();
+        let room_name = room_data.display_name_for_text();
         let nicknames: HashMap<MemberId, String> = room_data
             .room_state
             .member_info
@@ -937,7 +937,7 @@ fn build_view() -> Vec<DmRailEntry> {
         };
 
         // Decrypted room name for display.
-        let room_name = room_data.display_name();
+        let room_name = room_data.display_name_for_text();
 
         // Nickname lookup per member id.
         let nicknames: HashMap<MemberId, String> = room_data

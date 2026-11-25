@@ -231,11 +231,52 @@ pub fn install_test_hooks() {
         .into_js_value(),
     );
 
+    // `count` messages "<text> NN" from the fixture room's owner arrive in the
+    // viewed room's state, as if learned from the network.
+    set_hook(
+        "appendViewedMessages",
+        Closure::<dyn FnMut(String, String, u32) -> bool>::new(
+            move |kind: String, text: String, count: u32| {
+                let Some(owner_sk) = crate::example_data::fixture_owner_sk(&kind) else {
+                    return false;
+                };
+                let owner_vk = owner_sk.verifying_key();
+                crate::public_room::edit_viewed_state(move |state| {
+                    let now = crate::util::get_current_system_time();
+                    for i in 0..count {
+                        state.recent_messages.messages.push(signed_message(
+                            &owner_vk,
+                            &owner_sk,
+                            RoomMessageBody::public(format!("{text} {i:02}")),
+                            now + std::time::Duration::from_millis(u64::from(i)),
+                        ));
+                    }
+                    // A full window drops its oldest messages as new ones arrive.
+                    let max = state.configuration.configuration.max_recent_messages;
+                    let extra = state.recent_messages.messages.len().saturating_sub(max);
+                    state.recent_messages.messages.drain(..extra);
+                })
+            },
+        )
+        .into_js_value(),
+    );
+
     // Pin or release the join's solver (see `public_join::HOLD_SOLVER`).
     set_hook(
         "holdSolver",
         Closure::<dyn FnMut(bool)>::new(move |hold: bool| {
             crate::public_join::HOLD_SOLVER.store(hold, std::sync::atomic::Ordering::Relaxed);
+        })
+        .into_js_value(),
+    );
+
+    // Make the user's rooms look as if their load failed (the example build
+    // never loads any), to check that a join then refuses to start.
+    set_hook(
+        "failRoomsLoad",
+        Closure::<dyn FnMut()>::new(move || {
+            *crate::components::app::chat_delegate::ROOMS_LOAD_STATE.write() =
+                crate::components::app::chat_delegate::RoomsLoadState::LoadFailed;
         })
         .into_js_value(),
     );
@@ -340,6 +381,13 @@ pub fn install_test_hooks() {
             },
         )
         .into_js_value(),
+    );
+
+    // The join's phase: idle, solving, ready, submitting or failed. Lets a
+    // test wait for "the proof finished" instead of sleeping.
+    set_hook(
+        "joinPhase",
+        Closure::<dyn FnMut() -> String>::new(crate::public_join::phase_name).into_js_value(),
     );
 
     // Base58 of the verifying key the join in progress holds, "" when none:

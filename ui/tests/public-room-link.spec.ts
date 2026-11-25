@@ -1,5 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
-import { waitForApp, selectRoom, panicsOf } from "./example-room";
+import { closeViewer, waitForApp, selectRoom, panicsOf } from "./example-room";
 import { callRiverTest } from "./river-test";
 import { captureClipboardWrites, clipboardWrites } from "./clipboard";
 
@@ -35,7 +35,8 @@ test("a public room opens read-only, with messages and a disabled composer", asy
   await expect(page.getByTestId("viewed-room-message").first()).toBeVisible();
   expect(await page.getByTestId("viewed-room-message").count()).toBeGreaterThan(3);
   await expect(page.getByTestId("viewed-room-composer")).toBeDisabled();
-  await expect(page.getByTestId("viewed-room-composer-note")).toContainText("read-only");
+  await expect(page.getByTestId("viewed-room-composer-note")).toContainText("invitation");
+  await expect(page.getByTestId("viewed-room-composer-note")).not.toContainText("read-only");
   // No member identity was needed: nothing offers to send.
   await expect(page.getByTestId("send-message-button")).toHaveCount(0);
   expect(panics).toEqual([]);
@@ -86,16 +87,13 @@ test("the copy link round-trips: copied from a public room, it opens that room",
   expect(copied).toMatch(/^https:\/\/freenet\.org\/open#[1-9A-HJ-NP-Za-km-z]{43,44}\/\?room=[1-9A-HJ-NP-Za-km-z]{43,44}$/);
   await expect(page.getByTestId("room-public-link-text")).toHaveText(copied);
 
-  // The same builder serves a viewer: copy from the read-only pane and open it.
+  // The opened view has no Copy link of its own (it looks like a joined room),
+  // so links are shared from room settings. Open a link of that shape for a
+  // viewable room. freenet.org/open sends the reader to
+  // `/v1/contract/web/<id>/?room=...` on their own node; here that is the
+  // local build.
   const key = await callRiverTest(page, "viewableRoomKey", "public");
-  await openLink(page, key);
-  await captureClipboardWrites(page);
-  await page.getByTestId("viewed-room-copy-link").click();
-  const [viewerLink] = await clipboardWrites(page);
-  expect(viewerLink).toContain(`?room=${key}`);
-  // freenet.org/open sends the reader to `/v1/contract/web/<id>/?room=...` on
-  // their own node; here that is the local build.
-  await page.goto("/?room=" + viewerLink.split("?room=")[1]);
+  await page.goto("/?room=" + key);
   await waitForApp(page);
   await expect(page.getByTestId("viewed-room-name")).toHaveText("Open Public Room");
 });
@@ -103,7 +101,7 @@ test("the copy link round-trips: copied from a public room, it opens that room",
 test("closing the viewer returns to the user's own rooms", async ({ page }) => {
   const key = await keyOf(page, "public");
   await openLink(page, key);
-  await page.getByTestId("viewed-room-close").click();
+  await closeViewer(page);
   await expect(page.getByTestId("viewed-room")).toHaveCount(0);
   // The user's own rooms are untouched and open normally.
   await selectRoom(page, "Team Chat Room");

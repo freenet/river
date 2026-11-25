@@ -562,6 +562,18 @@ pub(crate) fn merge_converging(
     Ok(())
 }
 
+/// What a room is called while it is shown. Pure, so it is unit-tested.
+pub(crate) fn select_display_name(
+    awaiting_state: bool,
+    decrypted: Option<String>,
+    raw: impl FnOnce() -> String,
+) -> String {
+    if awaiting_state {
+        return "Loading room\u{2026}".to_string();
+    }
+    decrypted.unwrap_or_else(raw)
+}
+
 impl RoomData {
     /// Apply this member's purge `envelope` (signed on this device, purging
     /// `tokens`) to the room, and record the tokens as this device's own, so
@@ -784,9 +796,20 @@ impl RoomData {
             .filter(|name| !name.is_empty())
     }
 
-    /// The room name, or the encrypted placeholder until its secret is available.
+    /// Whether this room still holds the stand-in state (a default
+    /// configuration, whose owner id is not the owner's). A field comparison,
+    /// not `is_awaiting_initial_sync`'s serialize-and-verify, because the name
+    /// is read in render paths.
+    pub fn has_placeholder_state(&self) -> bool {
+        self.room_state.configuration.configuration.owner_member_id
+            != river_core::room_state::member::MemberId::from(self.owner_vk)
+    }
+
+    /// The room name; "Loading room…" until the room's state has arrived (its
+    /// stand-in state would otherwise show the `Default` name, "Default Room
+    /// Name"); or the encrypted placeholder until its secret is available.
     pub fn display_name(&self) -> String {
-        self.decrypted_name().unwrap_or_else(|| {
+        select_display_name(self.has_placeholder_state(), self.decrypted_name(), || {
             self.room_state
                 .configuration
                 .configuration
@@ -794,6 +817,24 @@ impl RoomData {
                 .name
                 .to_string_lossy()
         })
+    }
+
+    /// The room's name for text that leaves the screen or labels something
+    /// other than the room itself (an invitation message, a direct-message
+    /// title or card, the invite picker). Until the room's state has arrived
+    /// `display_name` says "Loading room…", which belongs on a rail row but
+    /// not in a message someone else will read: use the owner key's prefix.
+    pub fn display_name_for_text(&self) -> String {
+        if self.is_awaiting_initial_sync() {
+            let prefix: String = bs58::encode(self.owner_vk.as_bytes())
+                .into_string()
+                .chars()
+                .take(8)
+                .collect();
+            format!("Room {prefix}")
+        } else {
+            self.display_name()
+        }
     }
 
     /// Get the current (latest) secret for encryption/decryption
@@ -6626,10 +6667,68 @@ mod tests {
     }
 
     #[test]
+    fn text_that_leaves_the_screen_never_says_loading_room() {
+        let mut rng = rand::thread_rng();
+        let vk = SigningKey::generate(&mut rng).verifying_key();
+        let waiting = test_minimal_room_data(vk);
+        assert_eq!(waiting.display_name(), "Loading room\u{2026}");
+        let text = waiting.display_name_for_text();
+        assert!(text.starts_with("Room "), "{text}");
+        assert!(!text.contains("Loading"), "{text}");
+        assert_eq!(text.chars().count(), "Room ".len() + 8);
+    }
+
+    /// The callers whose output leaves the screen or is not a rail row must
+    /// use the text form, so a room still awaiting its state is never named
+    /// "Loading room…" in an invitation or a direct-message label.
+    #[test]
+    fn invitation_and_dm_callers_use_the_text_name() {
+        for (file, src) in [
+            (
+                "members/invite_member_modal.rs",
+                include_str!("components/members/invite_member_modal.rs"),
+            ),
+            (
+                "direct_messages/dm_thread_modal.rs",
+                include_str!("components/direct_messages/dm_thread_modal.rs"),
+            ),
+            (
+                "direct_messages/invite_via_dm_picker_modal.rs",
+                include_str!("components/direct_messages/invite_via_dm_picker_modal.rs"),
+            ),
+            (
+                "room_list/dm_rail_section.rs",
+                include_str!("components/room_list/dm_rail_section.rs"),
+            ),
+        ] {
+            let prod = src.split("#[cfg(test)]").next().unwrap();
+            assert!(
+                prod.contains("display_name_for_text()"),
+                "{file} must use display_name_for_text"
+            );
+            assert!(
+                !prod.contains(".display_name()"),
+                "{file} still calls display_name() for text"
+            );
+        }
+    }
+
+    #[test]
     fn display_name_covers_public_private_and_missing_secret() {
         let mut rng = rand::thread_rng();
         let public_room = test_minimal_room_data(SigningKey::generate(&mut rng).verifying_key());
-        assert_eq!(public_room.display_name(), "Default Room Name");
+        // A stand-in state (no state from the network yet) is not named
+        // "Default Room Name".
+        assert_eq!(public_room.display_name(), "Loading room\u{2026}");
+        assert_eq!(
+            select_display_name(true, Some("Real".into()), || "raw".into()),
+            "Loading room\u{2026}"
+        );
+        assert_eq!(
+            select_display_name(false, Some("Real".into()), || "raw".into()),
+            "Real"
+        );
+        assert_eq!(select_display_name(false, None, || "raw".into()), "raw");
 
         let owner_sk = SigningKey::generate(&mut rng);
         let member_sk = SigningKey::generate(&mut rng);
@@ -6638,8 +6737,13 @@ mod tests {
             .get_secret()
             .map(|(s, v)| (*s, v))
             .expect("fixture seeds a secret");
-        room.room_state.configuration.configuration.display.name =
-            seal_bytes(b"Secret Room", &secret, version);
+        let mut config = room.room_state.configuration.configuration.clone();
+        config.display.name = seal_bytes(b"Secret Room", &secret, version);
+        // Signed by the owner, as real state from the network is.
+        room.room_state.configuration =
+            river_core::room_state::configuration::AuthorizedConfigurationV1::new(
+                config, &owner_sk,
+            );
         assert_eq!(room.display_name(), "Secret Room");
 
         room.secrets.clear();

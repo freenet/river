@@ -43,6 +43,7 @@ use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessag
 use river_core::room_state::privacy::PrivacyMode;
 use river_core::room_state::provisional::{
     AdmissionEvidence, AuthorizedProvisionalMember, ProvisionalMember,
+    PROVISIONAL_MESSAGES_PER_AUTHOR,
 };
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
 use std::sync::Mutex;
@@ -88,6 +89,9 @@ pub enum JoinFailure {
     NotReady,
     /// The user already holds this room.
     AlreadyMember,
+    /// The user's rooms failed to load, so it is not known whether they are
+    /// already in this room: a join could mint a second identity in it.
+    RoomsNotLoaded,
     /// The browser could not hash.
     Internal(String),
 }
@@ -95,29 +99,31 @@ pub enum JoinFailure {
 impl JoinFailure {
     pub fn message(&self) -> String {
         match self {
-            Self::RoomFull => "The room's open-member slots are held by newer messages. \
+            Self::RoomFull => "This room has no free spot for a new person right now. \
                 Try again later, or ask a member for an invitation."
                 .to_string(),
             Self::Banned => "You are banned from this room.".to_string(),
-            Self::Shadowed => "Another key already holds this identity in the room, and \
-                your key stays the same, so trying again will not help. \
-                Ask a member for an invitation."
+            Self::Shadowed => "This room already has someone with the same identity as you, \
+                so trying again will not help. Ask a member for an invitation."
                 .to_string(),
             Self::NoKey => "This browser no longer holds your key for this room. \
                 Ask a member for an invitation."
                 .to_string(),
             Self::NotReady => "Your rooms are still loading. Try again in a moment.".to_string(),
             Self::AlreadyMember => "You are already in this room.".to_string(),
+            Self::RoomsNotLoaded => {
+                "We couldn't load your rooms yet. Reload this page to send a message.".to_string()
+            }
             Self::NotOpen => "This room no longer admits new members this way. \
                 Ask a member for an invitation."
                 .to_string(),
-            Self::PolicyChanged => "The room changed what it asks of newcomers. \
-                Join again to meet the new requirement."
+            Self::PolicyChanged => "The room changed what it asks of newcomers while you waited. \
+                Try again."
                 .to_string(),
-            Self::TooLong(max) => {
-                format!("The message is longer than the room allows ({max} bytes).")
-            }
-            Self::Internal(e) => format!("Joining failed: {e}"),
+            Self::TooLong(_) => "The message is longer than the room allows.".to_string(),
+            // The detail is logged where the failure is made; it is a Debug
+            // string, not something to show a visitor.
+            Self::Internal(_) => "Something went wrong while joining. Try again.".to_string(),
         }
     }
 
@@ -479,6 +485,10 @@ pub struct Machine {
     /// the composer closes: the member room's composer may be built before the
     /// join composer is dropped).
     draft: Option<(VerifyingKey, String)>,
+    /// The display name the visitor chose in the prompt shown at their first
+    /// message. Kept across a cancel (the key is not), dropped when the join
+    /// ends or the viewer closes.
+    nickname: Option<String>,
 }
 
 impl Machine {
@@ -497,6 +507,7 @@ impl Machine {
             readmit: false,
             joined: None,
             draft: None,
+            nickname: None,
         }
     }
 
@@ -673,8 +684,13 @@ impl Machine {
             if self.queue.len() + self.in_flight.len() >= limits.max_queued {
                 self.give_back(owner, text);
                 self.notice = Some(format!(
-                    "You can queue {} messages before you are admitted. Wait for admission to send more.",
-                    limits.max_queued
+                    "You can queue {} {} before you are admitted. Wait for admission to send more.",
+                    limits.max_queued,
+                    if limits.max_queued == 1 {
+                        "message"
+                    } else {
+                        "messages"
+                    }
                 ));
                 return Action::Nothing;
             }
@@ -758,6 +774,7 @@ impl Machine {
     /// remembered.
     pub fn reset(&mut self) {
         self.cancel();
+        self.nickname = None;
         self.owner = None;
     }
 
@@ -768,6 +785,7 @@ impl Machine {
         }
         let posted = std::mem::take(&mut self.in_flight);
         self.joined = self.owner;
+        self.nickname = None;
         self.clear_secrets();
         self.owner = None;
         self.notice = None;
@@ -805,6 +823,11 @@ impl Machine {
                 None
             }
         }
+    }
+
+    /// The nickname the visitor chose, if any.
+    fn chosen_nickname(&self) -> Option<String> {
+        self.nickname.clone()
     }
 
     fn submit_inputs(
@@ -862,6 +885,9 @@ fn is_current(generation: u64) -> bool {
 }
 
 fn fail(generation: u64, failure: JoinFailure) {
+    if let JoinFailure::Internal(detail) = &failure {
+        dioxus::logger::tracing::warn!("public join failed: {detail}");
+    }
     step(|m| m.fail(generation, failure));
 }
 
@@ -1026,6 +1052,19 @@ pub fn tried_for_test() -> u64 {
 #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
 pub static HOLD_SOLVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The join's phase by name (test hook).
+#[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+pub fn phase_name() -> String {
+    match machine().phase {
+        JoinPhase::Idle => "idle",
+        JoinPhase::Solving { .. } => "solving",
+        JoinPhase::Ready => "ready",
+        JoinPhase::Submitting => "submitting",
+        JoinPhase::Failed(_) => "failed",
+    }
+    .to_string()
+}
+
 /// Forget the join: it is over, or the viewer closed. Messages not yet in the
 /// room go back to their composer.
 pub fn reset() {
@@ -1037,6 +1076,31 @@ pub fn cancel() {
     step(|m| m.cancel());
 }
 
+/// Whether the user's rooms are known well enough to start a join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinReadiness {
+    Ready,
+    /// Still loading or migrating: wait.
+    Waiting,
+    /// The load failed: the visitor may already belong to this room, so no
+    /// join starts. Viewing is unaffected (`viewed_room::load_settled`).
+    LoadFailed,
+}
+
+/// The join's reading of the rooms load state. Stricter than the viewer's
+/// (`viewed_room::load_settled`), which shows a room to anyone once nothing
+/// more will arrive.
+pub fn join_readiness(
+    state: crate::components::app::chat_delegate::RoomsLoadState,
+) -> JoinReadiness {
+    use crate::components::app::chat_delegate::RoomsLoadState as S;
+    match state {
+        S::Loaded => JoinReadiness::Ready,
+        S::Loading | S::Migrating => JoinReadiness::Waiting,
+        S::LoadFailed => JoinReadiness::LoadFailed,
+    }
+}
+
 /// A room's own messages and rooms loading are both needed before a join can
 /// be started: a key must never be made for a room the user already holds.
 fn start_blocker(owner_vk: &VerifyingKey) -> Option<JoinFailure> {
@@ -1044,16 +1108,22 @@ fn start_blocker(owner_vk: &VerifyingKey) -> Option<JoinFailure> {
 }
 
 fn start_blocker_in_runtime(owner_vk: &VerifyingKey) -> Option<JoinFailure> {
-    use crate::components::app::chat_delegate::{RoomsLoadState, ROOMS_LOAD_STATE};
+    use crate::components::app::chat_delegate::ROOMS_LOAD_STATE;
     // The example build has no delegate to load from: its rooms are all there
     // is, and the load state never leaves `Loading`.
-    let loaded = cfg!(feature = "no-sync")
-        || ROOMS_LOAD_STATE
-            .try_peek()
-            .map(|s| *s == RoomsLoadState::Loaded)
-            .unwrap_or(false);
-    if !loaded {
-        return Some(JoinFailure::NotReady);
+    let state = ROOMS_LOAD_STATE.try_peek().map(|s| *s);
+    let readiness = match state {
+        Ok(s) if join_readiness(s) == JoinReadiness::LoadFailed => JoinReadiness::LoadFailed,
+        // The example build has no delegate to load from: its load state never
+        // leaves `Loading`, and its rooms are all there is.
+        _ if cfg!(feature = "no-sync") => JoinReadiness::Ready,
+        Ok(s) => join_readiness(s),
+        Err(_) => JoinReadiness::Waiting,
+    };
+    match readiness {
+        JoinReadiness::Ready => {}
+        JoinReadiness::Waiting => return Some(JoinFailure::NotReady),
+        JoinReadiness::LoadFailed => return Some(JoinFailure::RoomsNotLoaded),
     }
     match crate::components::app::ROOMS.try_peek() {
         Ok(rooms) if rooms.map.contains_key(owner_vk) => Some(JoinFailure::AlreadyMember),
@@ -1112,6 +1182,13 @@ pub fn start_readmit(owner_vk: VerifyingKey) {
     act(action, owner_vk);
 }
 
+/// How many messages a visitor may queue before admission: the room's
+/// newcomer quota, but never more than one author keeps (the room drops the
+/// oldest beyond that), and at least one.
+pub(crate) fn queue_limit(room_quota: u32) -> usize {
+    (room_quota as usize).clamp(1, PROVISIONAL_MESSAGES_PER_AUTHOR)
+}
+
 /// Send pressed with `text`: queue it, and start admission or post it.
 pub fn send(owner_vk: VerifyingKey, text: String) {
     let (plan, state) = plan_for(&owner_vk);
@@ -1123,7 +1200,7 @@ pub fn send(owner_vk: VerifyingKey, text: String) {
                 .configuration
                 .public_admission
                 .as_ref()
-                .map_or(1, |p| (p.max_provisional_messages as usize).max(1)),
+                .map_or(1, |p| queue_limit(p.max_provisional_messages)),
         },
         None => Limits {
             max_message_size: usize::MAX,
@@ -1132,6 +1209,52 @@ pub fn send(owner_vk: VerifyingKey, text: String) {
     };
     let action = step(|m| m.send(owner_vk, &text, limits, plan));
     act(action, owner_vk);
+}
+
+/// The pass for a visitor who is about to write: the proof of work starts on
+/// the first focus or keystroke in the composer, not when the page opens, so a
+/// bot or a link previewer that never interacts is not charged. The one place
+/// that decides when it starts. A no-op unless the join is idle for this room.
+pub fn start_on_interaction(owner_vk: VerifyingKey) {
+    let idle = {
+        let m = machine();
+        match (&m.owner, &m.phase) {
+            (Some(o), p) if *o == owner_vk => matches!(p, JoinPhase::Idle),
+            (Some(_), p) => !matches!(p, JoinPhase::Submitting),
+            (None, _) => true,
+        }
+    };
+    if idle && matches!(viewed_state(), Some((o, _)) if o == owner_vk) {
+        start(owner_vk);
+    }
+}
+
+/// The display name this join would publish if the visitor chooses none, once
+/// a key exists (it is derived from the key).
+pub fn default_nickname() -> Option<String> {
+    machine()
+        .signing_key
+        .as_ref()
+        .map(|k| crate::nickname::generate_default_nickname(&k.verifying_key()))
+}
+
+/// Record the display name the visitor chose. Read when the entry is posted.
+/// `None` keeps the generated default, whatever key the join ends up with.
+pub fn set_nickname(name: Option<String>) {
+    machine().nickname = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+}
+
+/// Make sure a key exists for this visitor (a failed or cancelled start leaves
+/// none), so the display-name prompt can be prefilled. A no-op while a join is
+/// under way for this room.
+pub fn ensure_started(owner_vk: VerifyingKey) {
+    let needs = {
+        let m = machine();
+        m.signing_key.is_none() && m.can_start(&owner_vk)
+    };
+    if needs && matches!(viewed_state(), Some((o, _)) if o == owner_vk) {
+        start(owner_vk);
+    }
 }
 
 /// Take the text handed back to `owner`'s composer, if any.
@@ -1475,6 +1598,9 @@ fn nickname_for(owner_vk: &VerifyingKey, signing_key: &SigningKey, readmit: bool
         if let Some(n) = kept {
             return n;
         }
+    }
+    if let Some(chosen) = machine().chosen_nickname() {
+        return chosen;
     }
     crate::nickname::generate_default_nickname(&signing_key.verifying_key())
 }
@@ -2295,6 +2421,104 @@ mod tests {
     }
 
     #[test]
+    fn no_failure_text_uses_the_jargon_of_the_work_or_the_buttons_that_are_gone() {
+        for f in [
+            JoinFailure::RoomFull,
+            JoinFailure::Banned,
+            JoinFailure::Shadowed,
+            JoinFailure::NotOpen,
+            JoinFailure::PolicyChanged,
+            JoinFailure::TooLong(100),
+            JoinFailure::NoKey,
+            JoinFailure::NotReady,
+            JoinFailure::AlreadyMember,
+            JoinFailure::RoomsNotLoaded,
+            JoinFailure::Internal("Err(Variant { x: 1 })".into()),
+        ] {
+            let m = f.message().to_lowercase();
+            for bad in [
+                "proof",
+                "hash",
+                "bits",
+                "pow",
+                "bytes",
+                "slots",
+                "join again",
+                "variant",
+                "{",
+            ] {
+                assert!(!m.contains(bad), "{f:?} says {bad:?}: {m}");
+            }
+        }
+    }
+
+    #[test]
+    fn viewing_and_joining_read_the_rooms_load_state_differently() {
+        use crate::components::app::chat_delegate::RoomsLoadState as S;
+        use crate::components::viewed_room::load_settled;
+        // (state, may view, join readiness)
+        for (state, view, join) in [
+            (S::Loading, false, JoinReadiness::Waiting),
+            (S::Migrating, false, JoinReadiness::Waiting),
+            (S::Loaded, true, JoinReadiness::Ready),
+            (S::LoadFailed, true, JoinReadiness::LoadFailed),
+        ] {
+            assert_eq!(load_settled(state), view, "{state:?} view");
+            assert_eq!(join_readiness(state), join, "{state:?} join");
+        }
+        assert!(
+            !JoinFailure::RoomsNotLoaded.retryable(),
+            "reload, not retry"
+        );
+        assert!(JoinFailure::RoomsNotLoaded
+            .message()
+            .contains("Reload this page"));
+    }
+
+    #[test]
+    fn a_chosen_name_survives_a_cancel_and_ends_with_the_join() {
+        let (a, mut m) = (vk(1), Machine::new());
+        // The proof starts on interaction, before any message: the machine
+        // holds a key and waits, and the visitor can still choose a name.
+        let Action::Solve(g) = m.start(a, fresh()) else {
+            panic!("start solves");
+        };
+        m.nickname = Some("Quinn".into());
+        assert_eq!(m.chosen_nickname().as_deref(), Some("Quinn"));
+        // A cancel forgets the key but not the name the visitor typed.
+        m.cancel();
+        assert_eq!(m.chosen_nickname().as_deref(), Some("Quinn"));
+        // Switching to another room's join does not drop it either.
+        let Action::Solve(_) = m.start(a, fresh()) else {
+            panic!("start solves");
+        };
+        m.abandon();
+        assert_eq!(m.chosen_nickname().as_deref(), Some("Quinn"));
+        // A finished join and a closed viewer both end it.
+        let Action::Solve(g2) = m.send(a, "hi", limits(), fresh()) else {
+            panic!("send solves");
+        };
+        assert_ne!(g, g2);
+        assert_eq!(m.solved(g2, some_entry()), Action::Submit(g2));
+        m.succeed(g2);
+        assert_eq!(m.chosen_nickname(), None);
+        m.nickname = Some("Quinn".into());
+        m.reset();
+        assert_eq!(m.chosen_nickname(), None);
+    }
+
+    #[test]
+    fn a_proof_started_before_any_message_waits_ready_and_posts_the_first_message() {
+        let (a, mut m) = (vk(1), Machine::new());
+        let Action::Solve(g) = m.start(a, fresh()) else {
+            panic!("start solves");
+        };
+        assert_eq!(m.solved(g, some_entry()), Action::Nothing);
+        assert!(m.ui().queued.is_empty(), "nothing is shown as pending");
+        assert_eq!(m.send(a, "first", limits(), fresh()), Action::Submit(g));
+    }
+
+    #[test]
     fn two_quick_sends_when_ready_submit_once() {
         let (a, mut m) = (vk(1), Machine::new());
         let Action::Solve(g) = m.start(a, fresh()) else {
@@ -2495,8 +2719,58 @@ mod tests {
     }
 
     #[test]
+    fn the_queue_never_exceeds_what_one_author_keeps() {
+        assert_eq!(queue_limit(0), 1);
+        assert_eq!(queue_limit(1), 1);
+        assert_eq!(
+            queue_limit(PROVISIONAL_MESSAGES_PER_AUTHOR as u32),
+            PROVISIONAL_MESSAGES_PER_AUTHOR
+        );
+        assert_eq!(queue_limit(20), PROVISIONAL_MESSAGES_PER_AUTHOR);
+        assert_eq!(queue_limit(u32::MAX), PROVISIONAL_MESSAGES_PER_AUTHOR);
+    }
+
+    #[test]
+    fn a_message_over_the_queue_limit_is_refused_with_the_real_number() {
+        let mut m = Machine::default();
+        let a = vk(60);
+        let lim = Limits {
+            max_message_size: 100,
+            max_queued: queue_limit(20),
+        };
+        let _ = m.send(a, "one", lim, fresh());
+        let _ = m.send(a, "two", lim, fresh());
+        let _ = m.send(a, "three", lim, fresh());
+        let notice = m.ui().notice_for(&a).expect("a notice");
+        assert!(
+            notice.contains(&format!(
+                "You can queue {PROVISIONAL_MESSAGES_PER_AUTHOR} messages"
+            )),
+            "{notice}"
+        );
+        assert_eq!(returned(&mut m, &a), "three", "the refused text goes back");
+    }
+
+    #[test]
+    fn a_queue_of_one_says_one_message_in_the_singular() {
+        let mut m = Machine::default();
+        let a = vk(61);
+        let lim = Limits {
+            max_message_size: 100,
+            max_queued: 1,
+        };
+        let _ = m.send(a, "one", lim, fresh());
+        let _ = m.send(a, "two", lim, fresh());
+        let notice = m.ui().notice_for(&a).expect("a notice");
+        assert!(
+            notice.contains("You can queue 1 message before"),
+            "{notice}"
+        );
+        assert_eq!(returned(&mut m, &a), "two");
+    }
+
+    #[test]
     fn several_messages_are_admitted_in_one_delta_and_kept() {
-        use river_core::room_state::provisional::PROVISIONAL_MESSAGES_PER_AUTHOR;
         let state = room(PrivacyMode::Public, Some(policy(2, 2)));
         let sk = SigningKey::from_bytes(&[41u8; 32]);
         let (owner_vk, entry) = solved(&state, &sk);

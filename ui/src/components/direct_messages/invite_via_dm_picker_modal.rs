@@ -228,7 +228,7 @@ pub fn InviteViaDmPickerModal() -> Element {
                 .iter()
                 .filter(|(owner_vk, _)| **owner_vk != current_room)
                 .map(|(owner_vk, room_data)| {
-                    let label = room_data.display_name();
+                    let label = room_data.display_name_for_text();
                     CandidateRoom {
                         room_vk: *owner_vk,
                         label,
