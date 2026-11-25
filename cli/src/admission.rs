@@ -414,7 +414,7 @@ fn attachment_for_status(
 }
 
 /// Open-member count a new public room starts with. Below the ceiling
-/// (`MAX_PROVISIONAL_CEILING`, 32): every extra open member adds to the cost of
+/// (`MAX_PROVISIONAL_CEILING`, 24): every extra open member adds to the cost of
 /// each message, so an owner opts in to more with `--max-provisional`.
 const DEFAULT_MAX_PROVISIONAL: u32 = 16;
 /// Provisional-ban count a new public room starts with (see
@@ -484,7 +484,7 @@ impl PolicyEdit {
             }
             // Defaults follow the design: the open-member quota is half the
             // message window, and the open-member and ban counts start at
-            // DEFAULT_MAX_PROVISIONAL (16), below their ceilings (32): a
+            // DEFAULT_MAX_PROVISIONAL (16), below their ceilings (24): a
             // higher count costs every member more per message (#982), so
             // the owner opts in to it with `--max-provisional`.
             config.public_admission = Some(PublicRoomPolicy {
@@ -794,8 +794,8 @@ mod tests {
             "the default stays 16, not the ceiling"
         );
         assert_eq!(p.max_provisional_bans, 16);
-        assert_eq!(MAX_PROVISIONAL_CEILING, 32);
-        assert_eq!(MAX_PROVISIONAL_BANS_CEILING, 32);
+        assert_eq!(MAX_PROVISIONAL_CEILING, 24);
+        assert_eq!(MAX_PROVISIONAL_BANS_CEILING, 24);
         // The ceiling is still reachable by asking for it.
         let mut hi = edit();
         hi.enable = Some(true);

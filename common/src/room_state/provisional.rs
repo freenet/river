@@ -46,32 +46,32 @@ pub const POW_DOMAIN_TAG: &[u8; 27] = b"river-room-admission-pow/v1";
 /// twice is verified once, and `update_state` takes the stored state's
 /// signatures as already validated (`sigcheck`), so only what a delta adds
 /// costs crypto. With that, the worst-case delta (every entry and ban carried,
-/// a `member_info` and a message for each new author) measures, as median of
-/// 100 wasmtime runs on a 16-core host that was loaded by other jobs (load
-/// average 9 to 16), about 55 ms at 16 and 16, 81 ms at 32 and 32 (max 84 to
-/// 136 ms depending on load), and 108 ms at 48 and 48, over the gate. A
-/// one-message delta measures about 41 ms at 16, 51 ms at 32 and 62 ms at 48.
+/// a `member_info` and a message for each new author) measures, as the median
+/// of 100 wasmtime runs on a 16-core host loaded by other jobs (load average 8
+/// to 25), about 56 ms at 16 and 16, 68 ms at 24 and 24 (p95 71 to 73 ms), and
+/// 81 ms at 32 and 32 (p95 86 to 89 ms, max up to 144 ms), so 24 is the ceiling.
+/// A one-message delta measures about 40 ms at 16, 47 ms at 24 and 51 ms at 32.
 /// The bench asserts each measured delta applies, so a skipped delta cannot
 /// pass as a fast one. Before those savings (#982) 16 and 16 measured about
 /// 130 ms worst case. Raising it again needs a measurement, not an opinion: the benchmark is
 /// `common/benches/provisional_pair.rs` (native; `BENCH_PROVISIONAL=<n>`
 /// sets the cap) and the same fixtures run under wasmtime.
-pub const MAX_PROVISIONAL_CEILING: u32 = 32;
+pub const MAX_PROVISIONAL_CEILING: u32 = 24;
 /// Largest `max_provisional_messages` a policy may set.
 pub const MAX_PROVISIONAL_MESSAGES_CEILING: u32 = 500;
 /// Largest `max_provisional_bans` a policy may set (see
 /// [`MAX_PROVISIONAL_CEILING`] for why it is this low).
-pub const MAX_PROVISIONAL_BANS_CEILING: u32 = 32;
+pub const MAX_PROVISIONAL_BANS_CEILING: u32 = 24;
 /// Largest `difficulty_bits` a policy may set.
 pub const MAX_DIFFICULTY_BITS: u8 = 32;
 /// The least number of entries or provisional bans one delta may carry: a work
-/// bound, never below the caps (the ceilings are 32). It applies to EVERY public
+/// bound, never below the caps (the ceilings are 24). It applies to EVERY public
 /// room, whatever its configured caps: a room with `max_provisional = 1` still
-/// accepts a delta carrying 32 new entries and 32 new bans, each paying its
-/// signature check before it is dropped, so raising the floor from 16 to 32
-/// doubled the per-delta worst-case work of every public room (measured as the
-/// worst-case delta in `common/benches/provisional_pair.rs`).
-pub const PROVISIONAL_DELTA_FLOOR: usize = 32;
+/// accepts a delta carrying 24 new entries and 24 new bans, each paying its
+/// signature check before it is dropped, so raising the floor from 16 to 24
+/// raised every public room's per-delta worst-case work by half (measured as
+/// the worst-case delta in `common/benches/provisional_pair.rs`).
+pub const PROVISIONAL_DELTA_FLOOR: usize = 24;
 const _: () = assert!(
     PROVISIONAL_DELTA_FLOOR >= MAX_PROVISIONAL_CEILING as usize
         && PROVISIONAL_DELTA_FLOOR >= MAX_PROVISIONAL_BANS_CEILING as usize
@@ -85,7 +85,7 @@ const _: () = assert!(
 pub struct PublicRoomPolicy {
     /// Atlas discovery opt-in; no effect on admission.
     pub listed: bool,
-    /// Provisional authors held at once, `1..=32` ([`MAX_PROVISIONAL_CEILING`]).
+    /// Provisional authors held at once, `1..=24` ([`MAX_PROVISIONAL_CEILING`]).
     ///
     /// When the pool is full a new author is not refused for being one too
     /// many: the pool is the authors of the newest provisional messages in the
@@ -97,7 +97,7 @@ pub struct PublicRoomPolicy {
     /// Window slots for provisional messages, `1..=500`. The effective quota is
     /// `min(this, max_recent_messages / 2)` ([`Self::quota`]).
     pub max_provisional_messages: u32,
-    /// Provisional ban list size, `0..=32` ([`MAX_PROVISIONAL_BANS_CEILING`]).
+    /// Provisional ban list size, `0..=24` ([`MAX_PROVISIONAL_BANS_CEILING`]).
     pub max_provisional_bans: u32,
     /// `None` admits nobody (a listed, invite-only room).
     pub pow: Option<PowPolicy>,
@@ -185,7 +185,7 @@ pub fn bans_cap(config: &Configuration) -> usize {
 }
 
 /// Most NEW entries one delta may carry in a room with `config`:
-/// `max(max_provisional, 32)`.
+/// `max(max_provisional, 24)`.
 pub fn entries_work_bound(config: &Configuration) -> usize {
     config
         .public_admission
@@ -194,7 +194,7 @@ pub fn entries_work_bound(config: &Configuration) -> usize {
         .max(PROVISIONAL_DELTA_FLOOR)
 }
 
-/// Most NEW provisional bans one delta may carry: `max(max_provisional_bans, 32)`.
+/// Most NEW provisional bans one delta may carry: `max(max_provisional_bans, 24)`.
 pub fn bans_work_bound(config: &Configuration) -> usize {
     config
         .public_admission
@@ -622,7 +622,7 @@ impl ComposableState for ProvisionalV1 {
     /// Every held entry's self-signature, every held ban signature whose
     /// issuer is known, and the counts against the state's own caps. This is
     /// the cost `validate_state` pays after every changing update, so the
-    /// ceilings are 32 each ([`MAX_PROVISIONAL_CEILING`]).
+    /// ceilings are 24 each ([`MAX_PROVISIONAL_CEILING`]).
     fn verify(
         &self,
         parent_state: &Self::ParentState,
@@ -1363,9 +1363,9 @@ mod tests {
     fn policy_values_are_absolute_ranges() {
         let ok = PublicRoomPolicy {
             listed: false,
-            max_provisional: 32,
+            max_provisional: 24,
             max_provisional_messages: 500,
-            max_provisional_bans: 32,
+            max_provisional_bans: 24,
             pow: Some(PowPolicy {
                 difficulty_bits: 32,
                 epoch: 0,
@@ -1375,7 +1375,7 @@ mod tests {
         let mut p = ok.clone();
         p.max_provisional = 0;
         assert!(p.check_values().is_err());
-        p.max_provisional = 33;
+        p.max_provisional = 25;
         assert!(p.check_values().is_err());
         let mut p = ok.clone();
         p.max_provisional_messages = 0;
@@ -1383,7 +1383,7 @@ mod tests {
         p.max_provisional_messages = 501;
         assert!(p.check_values().is_err());
         let mut p = ok.clone();
-        p.max_provisional_bans = 33;
+        p.max_provisional_bans = 25;
         assert!(p.check_values().is_err());
         p.max_provisional_bans = 0;
         assert!(p.check_values().is_ok());

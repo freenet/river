@@ -152,7 +152,7 @@ pub enum RoomCommands {
         #[arg(long)]
         admission_new_epoch: bool,
 
-        /// Most open (provisional) members the room holds at once (1 to 32)
+        /// Most open (provisional) members the room holds at once (1 to 24)
         #[arg(long)]
         max_provisional: Option<u32>,
 

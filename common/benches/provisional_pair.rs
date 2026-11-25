@@ -1,7 +1,7 @@
 //! Cost of the pair the host pays after every chat message on a room at the
 //! provisional ceilings (freenet/river#974, design section 5): `update_state`
 //! with a one-message delta, then `validate_state` of its output. The room
-//! holds the ceilings of provisional entries and bans (32 each) and a full message
+//! holds the ceilings of provisional entries and bans (24 each) and a full message
 //! window; the baseline is the same room without the provisional entries, bans
 //! and the provisional authors' messages (same members, same member and owner
 //! messages).
@@ -14,10 +14,10 @@
 //! CARGO_PROFILE_BENCH_OPT_LEVEL=3 cargo bench -p river-core --bench provisional_pair
 //! ```
 //!
-//! A second case times the adversarial worst case one delta may carry: 32 NEW
-//! provisional entries, 32 NEW provisional bans, a `member_info` record and a
+//! A second case times the adversarial worst case one delta may carry: 24 NEW
+//! provisional entries, 24 NEW provisional bans, a `member_info` record and a
 //! message for each new author, applied to the room at the ceilings (per-delta
-//! work bounds are `max(cap, 32)`). Set `BENCH_DUMP_DIR=<dir>` to also write
+//! work bounds are `max(cap, 24)`). Set `BENCH_DUMP_DIR=<dir>` to also write
 //! `params.cbor`, `state.cbor`, `delta.cbor` and `adversarial_delta.cbor` for
 //! `tools/wasm-cost-bench`, which times the same calls under wasmtime.
 //!
@@ -322,7 +322,7 @@ fn main() {
         medians[1].saturating_sub(medians[0])
     );
 
-    // Adversarial worst case: one delta with 32 new entries, 32 new bans, and a
+    // Adversarial worst case: one delta with 24 new entries, 24 new bans, and a
     // member_info record plus a message for each new author.
     {
         let (state, params, member, owner) = build(true);
