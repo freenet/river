@@ -20,7 +20,7 @@ use river_core::room_state::member_info::{AuthorizedMemberInfo, MemberInfo};
 use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
 use river_core::room_state::provisional::{
     AuthorizedProvisionalMember, ProvisionalDelta, PublicRoomPolicy, MAX_DIFFICULTY_BITS,
-    MAX_PROVISIONAL_BANS_CEILING, MAX_PROVISIONAL_CEILING, MAX_PROVISIONAL_MESSAGES_CEILING,
+    MAX_PROVISIONAL_MESSAGES_CEILING,
 };
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1};
 use serde_json::json;
@@ -413,6 +413,14 @@ fn attachment_for_status(
     }
 }
 
+/// Open-member count a new public room starts with. Below the ceiling
+/// (`MAX_PROVISIONAL_CEILING`, 32): every extra open member adds to the cost of
+/// each message, so an owner opts in to more with `--max-provisional`.
+const DEFAULT_MAX_PROVISIONAL: u32 = 16;
+/// Provisional-ban count a new public room starts with (see
+/// [`DEFAULT_MAX_PROVISIONAL`]).
+const DEFAULT_MAX_PROVISIONAL_BANS: u32 = 16;
+
 /// Apply `--public-admission` and friends to a configuration copy.
 pub struct PolicyEdit {
     pub enable: Option<bool>,
@@ -475,14 +483,16 @@ impl PolicyEdit {
                 return;
             }
             // Defaults follow the design: the open-member quota is half the
-            // message window, and the counts start at their ceilings. The
-            // owner may lower them.
+            // message window, and the open-member and ban counts start at
+            // DEFAULT_MAX_PROVISIONAL (16), below their ceilings (32): a
+            // higher count costs every member more per message (#982), so
+            // the owner opts in to it with `--max-provisional`.
             config.public_admission = Some(PublicRoomPolicy {
                 listed: false,
-                max_provisional: MAX_PROVISIONAL_CEILING,
+                max_provisional: DEFAULT_MAX_PROVISIONAL,
                 max_provisional_messages: (config.max_recent_messages as u32 / 2)
                     .clamp(1, MAX_PROVISIONAL_MESSAGES_CEILING),
-                max_provisional_bans: MAX_PROVISIONAL_BANS_CEILING,
+                max_provisional_bans: DEFAULT_MAX_PROVISIONAL_BANS,
                 // A random epoch: a fixed one would let proofs for any room be
                 // computed in advance, and would revive old proofs when
                 // admission is disabled and enabled again.
@@ -536,6 +546,9 @@ fn random_epoch() -> u32 {
 mod tests {
     use super::*;
     use river_core::room_state::configuration::Configuration;
+    use river_core::room_state::provisional::{
+        MAX_PROVISIONAL_BANS_CEILING, MAX_PROVISIONAL_CEILING,
+    };
 
     /// Whether `config` passes the room's value checks.
     fn adoptable(config: &Configuration) -> bool {
@@ -776,8 +789,26 @@ mod tests {
         e.apply(&mut c);
         let p = c.public_admission.unwrap();
         assert_eq!(p.max_provisional_messages, 50);
-        assert_eq!(p.max_provisional, MAX_PROVISIONAL_CEILING);
-        assert_eq!(p.max_provisional_bans, MAX_PROVISIONAL_BANS_CEILING);
+        assert_eq!(
+            p.max_provisional, 16,
+            "the default stays 16, not the ceiling"
+        );
+        assert_eq!(p.max_provisional_bans, 16);
+        assert_eq!(MAX_PROVISIONAL_CEILING, 32);
+        assert_eq!(MAX_PROVISIONAL_BANS_CEILING, 32);
+        // The ceiling is still reachable by asking for it.
+        let mut hi = edit();
+        hi.enable = Some(true);
+        hi.max_provisional = Some(MAX_PROVISIONAL_CEILING);
+        hi.max_provisional_bans = Some(MAX_PROVISIONAL_BANS_CEILING);
+        let mut c2 = Configuration {
+            max_recent_messages: 100,
+            ..Configuration::default()
+        };
+        hi.apply(&mut c2);
+        let p2 = c2.public_admission.unwrap();
+        assert_eq!(p2.max_provisional, MAX_PROVISIONAL_CEILING);
+        assert_eq!(p2.max_provisional_bans, MAX_PROVISIONAL_BANS_CEILING);
         // Clamped to the ceiling for a large window and to 1 for a tiny one.
         let mut big = Configuration {
             max_recent_messages: 100_000,

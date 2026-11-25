@@ -282,6 +282,11 @@ fn main() -> Result<()> {
     }
     let (warm, _) = update(&state)?; // warm up
     println!("update output byte-identical to the input state: {}", warm == state);
+    // A skipped delta (unauthorized sender, rejected entry) leaves the state
+    // unchanged and would time a no-op, so refuse to report numbers for it.
+    if !unsafe { STATE_MODE } && warm == state {
+        bail!("the delta did not change the state: it was skipped, the timing would be meaningless");
+    }
     let (mut ups, mut vals, mut cpus) = (Vec::new(), Vec::new(), Vec::new());
     let mut out_len = 0;
     for _ in 0..iterations {
@@ -301,12 +306,12 @@ fn main() -> Result<()> {
     let inst_med = pct(&mut inst, 0.5);
     let mut pairs: Vec<f64> = ups.iter().zip(vals.iter()).map(|(a, b)| a + b).collect();
     println!(
-        "wasm {} B, state {} B -> {} B, n={iterations}: update wall {:.1}/{:.1} ms  validate wall {:.1}/{:.1} ms  pair CPU {:.1}/{:.1} ms  pair wall {:.1}/{:.1} ms  (median/p99)",
+        "wasm {} B, state {} B -> {} B, n={iterations}: update wall {:.1}/{:.1}/{:.1} ms  validate wall {:.1}/{:.1}/{:.1} ms  pair CPU {:.1}/{:.1}/{:.1} ms  pair wall {:.1}/{:.1}/{:.1} ms  (median/p95/max)",
         wasm.len(), state.len(), out_len,
-        pct(&mut ups, 0.5), pct(&mut ups, 0.99),
-        pct(&mut vals, 0.5), pct(&mut vals, 0.99),
-        pct(&mut cpus, 0.5), pct(&mut cpus, 0.99),
-        pct(&mut pairs, 0.5), pct(&mut pairs, 0.99),
+        pct(&mut ups, 0.5), pct(&mut ups, 0.95), pct(&mut ups, 1.0),
+        pct(&mut vals, 0.5), pct(&mut vals, 0.95), pct(&mut vals, 1.0),
+        pct(&mut cpus, 0.5), pct(&mut cpus, 0.95), pct(&mut cpus, 1.0),
+        pct(&mut pairs, 0.5), pct(&mut pairs, 0.95), pct(&mut pairs, 1.0),
     );
     println!("  instantiate (per call, 2 per pair, included above): median {:.2} ms", inst_med);
     Ok(())

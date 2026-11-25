@@ -1,9 +1,10 @@
 //! Cost of the pair the host pays after every chat message on a room at the
 //! provisional ceilings (freenet/river#974, design section 5): `update_state`
 //! with a one-message delta, then `validate_state` of its output. The room
-//! holds the ceilings of provisional entries and bans (16 each) and a full message
-//! window; the baseline is the same room (same members, same messages) with no
-//! provisional data.
+//! holds the ceilings of provisional entries and bans (32 each) and a full message
+//! window; the baseline is the same room without the provisional entries, bans
+//! and the provisional authors' messages (same members, same member and owner
+//! messages).
 //!
 //! Plain `std::time` timing, not criterion: the committed `Cargo.lock` pins the
 //! byte-reproducible contract WASM builds, so no dependency is added for a
@@ -13,10 +14,10 @@
 //! CARGO_PROFILE_BENCH_OPT_LEVEL=3 cargo bench -p river-core --bench provisional_pair
 //! ```
 //!
-//! A second case times the adversarial worst case one delta may carry: 16 NEW
-//! provisional entries, 16 NEW provisional bans, a `member_info` record and a
+//! A second case times the adversarial worst case one delta may carry: 32 NEW
+//! provisional entries, 32 NEW provisional bans, a `member_info` record and a
 //! message for each new author, applied to the room at the ceilings (per-delta
-//! work bounds are `max(cap, 16)`). Set `BENCH_DUMP_DIR=<dir>` to also write
+//! work bounds are `max(cap, 32)`). Set `BENCH_DUMP_DIR=<dir>` to also write
 //! `params.cbor`, `state.cbor`, `delta.cbor` and `adversarial_delta.cbor` for
 //! `tools/wasm-cost-bench`, which times the same calls under wasmtime.
 //!
@@ -48,10 +49,20 @@ fn provisional() -> usize {
         .and_then(|v| v.parse().ok())
         .unwrap_or(river_core::room_state::provisional::MAX_PROVISIONAL_CEILING as usize)
 }
-/// What fills the window beside the members' three messages each and the
-/// provisional authors' one each.
+/// Messages per member. Two, so the members' messages plus one per
+/// provisional author fit the window up to a cap of 48 and cleanup never
+/// prunes the fixture's one-message sender (`members[0]`): a pruned sender
+/// makes the delta skip as unauthorized and the timing meaningless.
+const MEMBER_MESSAGES: usize = 2;
+/// What fills the window beside the members' messages and the provisional
+/// authors' one each.
 fn owner_fill() -> usize {
-    WINDOW.saturating_sub(MEMBERS as usize * 3 + provisional())
+    let used = MEMBERS as usize * MEMBER_MESSAGES + provisional();
+    assert!(
+        used <= WINDOW,
+        "fixture overflows the {WINDOW}-message window"
+    );
+    WINDOW - used
 }
 
 fn sk(n: u32) -> SigningKey {
@@ -115,12 +126,12 @@ fn build(
             .apply_delta(&parent, &params, &Some(d))
             .expect("fixture delta applies");
     };
-    // Members with three messages each, and the owner with twenty.
+    // Members with `MEMBER_MESSAGES` messages each, and the owner filling the rest.
     let members: Vec<SigningKey> = (0..MEMBERS as u32).map(sk).collect();
     let mut t = 0u64;
     let mut msgs = Vec::new();
     for k in &members {
-        for _ in 0..3 {
+        for _ in 0..MEMBER_MESSAGES {
             t += 1;
             msgs.push(msg(owner_id, k, t));
         }
@@ -152,7 +163,7 @@ fn build(
         },
     );
     if with_provisional {
-        // 16 (the ceiling) provisional authors, each with an entry and one message.
+        // `provisional()` (the ceiling) provisional authors, each with an entry and one message.
         let authors: Vec<SigningKey> = (0..provisional() as u32).map(|i| sk(500_000 + i)).collect();
         let entries: Vec<AuthorizedProvisionalMember> = authors
             .iter()
@@ -213,7 +224,7 @@ fn build(
         if with_provisional {
             WINDOW
         } else {
-            MEMBERS as usize * 3 + owner_fill()
+            MEMBERS as usize * MEMBER_MESSAGES + owner_fill()
         }
     );
     (state, params, members[0].clone(), owner)
@@ -234,9 +245,18 @@ fn pair(
     let t0 = Instant::now();
     let mut state: ChatRoomStateV1 = ciborium::de::from_reader(state_bytes).unwrap();
     let delta: ChatRoomStateV1Delta = ciborium::de::from_reader(delta_bytes).unwrap();
-    state
-        .apply_delta(&state.clone(), params, &Some(delta))
-        .unwrap();
+    let before = state.clone();
+    let sent = delta.recent_messages.clone().unwrap_or_default();
+    state.apply_delta(&before, params, &Some(delta)).unwrap();
+    // A delta that is silently skipped (unauthorized sender, pruned author)
+    // would time a no-op. Every message it carried must be in the result.
+    assert!(!sent.is_empty(), "bench deltas carry messages");
+    for m in &sent {
+        assert!(
+            state.recent_messages.messages.contains(m),
+            "the measured delta was skipped: its message is not in the result"
+        );
+    }
     let out = cbor(&state);
     let update = t0.elapsed();
     let t1 = Instant::now();
@@ -245,9 +265,11 @@ fn pair(
     (update, t1.elapsed(), out.len())
 }
 
-fn median(mut v: Vec<Duration>) -> Duration {
+/// (median, p95, max) of the samples.
+fn stats(mut v: Vec<Duration>) -> (Duration, Duration, Duration) {
     v.sort();
-    v[v.len() / 2]
+    let p95 = v[((v.len() - 1) as f64 * 0.95).round() as usize];
+    (v[v.len() / 2], p95, v[v.len() - 1])
 }
 
 fn main() {
@@ -279,24 +301,28 @@ fn main() {
             v.push(b);
             out_len = l;
         }
-        let (mu, mv) = (median(u), median(v));
+        let totals: Vec<Duration> = u.iter().zip(&v).map(|(a, b)| *a + *b).collect();
+        let (tmed, tp95, tmax) = stats(totals);
+        let (mu, mv) = (stats(u).0, stats(v).0);
         println!(
-            "{:<22} state {:>7} B  summary {:>6} B  update_state {:>8.2?}  validate_state {:>8.2?}  pair {:>8.2?}",
+            "{:<22} state {:>7} B  summary {:>6} B  update_state {:>8.2?}  validate_state {:>8.2?}  pair median {:>8.2?} p95 {:>8.2?} max {:>8.2?}",
             if with { "with provisional data" } else { "baseline (none)" },
             out_len,
             summary_bytes,
             mu,
             mv,
-            mu + mv
+            tmed,
+            tp95,
+            tmax
         );
-        medians.push(mu + mv);
+        medians.push(tmed);
     }
     println!(
         "added by provisional data: {:.2?} per message",
         medians[1].saturating_sub(medians[0])
     );
 
-    // Adversarial worst case: one delta with 16 new entries, 16 new bans, and a
+    // Adversarial worst case: one delta with 32 new entries, 32 new bans, and a
     // member_info record plus a message for each new author.
     {
         let (state, params, member, owner) = build(true);
@@ -363,15 +389,19 @@ fn main() {
             v.push(b);
             out_len = l;
         }
-        let (mu, mv) = (median(u), median(v));
+        let totals: Vec<Duration> = u.iter().zip(&v).map(|(a, b)| *a + *b).collect();
+        let (tmed, tp95, tmax) = stats(totals);
+        let (mu, mv) = (stats(u).0, stats(v).0);
         println!(
-            "{:<22} state {:>7} B  delta {:>6} B  update_state {:>8.2?}  validate_state {:>8.2?}  pair {:>8.2?}",
+            "{:<22} state {:>7} B  delta {:>6} B  update_state {:>8.2?}  validate_state {:>8.2?}  pair median {:>8.2?} p95 {:>8.2?} max {:>8.2?}",
             "adversarial delta",
             out_len,
             delta_bytes.len(),
             mu,
             mv,
-            mu + mv
+            tmed,
+            tp95,
+            tmax
         );
         if let Ok(dir) = std::env::var("BENCH_DUMP_DIR") {
             let one = ChatRoomStateV1Delta {

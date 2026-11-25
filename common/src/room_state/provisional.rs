@@ -45,12 +45,15 @@ pub const POW_DOMAIN_TAG: &[u8; 27] = b"river-room-admission-pow/v1";
 /// members) by `tools/wasm-cost-bench`. Within one call a signature checked
 /// twice is verified once, and `update_state` takes the stored state's
 /// signatures as already validated (`sigcheck`), so only what a delta adds
-/// costs crypto. With that, at 32 and 32 a one-message delta measures about
-/// 45 ms and the worst-case delta (every entry and ban carried, a
-/// `member_info` and a message for each new author) about 72 ms (p99 80 ms); at 48 and
-/// 48 the worst case is about 87 ms, too close to the gate to ship. Before
-/// those savings (#982) 16 and 16 measured about 130 ms worst case. Raising
-/// it again needs a measurement, not an opinion: the benchmark is
+/// costs crypto. With that, the worst-case delta (every entry and ban carried,
+/// a `member_info` and a message for each new author) measures, as median of
+/// 100 wasmtime runs on a 16-core host that was loaded by other jobs (load
+/// average 9 to 16), about 55 ms at 16 and 16, 81 ms at 32 and 32 (max 84 to
+/// 136 ms depending on load), and 108 ms at 48 and 48, over the gate. A
+/// one-message delta measures about 41 ms at 16, 51 ms at 32 and 62 ms at 48.
+/// The bench asserts each measured delta applies, so a skipped delta cannot
+/// pass as a fast one. Before those savings (#982) 16 and 16 measured about
+/// 130 ms worst case. Raising it again needs a measurement, not an opinion: the benchmark is
 /// `common/benches/provisional_pair.rs` (native; `BENCH_PROVISIONAL=<n>`
 /// sets the cap) and the same fixtures run under wasmtime.
 pub const MAX_PROVISIONAL_CEILING: u32 = 32;
@@ -62,7 +65,12 @@ pub const MAX_PROVISIONAL_BANS_CEILING: u32 = 32;
 /// Largest `difficulty_bits` a policy may set.
 pub const MAX_DIFFICULTY_BITS: u8 = 32;
 /// The least number of entries or provisional bans one delta may carry: a work
-/// bound, never below the caps (the ceilings are 32).
+/// bound, never below the caps (the ceilings are 32). It applies to EVERY public
+/// room, whatever its configured caps: a room with `max_provisional = 1` still
+/// accepts a delta carrying 32 new entries and 32 new bans, each paying its
+/// signature check before it is dropped, so raising the floor from 16 to 32
+/// doubled the per-delta worst-case work of every public room (measured as the
+/// worst-case delta in `common/benches/provisional_pair.rs`).
 pub const PROVISIONAL_DELTA_FLOOR: usize = 32;
 const _: () = assert!(
     PROVISIONAL_DELTA_FLOOR >= MAX_PROVISIONAL_CEILING as usize
