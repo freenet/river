@@ -947,8 +947,8 @@ pub fn readmit_note(
 ) -> String {
     match check_admission_status(state, owner_vk, member_vk, entry, now) {
         Ok(_) if entry.is_some() => {
-            "The room has a limited number of places for newcomers, and newer \
-            arrivals took yours. Your next message rejoins."
+            "The room keeps a limited number of newcomers and their recent messages, \
+            and newer activity pushed yours out. Your next message rejoins."
                 .to_string()
         }
         // The proof held no longer passes because the room asks for more bits.
@@ -957,10 +957,12 @@ pub fn readmit_note(
             Your next message rejoins after a short proof of work."
                 .to_string()
         }
-        Ok(_) | Err(JoinFailure::PolicyChanged) => "The room has a limited number of places \
-            for newcomers, and newer arrivals took yours. \
+        Ok(_) | Err(JoinFailure::PolicyChanged) => {
+            "The room keeps a limited number of newcomers and their recent messages, \
+            and newer activity pushed yours out. \
             Your next message rejoins after a short proof of work."
-            .to_string(),
+                .to_string()
+        }
         Err(f) => f.message(),
     }
 }
@@ -1976,7 +1978,7 @@ mod tests {
     #[test]
     fn a_newcomer_ban_built_by_the_menu_is_kept_by_the_rooms_own_apply() {
         use crate::components::conversation::newcomer_ban::{
-            build_ban, can_ban_newcomer, outcome, BanOutcome,
+            ban_refusal, build_ban, outcome, BanOutcome,
         };
         use river_core::room_state::provisional::ProvisionalDelta;
         use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
@@ -1995,7 +1997,7 @@ mod tests {
         .unwrap();
         let mut after = sub.state_after;
         let target = MemberId::from(&sk.verifying_key());
-        assert!(can_ban_newcomer(&after, &owner_vk, Some(&owner_vk), target));
+        assert!(ban_refusal(&after, &owner_vk, Some(&owner_vk), target).is_none());
         let ban = build_ban(&owner_vk, &owner(), target, SystemTime::now());
         let before = after.clone();
         after
@@ -2011,9 +2013,12 @@ mod tests {
                 }),
             )
             .expect("the room accepts the ban");
-        assert_eq!(outcome(&after, &ban), BanOutcome::Stands);
+        assert_eq!(
+            outcome(&before.provisional.bans, &after, &ban),
+            BanOutcome::Stands
+        );
         assert!(
-            !can_ban_newcomer(&after, &owner_vk, Some(&owner_vk), target),
+            ban_refusal(&after, &owner_vk, Some(&owner_vk), target).is_some(),
             "not offered again"
         );
     }
@@ -2039,8 +2044,8 @@ mod tests {
         assert!(note.contains("Your next message rejoins."), "{note}");
         assert!(
             note.contains(
-                "The room has a limited number of places for newcomers, \
-                 and newer arrivals took yours."
+                "The room keeps a limited number of newcomers and their recent messages, \
+                 and newer activity pushed yours out."
             ),
             "{note}"
         );
@@ -2100,8 +2105,8 @@ mod tests {
             // took the limited newcomer places, not that they were quiet.
             assert!(
                 other.contains(
-                    "The room has a limited number of places for newcomers, \
-                     and newer arrivals took yours."
+                    "The room keeps a limited number of newcomers and their recent messages, \
+                     and newer activity pushed yours out."
                 ),
                 "{other}"
             );

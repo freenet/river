@@ -8,7 +8,7 @@
 //! Who may issue the ban is decided by the contract, in `provisional_step`
 //! (P1, `common/src/room_state/provisional.rs`): the owner signs with the
 //! owner key, and an owner deputy signs with the key of its member record.
-//! [`can_ban_newcomer`] mirrors that rule to decide what to offer, and
+//! [`BanContext`] mirrors that rule to decide what to offer, and
 //! [`ban_verifies`] calls the contract's own signature check on the ban that
 //! was built, so the two cannot drift unnoticed.
 
@@ -44,61 +44,97 @@ pub(crate) fn request_ban(room: VerifyingKey, target: MemberId, name: String) {
     });
 }
 
-/// Whether `issuer_vk` is a key the contract accepts as a provisional-ban
-/// issuer in `state`: the owner's key, or the key of an owner deputy's member
-/// record.
-pub(crate) fn is_ban_issuer(
-    state: &ChatRoomStateV1,
-    owner_vk: &VerifyingKey,
-    issuer_vk: &VerifyingKey,
-) -> bool {
-    let owner_id = MemberId::from(owner_vk);
-    let issuer_id = MemberId::from(issuer_vk);
-    if issuer_id == owner_id {
-        return issuer_vk == owner_vk;
-    }
-    state
-        .members
-        .members_by_member_id()
-        .get(&issuer_id)
-        .is_some_and(|record| {
-            record.member.member_vk == *issuer_vk
-                && state.member_info.deputies_of(owner_id).contains(&issuer_id)
-        })
+/// Why the menu does not offer "Ban newcomer" (shown when the action runs).
+pub(crate) const NOT_ISSUER: &str = "Only the room owner or an owner deputy can ban a newcomer.";
+const NOT_A_NEWCOMER: &str = "That author is not a newcomer.";
+const ALREADY_BANNED: &str = "That newcomer is already banned.";
+const NOT_YOU: &str = "You cannot ban yourself or the owner.";
+
+/// What the menu needs to decide, per author, whether to offer the ban. Built
+/// once per room update, so the member map is not rebuilt for every message
+/// group. Absent for a reader who may not issue the ban.
+pub(crate) struct BanContext {
+    reader: MemberId,
+    owner: MemberId,
+    members: std::collections::HashSet<MemberId>,
+    newcomers: std::collections::HashSet<MemberId>,
+    banned: std::collections::HashSet<MemberId>,
 }
 
-/// Whether the menu offers "Ban newcomer" on a message by `author`: the
-/// reader may issue the ban, and the author is a provisional member (an entry,
-/// no member record) who is not the reader, the owner, or already banned.
-pub(crate) fn can_ban_newcomer(
+impl BanContext {
+    /// `Err` with the reason when `reader_vk` is not a key the contract
+    /// accepts as a provisional-ban issuer: the owner's key, or the key of an
+    /// owner deputy's member record.
+    pub(crate) fn new(
+        state: &ChatRoomStateV1,
+        owner_vk: &VerifyingKey,
+        reader_vk: Option<&VerifyingKey>,
+    ) -> Result<Self, &'static str> {
+        let reader_vk = reader_vk.ok_or(NOT_ISSUER)?;
+        let owner = MemberId::from(owner_vk);
+        let reader = MemberId::from(reader_vk);
+        let by_id = state.members.members_by_member_id();
+        let issuer = if reader == owner {
+            reader_vk == owner_vk
+        } else {
+            by_id.get(&reader).is_some_and(|record| {
+                record.member.member_vk == *reader_vk
+                    && state.member_info.deputies_of(owner).contains(&reader)
+            })
+        };
+        if !issuer {
+            return Err(NOT_ISSUER);
+        }
+        Ok(Self {
+            reader,
+            owner,
+            members: by_id.keys().copied().collect(),
+            newcomers: state
+                .provisional
+                .entries
+                .iter()
+                .map(|e| MemberId::from(&e.provisional.member_vk))
+                .collect(),
+            banned: state
+                .provisional
+                .bans
+                .iter()
+                .map(|b| b.ban.target)
+                .collect(),
+        })
+    }
+
+    /// Why `author` cannot be banned, or `None` when the ban is offered: a
+    /// provisional member (an entry, no member record) who is not the reader,
+    /// the owner, or already banned.
+    pub(crate) fn refusal(&self, author: MemberId) -> Option<&'static str> {
+        if author == self.reader || author == self.owner {
+            Some(NOT_YOU)
+        } else if self.members.contains(&author) || !self.newcomers.contains(&author) {
+            Some(NOT_A_NEWCOMER)
+        } else if self.banned.contains(&author) {
+            Some(ALREADY_BANNED)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn can_ban(&self, author: MemberId) -> bool {
+        self.refusal(author).is_none()
+    }
+}
+
+/// The reason the menu does not offer the ban on `author`, or `None`.
+pub(crate) fn ban_refusal(
     state: &ChatRoomStateV1,
     owner_vk: &VerifyingKey,
     reader_vk: Option<&VerifyingKey>,
     author: MemberId,
-) -> bool {
-    let Some(reader_vk) = reader_vk else {
-        return false;
-    };
-    if !is_ban_issuer(state, owner_vk, reader_vk)
-        || author == MemberId::from(reader_vk)
-        || author == MemberId::from(owner_vk)
-    {
-        return false;
+) -> Option<&'static str> {
+    match BanContext::new(state, owner_vk, reader_vk) {
+        Ok(ctx) => ctx.refusal(author),
+        Err(why) => Some(why),
     }
-    if state.members.members_by_member_id().contains_key(&author) {
-        return false;
-    }
-    let is_provisional = state
-        .provisional
-        .entries
-        .iter()
-        .any(|e| MemberId::from(&e.provisional.member_vk) == author);
-    let already_banned = state
-        .provisional
-        .bans
-        .iter()
-        .any(|b| b.ban.target == author);
-    is_provisional && !already_banned
 }
 
 /// The signed ban of `target` by the holder of `signing_key`.
@@ -130,27 +166,52 @@ pub(crate) fn ban_verifies(
 }
 
 /// What happened to a ban once it was applied.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum BanOutcome {
-    /// The merged state holds the ban.
+    /// The merged state holds the ban and every ban held before it.
     Stands,
+    /// The merged state holds the ban, but the ban cap pushed out the bans of
+    /// these newcomers, who are no longer banned.
+    StandsDroppingOthers(Vec<MemberId>),
     /// The merged state does not hold it (for example, cut by the ban cap).
     NotKept,
 }
 
-/// Whether `ban` is in the merged `state`.
-pub(crate) fn outcome(state: &ChatRoomStateV1, ban: &AuthorizedProvisionalBan) -> BanOutcome {
-    if state.provisional.bans.iter().any(|b| b.ban == ban.ban) {
+/// Compare the bans held `before` with those in the merged `state`.
+pub(crate) fn outcome(
+    before: &[AuthorizedProvisionalBan],
+    state: &ChatRoomStateV1,
+    ban: &AuthorizedProvisionalBan,
+) -> BanOutcome {
+    let held = |b: &AuthorizedProvisionalBan| state.provisional.bans.iter().any(|x| x.ban == b.ban);
+    if !held(ban) {
+        return BanOutcome::NotKept;
+    }
+    let mut dropped: Vec<MemberId> = before
+        .iter()
+        .filter(|b| !held(b))
+        .map(|b| b.ban.target)
+        .collect();
+    dropped.sort();
+    dropped.dedup();
+    if dropped.is_empty() {
         BanOutcome::Stands
     } else {
-        BanOutcome::NotKept
+        BanOutcome::StandsDroppingOthers(dropped)
     }
 }
 
 /// The text shown for each outcome.
-pub(crate) fn outcome_message(name: &str, outcome: BanOutcome) -> String {
+pub(crate) fn outcome_message(name: &str, outcome: &BanOutcome) -> String {
     match outcome {
         BanOutcome::Stands => format!("Banned newcomer {name}."),
+        BanOutcome::StandsDroppingOthers(dropped) => {
+            let ids: Vec<String> = dropped.iter().map(|d| d.to_string()).collect();
+            format!(
+                "Banned {name}; the newcomer ban list is full, so the ban on {} was dropped.",
+                ids.join(", ")
+            )
+        }
         BanOutcome::NotKept => format!(
             "The ban of {name} was not kept. The room holds a limited number of newcomer \
              bans, and this one was not among them."
@@ -158,28 +219,37 @@ pub(crate) fn outcome_message(name: &str, outcome: BanOutcome) -> String {
     }
 }
 
+static IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Sign and apply the ban, tell the user what came of it, and sync it.
+/// One ban is in flight at a time: a second confirm while one runs does nothing.
 fn execute(pending: PendingNewcomerBan) {
+    use std::sync::atomic::Ordering;
+    if IN_FLIGHT.swap(true, Ordering::SeqCst) {
+        return;
+    }
     let PendingNewcomerBan { room, target, name } = pending;
     crate::util::defer(move || {
-        let mut result: Option<BanOutcome> = None;
+        let mut result: Result<BanOutcome, String> = Err("That room is no longer open.".into());
         ROOMS.with_mut(|rooms| {
             let Some(room_data) = rooms.map.get_mut(&room) else {
                 return;
             };
             let Some(sk) = room_data.signing_key().cloned() else {
                 warn!("Cannot ban newcomer: no local signing key for this room");
+                result = Err("This device has no signing key for the room.".into());
                 return;
             };
             // The action boundary, as `BanButton` has: the menu hides the
             // item, but this function trusts its arguments, so it checks again.
-            if !can_ban_newcomer(
+            if let Some(why) = ban_refusal(
                 &room_data.room_state,
                 &room,
                 Some(&sk.verifying_key()),
                 target,
             ) {
-                warn!("Refusing a newcomer ban the room would not accept");
+                warn!("Refusing a newcomer ban: {why}");
+                result = Err(why.to_string());
                 return;
             }
             let ban = build_ban(&room, &sk, target, crate::util::get_current_system_time());
@@ -197,21 +267,26 @@ fn execute(pending: PendingNewcomerBan) {
                 &Some(delta),
             ) {
                 Ok(()) => {
-                    result = Some(outcome(&room_data.room_state, &ban));
-                    info!("Applied newcomer ban for {:?}: {:?}", target, result);
+                    let o = outcome(&before.provisional.bans, &room_data.room_state, &ban);
+                    info!("Applied newcomer ban for {:?}: {:?}", target, o);
+                    result = Ok(o);
                 }
-                Err(e) => error!("Failed to apply newcomer ban: {:?}", e),
+                Err(e) => {
+                    error!("Failed to apply newcomer ban: {:?}", e);
+                    result = Err("The room did not accept the ban.".into());
+                }
             }
         });
         match result {
-            Some(o) => {
-                show_toast(outcome_message(&name, o), None);
-                if o == BanOutcome::Stands {
+            Ok(o) => {
+                show_toast(outcome_message(&name, &o), None);
+                if o != BanOutcome::NotKept {
                     mark_needs_sync(room);
                 }
             }
-            None => show_toast(format!("Could not ban {name}."), None),
+            Err(why) => show_toast(format!("Could not ban {name}. {why}"), None),
         }
+        IN_FLIGHT.store(false, Ordering::SeqCst);
     });
 }
 
@@ -237,7 +312,7 @@ pub(crate) fn NewcomerBanDialog() -> Element {
                 p { class: "text-text-muted text-[13px] mb-4",
                     "Ban "
                     span { class: "font-semibold", "{name}" }
-                    " from this room? They are removed from the room and cannot rejoin with this key."
+                    " from this room? While the ban is held, this key is blocked from the room. The room keeps a limited number of newcomer bans, so an old ban can be dropped later."
                 }
                 div { class: "flex gap-3 justify-end",
                     button {
@@ -330,12 +405,13 @@ mod tests {
     }
 
     fn can(s: &ChatRoomStateV1, reader: u8, author: u8) -> bool {
-        can_ban_newcomer(
+        ban_refusal(
             s,
             &key(1).verifying_key(),
             Some(&key(reader).verifying_key()),
             id(author),
         )
+        .is_none()
     }
 
     #[test]
@@ -350,7 +426,7 @@ mod tests {
         let s = state();
         assert!(!can(&s, 3, 5), "ordinary member");
         assert!(!can(&s, 5, 5), "a newcomer");
-        assert!(!can_ban_newcomer(&s, &key(1).verifying_key(), None, id(5)));
+        assert!(ban_refusal(&s, &key(1).verifying_key(), None, id(5)).is_some());
     }
 
     #[test]
@@ -373,16 +449,12 @@ mod tests {
     #[test]
     fn a_key_that_is_not_the_owner_or_a_deputy_record_is_not_an_issuer() {
         let s = state();
-        assert!(!is_ban_issuer(
-            &s,
-            &key(1).verifying_key(),
-            &key(7).verifying_key()
-        ));
-        assert!(!is_ban_issuer(
-            &s,
-            &key(1).verifying_key(),
-            &key(3).verifying_key()
-        ));
+        assert!(
+            BanContext::new(&s, &key(1).verifying_key(), Some(&key(7).verifying_key())).is_err()
+        );
+        assert!(
+            BanContext::new(&s, &key(1).verifying_key(), Some(&key(3).verifying_key())).is_err()
+        );
     }
 
     #[test]
@@ -404,10 +476,56 @@ mod tests {
     fn outcome_says_whether_the_merged_state_holds_the_ban() {
         let mut s = state();
         let ban = build_ban(&key(1).verifying_key(), &key(1), id(5), SystemTime::now());
-        assert_eq!(outcome(&s, &ban), BanOutcome::NotKept);
+        assert_eq!(outcome(&[], &s, &ban), BanOutcome::NotKept);
         s.provisional.bans.push(ban.clone());
-        assert_eq!(outcome(&s, &ban), BanOutcome::Stands);
-        assert!(outcome_message("N", BanOutcome::NotKept).contains("not kept"));
-        assert!(!outcome_message("N", BanOutcome::Stands).contains("not kept"));
+        assert_eq!(outcome(&[], &s, &ban), BanOutcome::Stands);
+        assert_eq!(
+            outcome(std::slice::from_ref(&ban), &s, &ban),
+            BanOutcome::Stands
+        );
+        assert!(outcome_message("N", &BanOutcome::NotKept).contains("not kept"));
+        assert!(!outcome_message("N", &BanOutcome::Stands).contains("not kept"));
+    }
+
+    #[test]
+    fn a_new_ban_that_pushes_an_older_one_out_says_so() {
+        let owner_vk = key(1).verifying_key();
+        let old = build_ban(&owner_vk, &key(2), id(6), SystemTime::now());
+        let new = build_ban(&owner_vk, &key(1), id(5), SystemTime::now());
+        let mut s = state();
+        // After the apply the cap kept the new ban and dropped the old one.
+        s.provisional.bans.push(new.clone());
+        let o = outcome(&[old], &s, &new);
+        assert_eq!(o, BanOutcome::StandsDroppingOthers(vec![id(6)]));
+        let msg = outcome_message("N", &o);
+        assert!(msg.contains("list is full"), "{msg}");
+        assert!(msg.contains(&id(6).to_string()), "{msg}");
+    }
+
+    #[test]
+    fn the_refusal_names_why() {
+        let s = state();
+        let owner = key(1).verifying_key();
+        let why = |reader: u8, author: u8| {
+            ban_refusal(&s, &owner, Some(&key(reader).verifying_key()), id(author))
+        };
+        assert_eq!(why(3, 5), Some(NOT_ISSUER));
+        assert_eq!(why(1, 4), Some(NOT_A_NEWCOMER));
+        assert_eq!(why(2, 2), Some(NOT_YOU));
+    }
+
+    /// The desktop footer, the mobile sheet and the sheet's action all read
+    /// the one flag the conversation computes per group.
+    #[test]
+    fn both_menus_use_the_same_condition() {
+        let src = include_str!("../conversation.rs");
+        assert!(src.contains("group.can_ban_newcomer = ctx.can_ban(group.author_id)"));
+        assert!(src.contains("let can_ban_newcomer = group.can_ban_newcomer;"));
+        assert!(src.contains("if can_ban_newcomer {"), "desktop footer");
+        assert!(
+            src.contains("                            can_ban_newcomer,\n"),
+            "sheet target"
+        );
+        assert!(src.contains("MobileAction::BanNewcomer if group.can_ban_newcomer"));
     }
 }

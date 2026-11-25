@@ -1887,17 +1887,16 @@ pub fn Conversation() -> Element {
                         fallback_now: Utc::now(),
                     },
                 );
-                // Which authors the reader may ban as newcomers.
-                {
-                    let reader_vk = room_data.self_verifying_key();
+                // Which authors the reader may ban as newcomers. One context
+                // per pass; a reader who may not ban builds nothing per group.
+                if let Ok(ctx) = newcomer_ban::BanContext::new(
+                    room_state,
+                    &key,
+                    room_data.self_verifying_key().as_ref(),
+                ) {
                     for item in groups.iter_mut() {
                         if let DisplayItem::Messages(group) = item {
-                            group.can_ban_newcomer = newcomer_ban::can_ban_newcomer(
-                                room_state,
-                                &key,
-                                reader_vk.as_ref(),
-                                group.author_id,
-                            );
+                            group.can_ban_newcomer = ctx.can_ban(group.author_id);
                         }
                     }
                 }
