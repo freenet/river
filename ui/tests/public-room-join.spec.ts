@@ -175,7 +175,9 @@ test("the name prompt is a labelled dialog that keeps focus, and its buttons are
   await expect(modal).toHaveAttribute("role", "dialog");
   await expect(modal).toHaveAttribute("aria-modal", "true");
   const labelled = await modal.getAttribute("aria-labelledby");
-  await expect(page.locator(`#${labelled}`)).toContainText("display name");
+  await expect(page.locator(`#${labelled}`)).toContainText("Pick a name to show next to your message");
+  await expect(page.locator(`#${await modal.getAttribute("aria-describedby")}`)).toContainText("ready and will send as soon as you continue");
+  await expect(modal).not.toContainText(/proof|bot|bits|hash/i);
   // The label is tied to the input, and the input has focus.
   await expect(page.getByLabel("Your display name")).toBeFocused();
   // Tab stays inside the dialog.
@@ -258,6 +260,30 @@ test("the display name chosen at the first message is the one posted", async ({ 
   await sendFirst(page, "Quinn");
   await expect(page.getByTestId("viewed-room")).toHaveCount(0, { timeout: 30_000 });
   expect(await callRiverTest(page, "currentRoomSelfNickname")).toBe("Quinn");
+  expect(panics).toEqual([]);
+});
+
+test("while the solve is pending the queued message shows the delay, progress, keep-open hint and Cancel, then posts and they go", async ({ page }) => {
+  const panics = panicsOf(page);
+  await openRoom(page, "open");
+  await callRiverTest(page, "holdSolver", true);
+  await page.getByTestId("viewed-room-composer").fill("Held message");
+  await sendFirst(page);
+  const notice = page.getByTestId("viewed-room-sending-notice");
+  await expect(notice).toContainText("Sending in a moment");
+  await expect(notice).toContainText("A short delay that helps keep the room free of spam.");
+  const progress = page.getByTestId("viewed-room-join-progress");
+  await expect(progress).toBeVisible();
+  await expect(progress).toContainText(/\d+% done/);
+  await expect(progress).toContainText("Keep this tab open: a phone may pause a hidden tab.");
+  await expect(progress).not.toContainText(/proof|bot|bits|hash/i);
+  await expect(page.getByTestId("viewed-room-join-cancel")).toBeVisible();
+
+  await callRiverTest(page, "holdSolver", false);
+  await expect(page.getByTestId("viewed-room")).toHaveCount(0, { timeout: 30_000 });
+  expect(await callRiverTest(page, "roomMessageCount", "Held message")).toBe(1);
+  await expect(notice).toHaveCount(0);
+  await expect(progress).toHaveCount(0);
   expect(panics).toEqual([]);
 });
 

@@ -680,7 +680,8 @@ fn NicknamePrompt(default: String, on_done: EventHandler<NameAnswer>) -> Element
                 "data-testid": "viewed-room-nickname-modal",
                 role: "dialog",
                 "aria-modal": "true",
-                "aria-labelledby": "viewed-room-nickname-text",
+                "aria-labelledby": "viewed-room-nickname-title",
+                "aria-describedby": "viewed-room-nickname-text",
                 class: "relative z-10 w-full max-w-md m-auto bg-panel rounded-xl shadow-xl border border-border",
                 // Escape cancels (nothing is sent), wherever focus is; Tab stays
                 // inside the dialog.
@@ -712,12 +713,15 @@ fn NicknamePrompt(default: String, on_done: EventHandler<NameAnswer>) -> Element
                     }
                 },
                 div { class: "p-6",
+                    h2 {
+                        id: "viewed-room-nickname-title",
+                        class: "text-base font-semibold text-text mb-1",
+                        "Pick a name to show next to your message"
+                    }
                     p {
                         id: "viewed-room-nickname-text",
                         class: "text-[13px] text-text-muted mb-4",
-                        "Choose "
-                        span { class: "text-text font-medium", "your own display name" }
-                        " (not the room's name). It's what other members will see when you send messages:"
+                        "Your message is ready and will send as soon as you continue."
                     }
                     div { class: "mb-4",
                         label {
@@ -755,7 +759,7 @@ fn NicknamePrompt(default: String, on_done: EventHandler<NameAnswer>) -> Element
                             }
                         }
                         p { class: "mt-2 text-xs text-text-muted",
-                            "Enter or Continue sends your message with this name. Escape cancels and keeps your message in the box."
+                            "Enter or Continue sends it. Escape cancels and keeps your message in the box."
                         }
                     }
                     div { class: "flex gap-3",
