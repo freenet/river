@@ -1348,10 +1348,10 @@ pub async fn handle_get_response(
                 });
             } else {
                 // Normal refresh — already subscribed, just update sync info
+                // Also requests a sync pass for a change held back while the room
+                // was subscribing (the first message of a fresh join).
                 crate::util::defer(move || {
-                    SYNC_INFO.with_mut(|sync_info| {
-                        sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
-                    });
+                    crate::components::app::sync_info::mark_room_subscribed(owner_vk);
                 });
             }
         }
@@ -1373,8 +1373,8 @@ pub async fn handle_get_response(
 fn complete_subscribe_get(owner_vk: ed25519_dalek::VerifyingKey, network_state: ChatRoomStateV1) {
     SYNC_INFO.with_mut(|sync_info| {
         sync_info.update_last_synced_state(&owner_vk, &network_state);
-        sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
     });
+    crate::components::app::sync_info::mark_room_subscribed(owner_vk);
     let local_ahead = match ROOMS.try_read() {
         Ok(rooms) => rooms
             .map
@@ -2873,12 +2873,12 @@ mod tests {
             .find("update_last_synced_state(&owner_vk,&network_state)")
             .expect("the network state must become the sync baseline");
         let subscribed = complete
-            .find("RoomSyncStatus::Subscribed")
+            .find("crate::components::app::sync_info::mark_room_subscribed(owner_vk);")
             .expect("the room must become Subscribed");
         let push = complete
             .find("mark_needs_sync(owner_vk)")
             .expect("local-only state must be pushed");
-        assert!(baseline < push && subscribed < push);
+        assert!(baseline < subscribed && subscribed < push);
 
         let handler = strip(include_str!("../response_handler.rs"));
         assert!(

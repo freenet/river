@@ -100,6 +100,21 @@ pub struct RoomSyncInfo {
     /// `NotFound`, an error, or nothing in time — so the next attempt must
     /// re-seed with a full PUT. Cleared once the room reaches `Subscribed`.
     pub needs_seed_put: bool,
+    /// A sync pass skipped this room's unsent local change because the room
+    /// was not yet `Subscribed`. Nothing else re-runs the pass when the
+    /// status flips, so [`SyncInfo::mark_subscribed`] reports it and
+    /// [`mark_room_subscribed`] requests one. Without it a message posted
+    /// between an invitation's PUT and its PutResponse waited for an
+    /// unrelated later pass, which a fresh profile (no rooms loaded, so no
+    /// post-load check) never got.
+    ///
+    /// Cleared only when the change is sent ([`SyncInfo::state_updated`]) or
+    /// a pass on the subscribed room finds nothing to send, never when a pass
+    /// is merely requested: a requested pass can do nothing (`ROOMS`
+    /// unreadable, no web API), and the next `Subscribed` report must ask
+    /// again. An extra request costs nothing, since a pass compares against
+    /// the last synced state.
+    pub update_held: bool,
 }
 
 impl SyncInfo {
@@ -129,6 +144,7 @@ impl SyncInfo {
                 failed_sync_attempts: 0,
                 subscribe_get_in_flight: false,
                 needs_seed_put: false,
+                update_held: false,
             });
 
             self.instances.insert(*contract_id, owner_key);
@@ -166,6 +182,51 @@ impl SyncInfo {
                 self.known_on_network.insert(*owner_key);
             }
             sync_info.sync_status = status;
+        }
+    }
+
+    /// Mark the room `Subscribed`. Returns whether a local change skipped
+    /// while it was not subscribed is still unsent, in which case the caller
+    /// must request a pass ([`mark_room_subscribed`] does). Does not clear the
+    /// record; see [`RoomSyncInfo::update_held`].
+    pub fn mark_subscribed(&mut self, owner_key: &VerifyingKey) -> bool {
+        self.update_sync_status(owner_key, RoomSyncStatus::Subscribed);
+        self.map.get(owner_key).is_some_and(|info| info.update_held)
+    }
+
+    /// Whether `room_state` must be sent for `key` in this pass: the room is
+    /// `Subscribed` and its state differs from what was last synced. A change
+    /// skipped because the room is not subscribed yet is recorded for
+    /// [`SyncInfo::mark_subscribed`]. Registers an unknown room.
+    pub fn room_needs_update(&mut self, key: &VerifyingKey, room_state: &ChatRoomStateV1) -> bool {
+        if !self.map.contains_key(key) {
+            info!("Registering new room: {:?}", key);
+            self.register_new_room(*key);
+        }
+        let Some(sync_info) = self.map.get_mut(key) else {
+            return false;
+        };
+        let states_match = sync_info.last_synced_state.as_ref() == Some(room_state);
+        if sync_info.sync_status == RoomSyncStatus::Subscribed {
+            if states_match {
+                // Nothing left to send, held or not.
+                sync_info.update_held = false;
+                debug!(
+                    "Room {:?} doesn't need update - state unchanged",
+                    MemberId::from(*key)
+                );
+            }
+            !states_match
+        } else {
+            if !states_match {
+                sync_info.update_held = true;
+            }
+            debug!(
+                "Room {:?} doesn't need update - not subscribed (status: {:?})",
+                MemberId::from(*key),
+                sync_info.sync_status
+            );
+            false
         }
     }
 
@@ -514,63 +575,17 @@ impl SyncInfo {
         );
 
         for (key, room_data) in rooms.map.iter() {
-            // Register new rooms automatically
-            if !self.map.contains_key(key) {
-                info!("Registering new room: {:?}", key);
-                self.register_new_room(*key);
-            }
-
-            let sync_info = self.map.get(key).unwrap();
-            let sync_status = &sync_info.sync_status;
-            let has_last_synced = sync_info.last_synced_state.is_some();
-            let states_match = sync_info.last_synced_state.as_ref() == Some(&room_data.room_state);
-
-            debug!(
-                "Room {:?} - sync status: {:?}, has last synced: {}, states match: {}",
-                MemberId::from(key),
-                sync_status,
-                has_last_synced,
-                states_match
-            );
-
-            if let Some(last_state) = &sync_info.last_synced_state {
-                debug!(
-                    "Room {:?} - last synced: {} members/{} member_info, current: {} members/{} member_info",
-                    MemberId::from(key),
-                    last_state.members.members.len(),
-                    last_state.member_info.member_info.len(),
-                    room_data.room_state.members.members.len(),
-                    room_data.room_state.member_info.member_info.len(),
+            if self.room_needs_update(key, &room_data.room_state) {
+                info!(
+                    "Room {:?} needs update - state has changed",
+                    MemberId::from(key)
                 );
-            }
-
-            // Add room to update list if it's subscribed and the state has changed
-            if *sync_status == RoomSyncStatus::Subscribed {
-                if !states_match {
-                    info!(
-                        "Room {:?} needs update - state has changed",
-                        MemberId::from(key)
-                    );
-                    rooms_needing_update.insert(
-                        *key,
-                        (
-                            room_data.room_state.clone(),
-                            sync_info.last_synced_state.clone(),
-                        ),
-                    );
-                    // Don't update the last synced state here - it will be updated after successful network send
-                } else {
-                    debug!(
-                        "Room {:?} doesn't need update - state unchanged",
-                        MemberId::from(key)
-                    );
-                }
-            } else {
-                debug!(
-                    "Room {:?} doesn't need update - not subscribed (status: {:?})",
-                    MemberId::from(key),
-                    sync_status
-                );
+                // The last synced state is updated after a successful send.
+                let last_synced = self
+                    .map
+                    .get(key)
+                    .and_then(|info| info.last_synced_state.clone());
+                rooms_needing_update.insert(*key, (room_data.room_state.clone(), last_synced));
             }
         }
 
@@ -582,6 +597,8 @@ impl SyncInfo {
     pub fn state_updated(&mut self, owner_key: &VerifyingKey, new_state: ChatRoomStateV1) {
         if let Some(sync_info) = self.map.get_mut(owner_key) {
             sync_info.last_synced_state = Some(new_state);
+            // The held change, if any, has been sent.
+            sync_info.update_held = false;
         }
     }
 }
@@ -595,6 +612,39 @@ pub enum RoomSyncStatus {
     Subscribed,
 
     Error(ErrorReport),
+}
+
+/// Mark `owner_vk`'s room `Subscribed`, and request a sync pass if one skipped
+/// a local change while the room was still subscribing (a message posted
+/// between an invitation's PUT and its PutResponse). Call from a deferred
+/// context. The pass sends nothing if the change already went out:
+/// `needs_to_send_update` compares against the last synced state.
+pub(crate) fn mark_room_subscribed(owner_vk: VerifyingKey) {
+    let mut requested = None;
+    SYNC_INFO.with_mut(|sync_info| {
+        subscribe_and_request_held_pass(sync_info, owner_vk, |vk| requested = Some(vk));
+    });
+    // Outside the SYNC_INFO borrow; `mark_needs_sync` defers its own write.
+    if let Some(vk) = requested {
+        crate::components::app::mark_needs_sync(vk);
+    }
+}
+
+/// The decision behind [`mark_room_subscribed`], with the pass request passed
+/// in so it is tested without the Dioxus runtime: mark the room `Subscribed`
+/// and call `request_pass` once if a held change is still unsent.
+pub(crate) fn subscribe_and_request_held_pass(
+    sync_info: &mut SyncInfo,
+    owner_vk: VerifyingKey,
+    request_pass: impl FnOnce(VerifyingKey),
+) {
+    if sync_info.mark_subscribed(&owner_vk) {
+        info!(
+            "Room {:?} is subscribed with a local change held back; requesting a sync pass",
+            MemberId::from(owner_vk)
+        );
+        request_pass(owner_vk);
+    }
 }
 
 #[cfg(test)]
@@ -639,6 +689,203 @@ mod tests {
             Some(&RoomSyncStatus::Disconnected)
         );
         assert!(!info.has_syncing_rooms(&[live]));
+    }
+
+    /// A fresh profile's first message: posted while the joined room is still
+    /// `Subscribing` (the invitation PUT is sent, its PutResponse is not back),
+    /// the sync pass skips it. When the room becomes `Subscribed` a pass must
+    /// be requested, it must send the change, and it must send it once.
+    #[test]
+    fn a_change_held_while_subscribing_is_sent_once_the_room_is_subscribed() {
+        let mut si = SyncInfo::new();
+        let room = test_owner(40);
+        si.register_new_room(room);
+        si.update_sync_status(&room, RoomSyncStatus::Subscribing);
+        let joined = ChatRoomStateV1::default();
+        si.update_last_synced_state(&room, &joined);
+
+        let mut with_message = joined.clone();
+        with_message.configuration.configuration.max_recent_messages += 1;
+
+        // The pass the message triggers runs before the PutResponse.
+        assert!(!si.room_needs_update(&room, &with_message));
+
+        // PutResponse: the room is subscribed, and a pass is requested.
+        assert!(
+            si.mark_subscribed(&room),
+            "a change held back while subscribing must request a sync pass"
+        );
+        assert_eq!(si.get_sync_status(&room), Some(&RoomSyncStatus::Subscribed));
+
+        // That pass sends the change.
+        assert!(si.room_needs_update(&room, &with_message));
+        si.state_updated(&room, with_message.clone());
+
+        // Exactly once: a later pass (the 21 s check, another trigger) and a
+        // second Subscribed report send and request nothing.
+        assert!(!si.room_needs_update(&room, &with_message));
+        assert!(!si.mark_subscribed(&room));
+    }
+
+    /// A requested pass that does nothing (ROOMS unreadable, so
+    /// `needs_to_send_update` returns early; or no web API, so the send never
+    /// happens) must not consume the record: the next `Subscribed` report asks
+    /// again, and the next real pass sends the change.
+    #[test]
+    fn a_held_change_survives_a_pass_that_sent_nothing() {
+        let mut si = SyncInfo::new();
+        let room = test_owner(43);
+        si.register_new_room(room);
+        si.update_sync_status(&room, RoomSyncStatus::Subscribing);
+        let joined = ChatRoomStateV1::default();
+        si.update_last_synced_state(&room, &joined);
+        let mut with_message = joined.clone();
+        with_message.configuration.configuration.max_recent_messages += 1;
+        assert!(!si.room_needs_update(&room, &with_message));
+
+        assert!(si.mark_subscribed(&room));
+        // The requested pass found ROOMS unreadable: room_needs_update is not
+        // called at all. The record stays, so a later report asks again.
+        assert!(
+            si.mark_subscribed(&room),
+            "a degraded pass must not consume the record"
+        );
+        // A pass picks the room for sending, but the send never happens (no
+        // web API): still held.
+        assert!(si.room_needs_update(&room, &with_message));
+        assert!(si.mark_subscribed(&room), "an unsent change must stay held");
+        // The next pass sends it; only then is the record cleared.
+        assert!(si.room_needs_update(&room, &with_message));
+        si.state_updated(&room, with_message.clone());
+        assert!(!si.mark_subscribed(&room));
+        assert!(!si.room_needs_update(&room, &with_message));
+    }
+
+    /// The pass request itself, end to end through the function
+    /// `mark_room_subscribed` delegates to: a held change requests exactly one
+    /// pass per `Subscribed` report until it is sent, and nothing is requested
+    /// without one.
+    #[test]
+    fn marking_subscribed_requests_a_pass_only_for_a_held_change() {
+        let mut si = SyncInfo::new();
+        let held = test_owner(44);
+        let clean = test_owner(45);
+        let joined = ChatRoomStateV1::default();
+        let mut with_message = joined.clone();
+        with_message.configuration.configuration.max_recent_messages += 1;
+        for room in [held, clean] {
+            si.register_new_room(room);
+            si.update_sync_status(&room, RoomSyncStatus::Subscribing);
+            si.update_last_synced_state(&room, &joined);
+        }
+        assert!(!si.room_needs_update(&held, &with_message));
+        assert!(!si.room_needs_update(&clean, &joined));
+
+        let mut requested = Vec::new();
+        subscribe_and_request_held_pass(&mut si, held, |vk| requested.push(vk));
+        subscribe_and_request_held_pass(&mut si, clean, |vk| requested.push(vk));
+        assert_eq!(
+            requested,
+            vec![held],
+            "only the room with a held change asks for a pass"
+        );
+        assert_eq!(
+            si.get_sync_status(&clean),
+            Some(&RoomSyncStatus::Subscribed)
+        );
+
+        // Sent: a second Subscribed report requests nothing.
+        assert!(si.room_needs_update(&held, &with_message));
+        si.state_updated(&held, with_message.clone());
+        subscribe_and_request_held_pass(&mut si, held, |vk| requested.push(vk));
+        assert_eq!(requested, vec![held]);
+    }
+
+    /// `mark_room_subscribed` must hand the decision's request to
+    /// `mark_needs_sync`, or the request decided above never reaches the
+    /// synchronizer.
+    #[test]
+    fn mark_room_subscribed_turns_the_request_into_a_sync_pass() {
+        let src = include_str!("sync_info.rs");
+        let prod = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        let body: String = prod
+            .split_once("pub(crate) fn mark_room_subscribed(owner_vk: VerifyingKey) {")
+            .expect("mark_room_subscribed must exist")
+            .1
+            .split_once("\n}\n")
+            .expect("mark_room_subscribed must end")
+            .0
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            body.contains(
+                "subscribe_and_request_held_pass(sync_info,owner_vk,|vk|requested=Some(vk));"
+            ),
+            "mark_room_subscribed must delegate the decision: {body}"
+        );
+        assert!(
+            body.contains("ifletSome(vk)=requested{crate::components::app::mark_needs_sync(vk);}"),
+            "mark_room_subscribed must request the pass it was told to: {body}"
+        );
+    }
+
+    /// No pass is requested when nothing was held back, so a reconnect that
+    /// re-subscribes every room does not queue a pass per room.
+    #[test]
+    fn subscribing_with_nothing_held_back_requests_no_pass() {
+        let mut si = SyncInfo::new();
+        let room = test_owner(41);
+        si.register_new_room(room);
+        si.update_sync_status(&room, RoomSyncStatus::Subscribing);
+        let state = ChatRoomStateV1::default();
+        si.update_last_synced_state(&room, &state);
+        // A pass that finds nothing to send holds nothing back.
+        assert!(!si.room_needs_update(&room, &state));
+        assert!(!si.mark_subscribed(&room));
+        // Unknown room: nothing to mark.
+        assert!(!si.mark_subscribed(&test_owner(42)));
+    }
+
+    /// Every response handler that marks a room `Subscribed` goes through
+    /// `mark_room_subscribed`, the one place that requests the held pass. A
+    /// handler writing the status directly would lose the first message of a
+    /// fresh join again.
+    #[test]
+    fn response_handlers_mark_subscribed_through_the_helper() {
+        for (file, src) in [
+            (
+                "put_response.rs",
+                include_str!("freenet_api/response_handler/put_response.rs"),
+            ),
+            (
+                "subscribe_response.rs",
+                include_str!("freenet_api/response_handler/subscribe_response.rs"),
+            ),
+            (
+                "get_response.rs",
+                include_str!("freenet_api/response_handler/get_response.rs"),
+            ),
+        ] {
+            let prod: String = src
+                .split("#[cfg(test)]")
+                .next()
+                .unwrap()
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !prod.contains("RoomSyncStatus::Subscribed"),
+                "{file} writes Subscribed directly; use mark_room_subscribed"
+            );
+            assert!(
+                prod.lines().any(|l| l.trim_start().starts_with(
+                    "crate::components::app::sync_info::mark_room_subscribed(owner_vk);"
+                )),
+                "{file} must call mark_room_subscribed"
+            );
+        }
     }
 
     fn test_owner(seed: u8) -> VerifyingKey {
