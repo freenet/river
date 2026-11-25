@@ -1028,10 +1028,7 @@ impl ChatRoomStateV1 {
                 (*non_owner, std::cmp::Reverse(ban.ban.banned_at), *digest)
             });
             let mut per_target: HashMap<MemberId, usize> = HashMap::new();
-            let mut ranked: Vec<(
-                (bool, usize, std::cmp::Reverse<SignedTime>, BanDigest),
-                &AuthorizedProvisionalBan,
-            )> = valid
+            let mut ranked: Vec<_> = valid
                 .into_iter()
                 .map(|(non_owner, digest, ban)| {
                     let seen_before = per_target.entry(ban.ban.target).or_insert(0);
