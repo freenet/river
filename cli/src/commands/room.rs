@@ -178,7 +178,8 @@ pub enum RoomCommands {
     /// The handle is the first 16 bytes of BLAKE3("freenet-shortkey/v1" ||
     /// owner key), written as 21-22 base58 characters. Anyone can publish the
     /// entry, because the resolver contract rejects a key that does not hash to
-    /// the handle. `room config --public-admission true` does this automatically.
+    /// the handle. The full link stays the canonical one to share; the short link
+    /// is optional and needs the entry published (`--publish`).
     ShortLink {
         /// Room owner key (base58)
         room_id: String,
@@ -194,25 +195,6 @@ pub enum RoomCommands {
         /// Short handle (21-22 base58 characters)
         handle: String,
     },
-}
-
-/// Publish the resolver entry when `--public-admission true` was just applied, and return the
-/// short link to show, if one may be shown (see `shortkey::UI_RESOLVES_SHORT_LINKS`). The entry
-/// is published either way; only advertising the link is gated.
-async fn auto_publish_short_link(
-    api: &ApiClient,
-    owner_key: &ed25519_dalek::VerifyingKey,
-    public_admission: Option<bool>,
-) -> Option<String> {
-    if public_admission != Some(true) {
-        return None;
-    }
-    let vk = owner_key.to_bytes();
-    crate::shortkey::publish_best_effort(api, &vk).await?;
-    crate::shortkey::advertised_link(
-        &crate::shortkey::ShortHandle::derive(&vk),
-        crate::shortkey::UI_RESOLVES_SHORT_LINKS,
-    )
 }
 
 /// Build the JSON payload emitted by `room join --format json`.
@@ -783,26 +765,12 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
                             if let Some(v) = max_room_description {
                                 println!("  max_room_description: {}", v);
                             }
-                            // After the change is applied and reported: opening a room to the
-                            // public is when a short link becomes useful, so publish the
-                            // resolver entry. Best effort and time-bounded; nothing here can
-                            // fail the command.
-                            if let Some(link) =
-                                auto_publish_short_link(&api, &owner_key, public_admission).await
-                            {
-                                println!("  short link: {link}");
-                            }
                         }
                         OutputFormat::Json => {
-                            let mut out = serde_json::json!({
+                            let out = serde_json::json!({
                                 "status": "success",
                                 "room_id": room_id,
                             });
-                            if let Some(link) =
-                                auto_publish_short_link(&api, &owner_key, public_admission).await
-                            {
-                                out["short_link"] = serde_json::Value::String(link);
-                            }
                             println!("{out}");
                         }
                     }
@@ -845,13 +813,13 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
             let long = crate::shortkey::long_link(&vk);
             match format {
                 OutputFormat::Human => {
+                    println!("Full link:  {long}");
                     println!("Handle:     {handle}");
-                    println!("Short link: {short}");
-                    println!("Long link:  {long}");
+                    println!("Short link (optional): {short}");
                     if !crate::shortkey::UI_RESOLVES_SHORT_LINKS {
                         println!(
                             "Note: short links open only in a River release with short-link \
-                             support. Share the long link until then."
+                             support. Share the full link."
                         );
                     }
                     match (published, exists) {

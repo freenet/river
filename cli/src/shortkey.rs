@@ -64,15 +64,11 @@ const RESOLVER_WASM: &[u8] = include_bytes!("../contracts/freenet_shortkey_v1.wa
 /// a test pins the two together.
 pub const WEB_APP_ID: &str = "raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv";
 
-/// Whether the shipped River UI opens `?room=<handle>` links. While this is false, riverctl
-/// still publishes resolver entries but does not advertise short links in `room config` output,
-/// and `room short-link` says such links open only in a River release with short-link support.
-/// The UI resolve PR (freenet/river#973) flips it to true.
+/// Whether the shipped River UI opens `?room=<handle>` links. While this is false, `room
+/// short-link` says such links open only in a River release with short-link support. The full
+/// link is always the canonical one to share; a short link is an optional extra, shown only when
+/// this is true and its entry resolves. The UI resolve PR (freenet/river#973) flips it.
 pub const UI_RESOLVES_SHORT_LINKS: bool = false;
-
-/// Total time `room config` spends publishing the resolver entry after the configuration
-/// change has been applied. The GET and PUT timeouts below are per request; this bounds both.
-pub const AUTO_PUBLISH_BUDGET: Duration = Duration::from_secs(10);
 
 /// How long to wait for the node to answer a resolver GET.
 pub const GET_TIMEOUT: Duration = Duration::from_secs(30);
@@ -364,11 +360,6 @@ pub fn lookup_from_error(e: &anyhow::Error) -> Lookup {
     }
 }
 
-/// The URL to advertise for `handle`, or `None` while the UI cannot open short links.
-pub fn advertised_link(handle: &ShortHandle, ui_resolves: bool) -> Option<String> {
-    ui_resolves.then(|| short_link(handle))
-}
-
 /// The resolver contract container for `handle`: generation 1 code, the handle bytes as parameters.
 pub fn resolver_container(handle: &ShortHandle) -> ContractContainer {
     ContractContainer::from(ContractWasmAPIVersion::V1(WrappedContract::new(
@@ -454,45 +445,6 @@ impl ApiClient {
     pub async fn short_handle_resolve(&self, handle: &ShortHandle) -> Result<[u8; KEY_LEN]> {
         resolve_lookup(handle, self.short_handle_lookup(handle).await)
     }
-}
-
-/// Best-effort publish used by `room config --public-admission true`, run AFTER the
-/// configuration change is applied and reported. The whole publish is bounded by `budget`; a
-/// failure or a timeout warns and returns `None`, never an error. Returns the outcome on success.
-pub async fn publish_best_effort_within<F>(
-    handle: &ShortHandle,
-    budget: Duration,
-    publish: F,
-) -> Option<Published>
-where
-    F: std::future::Future<Output = Result<Published>>,
-{
-    match tokio::time::timeout(budget, publish).await {
-        Ok(Ok(done)) => Some(done),
-        Ok(Err(e)) => {
-            tracing::warn!("could not publish the short handle {handle}: {e}");
-            eprintln!(
-                "warning: could not publish the short link entry for this room ({e}). The room \
-                 setting was changed. Retry with `riverctl room short-link <room> --publish`."
-            );
-            None
-        }
-        Err(_) => {
-            eprintln!(
-                "warning: publishing the short link entry for this room took longer than {}s and \
-                 was abandoned. The room setting was changed. Retry with `riverctl room \
-                 short-link <room> --publish`.",
-                budget.as_secs()
-            );
-            None
-        }
-    }
-}
-
-/// [`publish_best_effort_within`] against the node, with [`AUTO_PUBLISH_BUDGET`].
-pub async fn publish_best_effort(api: &ApiClient, vk: &[u8; KEY_LEN]) -> Option<Published> {
-    let handle = ShortHandle::derive(vk);
-    publish_best_effort_within(&handle, AUTO_PUBLISH_BUDGET, api.short_handle_publish(vk)).await
 }
 
 #[cfg(test)]
@@ -655,6 +607,12 @@ mod tests {
         assert_eq!(a.code_hash().to_string(), RESOLVER_CODE_HASH_B58);
     }
 
+    #[test]
+    fn short_links_stay_unadvertised_until_the_ui_resolves_them() {
+        // The UI resolve PR flips the constant and this test.
+        assert!(!UI_RESOLVES_SHORT_LINKS);
+    }
+
     // ---- review fixes (river#1043) ----
 
     #[test]
@@ -681,15 +639,6 @@ mod tests {
             resolve_state(&id, &minimal_state(&identity)),
             Err(ShortError::BadKey)
         );
-    }
-
-    #[test]
-    fn short_links_are_advertised_only_when_the_ui_resolves_them() {
-        let id = ShortHandle::derive(&[4u8; 32]);
-        assert_eq!(advertised_link(&id, true), Some(short_link(&id)));
-        assert_eq!(advertised_link(&id, false), None);
-        // The shipped UI cannot open them yet; the UI resolve PR flips this and this test.
-        assert!(!UI_RESOLVES_SHORT_LINKS);
     }
 
     fn client_error(kind: ErrorKind) -> anyhow::Error {
@@ -764,34 +713,6 @@ mod tests {
             Some(Published::AlreadyPublished)
         );
         assert_eq!(published_from_ack(PutAck::NotYet), None);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn auto_publish_is_bounded_and_never_fails() {
-        let id = ShortHandle::derive(&[2u8; 32]);
-        // A hung node: the publish never answers. The whole thing ends at the budget.
-        let started = tokio::time::Instant::now();
-        let out = publish_best_effort_within(
-            &id,
-            Duration::from_secs(10),
-            std::future::pending::<Result<Published>>(),
-        )
-        .await;
-        assert_eq!(out, None);
-        assert_eq!(started.elapsed(), Duration::from_secs(10));
-        // An error warns and returns None rather than propagating.
-        let out = publish_best_effort_within(&id, Duration::from_secs(10), async {
-            Err::<Published, _>(anyhow!("boom"))
-        })
-        .await;
-        assert_eq!(out, None);
-        let out = publish_best_effort_within(&id, Duration::from_secs(10), async {
-            Ok(Published::Created)
-        })
-        .await;
-        assert_eq!(out, Some(Published::Created));
-        // The budget is shorter than one request timeout, which is the point of it.
-        assert!(AUTO_PUBLISH_BUDGET < GET_TIMEOUT + PUT_TIMEOUT);
     }
 
     /// The resolver seam in `api.rs` is outside that file's response-multiplexing pin, so pin

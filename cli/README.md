@@ -322,18 +322,15 @@ of `BLAKE3("freenet-shortkey/v1" || owner key)` in base58. A small resolver
 contract (`freenet/freenet-shortkey`, generation 1) maps a handle to the key.
 The handle is not a name and cannot be chosen.
 
-- `riverctl room short-link <room>` prints the handle, the short link
-  (`https://freenet.org/open#<River>/?room=<handle>`), the long link (still
-  valid, needs no resolver) and whether the resolver entry exists yet.
+- `riverctl room short-link <room>` prints the full link (the canonical one to
+  share; it needs no resolver), the handle, the optional short link
+  (`https://freenet.org/open#<River>/?room=<handle>`, which opens only in a River
+  release with short-link support) and whether the resolver entry exists yet.
   `--publish` creates the entry if it is missing; running it again does
   nothing. Anyone can publish it, since the contract only accepts a key that
   hashes to the handle. Use this for rooms that already exist.
-- `riverctl room config <room> --public-admission true` applies and reports the
-  setting first, then publishes the entry, giving up after 10 seconds. If that
-  fails or times out it warns and the command still succeeds; retry with
-  `room short-link --publish`. It does not print the short link until the River
-  UI can open short links (`UI_RESOLVES_SHORT_LINKS` in `src/shortkey.rs`);
-  `room short-link` prints it with a note to that effect.
+- `room config --public-admission true` does not publish anything. Short links
+  are optional, so publishing is always an explicit `room short-link --publish`.
 - `riverctl room resolve-handle <handle>` fetches the entry, checks that the
   key hashes back to the handle and prints the full key. It fails with a clear
   message if the entry does not exist, the node cannot be reached, the lookup

@@ -6,8 +6,8 @@ All notable changes to riverctl will be documented in this file.
 
 ### Added
 - `room short-link` and `room resolve-handle`: short room handles resolved through the
-  freenet-shortkey contract. `room config --public-admission true` now publishes the
-  resolver entry for the room (best effort) and prints the short link (freenet/river#973).
+  freenet-shortkey contract.  The full link stays the canonical share link; the short link is optional and its
+  resolver entry is published only by `room short-link --publish` (freenet/river#973).
 
 ### Changed
 - Built against river-core 0.3.0 and the new room contract (freenet/river#703).
