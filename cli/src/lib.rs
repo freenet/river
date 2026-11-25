@@ -9,6 +9,7 @@ pub mod error;
 pub mod output;
 pub mod pointer;
 pub mod private_room;
+pub mod shortkey;
 pub mod signed_time;
 pub mod storage;
 pub mod version_check;

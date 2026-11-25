@@ -10,7 +10,7 @@ license = "LGPL-3.0-only"
 readme = "README.md"
 keywords = ["freenet", "chat", "cli", "p2p", "decentralized"]
 categories = ["command-line-utilities", "network-programming"]
-include = ["src/**/*", "Cargo.toml", "README.md", "LICENSE*", "contracts/room_contract.wasm", "build.rs"]
+include = ["src/**/*", "Cargo.toml", "README.md", "LICENSE*", "contracts/room_contract.wasm", "contracts/freenet_shortkey_v1.wasm", "build.rs"]
 
 [lib]
 name = "riverctl"

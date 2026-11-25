@@ -2768,6 +2768,26 @@ impl ApiClient {
         &self.storage
     }
 
+    /// Send one contract request and wait for its answer through the shared waiter.
+    ///
+    /// For callers outside this file (the short-handle resolver, `crate::shortkey`) that
+    /// build their own request and classifier but must not read the multiplexed connection
+    /// themselves: `classify` has the same three outcomes as in [`await_response`].
+    pub(crate) async fn send_and_await<T>(
+        &self,
+        request: ContractRequest<'static>,
+        timeout: Duration,
+        awaiting: &str,
+        classify: impl FnMut(&HostResponse) -> Option<Result<T>>,
+    ) -> Result<T> {
+        let mut web_api = self.web_api.lock().await;
+        web_api
+            .send(ClientRequest::ContractOp(request))
+            .await
+            .map_err(|e| anyhow!("Failed to send the {awaiting} request: {e}"))?;
+        await_response(&mut web_api, timeout, awaiting, classify).await
+    }
+
     pub async fn new(node_url: &str, config: Config, config_dir: Option<&str>) -> Result<Self> {
         Self::new_with_signing_key_override(node_url, config, config_dir, None).await
     }
@@ -14300,12 +14320,15 @@ mod response_multiplexing_pin {
     /// one-for-one swap passes. The check that would actually bind this is not
     /// a count at all: make the raw connection unreachable by wrapping it in a
     /// type whose only methods are the waiters. That is freenet/river#692.
-    const CONNECTION_ACQUISITIONS: usize = 21;
+    ///
+    /// One of them (and one of the field references) is `send_and_await`, the seam
+    /// `crate::shortkey` waits through.
+    const CONNECTION_ACQUISITIONS: usize = 22;
 
     /// See [`CONNECTION_ACQUISITIONS`]. One higher than the lock count, because
     /// `NodePointerIo` is handed a borrow of the field rather than locking it
     /// at the construction site.
-    const FIELD_REFERENCES: usize = 22;
+    const FIELD_REFERENCES: usize = 23;
 
     /// Production sends of a `ContractRequest::Update`: the eight routed
     /// through `await_update_response` below, plus `accept_invitation_struct`'s
@@ -14638,7 +14661,7 @@ mod response_multiplexing_pin {
         );
         assert_caught(
             &mutated,
-            "found 22",
+            "found 23",
             "a new call site that takes the connection lock",
         );
     }

@@ -7,3 +7,8 @@ riverctl derives every room's contract key from it, and crates.io packages need 
 **Never copy or rebuild it by hand.** A changed WASM changes the contract key.
 Run `cargo make sync-wasm` and follow `.claude/rules/delegate-migration.md`.
 CI's `check-cli-wasm` fails when the two copies differ.
+
+`freenet_shortkey_v1.wasm` is the generation 1 short-handle resolver, copied unchanged from
+`freenet/freenet-shortkey` (`wasm/`, commit b967e538; BLAKE3 `7fd0f944...04c5`). It is embedded by
+`src/shortkey.rs`, which refuses to publish if the hash differs. Its hash is part of every resolver
+address, so never rebuild it: a different resolver is a new generation.

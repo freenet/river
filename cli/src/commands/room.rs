@@ -171,6 +171,29 @@ pub enum RoomCommands {
         #[arg(long)]
         admission_listed: Option<bool>,
     },
+
+    /// Show a room's short handle and short share link; optionally publish the
+    /// resolver entry that makes the handle work.
+    ///
+    /// The handle is the first 16 bytes of BLAKE3("freenet-shortkey/v1" ||
+    /// owner key), written as 21-22 base58 characters. Anyone can publish the
+    /// entry, because the resolver contract rejects a key that does not hash to
+    /// the handle. `room config --public-admission true` does this automatically.
+    ShortLink {
+        /// Room owner key (base58)
+        room_id: String,
+
+        /// Publish the resolver entry to the node's network if it does not exist
+        #[arg(long)]
+        publish: bool,
+    },
+
+    /// Resolve a short handle to the room's full owner key, checking that the
+    /// key hashes back to the handle
+    ResolveHandle {
+        /// Short handle (21-22 base58 characters)
+        handle: String,
+    },
 }
 
 /// Build the JSON payload emitted by `room join --format json`.
@@ -711,9 +734,21 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
                 .await
             {
                 Ok(()) => {
+                    // Opening a room to the public is when a short link becomes useful, so
+                    // publish the resolver entry now. Best effort: a failure warns and the
+                    // configuration change stands.
+                    let short_link = if public_admission == Some(true) {
+                        let vk = crate::shortkey::parse_owner_key(&room_id)?;
+                        crate::shortkey::publish_best_effort(&api, &vk).await
+                    } else {
+                        None
+                    };
                     match format {
                         OutputFormat::Human => {
                             println!("{}", "Configuration updated successfully!".green());
+                            if let Some(link) = &short_link {
+                                println!("  short link: {link}");
+                            }
                             if let Some(v) = name {
                                 println!("  name: {}", v);
                             }
@@ -748,6 +783,7 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
                                 serde_json::json!({
                                     "status": "success",
                                     "room_id": room_id,
+                                    "short_link": short_link,
                                 })
                             );
                         }
@@ -759,6 +795,84 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
                     Err(e)
                 }
             }
+        }
+        RoomCommands::ShortLink { room_id, publish } => {
+            let vk = crate::shortkey::parse_owner_key(&room_id)?;
+            ed25519_dalek::VerifyingKey::from_bytes(&vk)
+                .map_err(|e| anyhow::anyhow!("Invalid room owner key: {}", e))?;
+            let handle = crate::shortkey::ShortHandle::derive(&vk);
+            let published = if publish {
+                Some(api.short_handle_publish(&vk).await?)
+            } else {
+                None
+            };
+            // Without --publish, look the entry up so the output says whether it works yet.
+            let exists = match published {
+                Some(_) => Some(true),
+                None => match api.short_handle_lookup(&handle).await {
+                    crate::shortkey::Lookup::Found(state) => {
+                        Some(crate::shortkey::resolve_state(&handle, &state).is_ok())
+                    }
+                    crate::shortkey::Lookup::NotFound(_) => Some(false),
+                    crate::shortkey::Lookup::TimedOut => None,
+                },
+            };
+            let short = crate::shortkey::short_link(&handle);
+            let long = crate::shortkey::long_link(&vk);
+            match format {
+                OutputFormat::Human => {
+                    println!("Handle:     {handle}");
+                    println!("Short link: {short}");
+                    println!("Long link:  {long}");
+                    match (published, exists) {
+                        (Some(crate::shortkey::Published::Created), _) => {
+                            println!("Resolver entry: published")
+                        }
+                        (Some(crate::shortkey::Published::AlreadyPublished), _) => {
+                            println!("Resolver entry: already published")
+                        }
+                        (None, Some(true)) => println!("Resolver entry: exists"),
+                        (None, Some(false)) => println!(
+                            "Resolver entry: not found; run with --publish so the short link works"
+                        ),
+                        (None, None) => println!(
+                            "Resolver entry: unknown (the lookup timed out); run with --publish to make sure"
+                        ),
+                    }
+                }
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "status": "success",
+                            "room_id": room_id,
+                            "handle": handle.to_base58(),
+                            "short_link": short,
+                            "long_link": long,
+                            "entry_exists": exists,
+                            "published": published.map(|p| p == crate::shortkey::Published::Created),
+                        })
+                    );
+                }
+            }
+            Ok(())
+        }
+        RoomCommands::ResolveHandle { handle } => {
+            let parsed = crate::shortkey::ShortHandle::from_base58(&handle)?;
+            let vk = api.short_handle_resolve(&parsed).await?;
+            let key = crate::shortkey::owner_key_b58(&vk);
+            match format {
+                OutputFormat::Human => println!("{key}"),
+                OutputFormat::Json => println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "success",
+                        "handle": handle,
+                        "room_id": key,
+                    })
+                ),
+            }
+            Ok(())
         }
         RoomCommands::Republish { room_id } => {
             // Parse the room owner key
