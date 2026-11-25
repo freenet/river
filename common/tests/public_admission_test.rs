@@ -2580,29 +2580,35 @@ fn a_sponsored_member_and_another_key_for_their_id_merge_and_verify() {
 }
 
 // ---------------------------------------------------------------------------
-// Provisional ban ranking (newest first) and the provisional message time bound
+// Provisional ban ranking: newest first
 // ---------------------------------------------------------------------------
+
+fn full_ban_room() -> Room {
+    let mut p = policy(0, 1);
+    p.max_provisional_bans = 16;
+    Room::new(20, 10, Some(p))
+}
+
+fn target_of(trial: u16, i: u16) -> MemberId {
+    id_of(&sk(((trial * 20 + i) % 200 + 20) as u8))
+}
 
 /// A full list keeps the ban just issued and cuts the oldest, whatever the
 /// digests are. A digest-only order cut the new ban about 1 time in 17.
 #[test]
 fn a_new_owner_provisional_ban_is_kept_and_the_oldest_is_cut_on_a_full_list() {
     for trial in 0..40u16 {
-        let mut p = policy(0, 1);
-        p.max_provisional_bans = 16;
-        let mut room = Room::new(20, 10, Some(p));
-        // Distinct random-ish targets per trial give different digests.
-        let target = |i: u16| id_of(&sk(((trial * 20 + i) % 200 + 20) as u8));
+        let mut room = full_ban_room();
         for i in 0..16u16 {
             room.apply(prov_ban_delta(room.prov_ban(
                 None,
-                target(i),
+                target_of(trial, i),
                 1_000 + i as u64,
             )))
             .unwrap();
         }
         assert_eq!(room.state.provisional.bans.len(), 16);
-        let newest = target(17);
+        let newest = target_of(trial, 17);
         room.apply(prov_ban_delta(room.prov_ban(None, newest, 5_000)))
             .unwrap();
         let bans = &room.state.provisional.bans;
@@ -2612,134 +2618,135 @@ fn a_new_owner_provisional_ban_is_kept_and_the_oldest_is_cut_on_a_full_list() {
             "trial {trial}: the new ban was cut"
         );
         assert!(
-            !bans.iter().any(|b| b.ban.target == target(0)),
+            !bans.iter().any(|b| b.ban.target == target_of(trial, 0)),
             "trial {trial}: the oldest ban stays"
         );
         for i in 1..16u16 {
             assert!(
-                bans.iter().any(|b| b.ban.target == target(i)),
+                bans.iter().any(|b| b.ban.target == target_of(trial, i)),
                 "trial {trial}"
             );
         }
     }
 }
 
-/// The first ban per target still ranks before repeats: a newer repeat ban on
-/// a target replaces that target's older ban, and a repeat never displaces
-/// another target's only ban.
+/// First ban per target ranks before repeats, and of two bans on one target
+/// the newer is the one kept. Over many trials, so a digest-only order (which
+/// keeps the newer one about half the time) cannot pass.
 #[test]
 fn provisional_ban_repeats_rank_after_first_bans_per_target() {
-    let mut p = policy(0, 1);
-    p.max_provisional_bans = 16;
-    let mut room = Room::new(20, 10, Some(p));
-    let targets: Vec<MemberId> = (0..16u8).map(|i| id_of(&sk(30 + i))).collect();
-    for (i, t) in targets.iter().enumerate() {
-        room.apply(prov_ban_delta(room.prov_ban(None, *t, 1_000 + i as u64)))
+    for trial in 0..40u16 {
+        let mut room = full_ban_room();
+        for i in 0..16u16 {
+            room.apply(prov_ban_delta(room.prov_ban(
+                None,
+                target_of(trial, i),
+                1_000 + i as u64,
+            )))
             .unwrap();
-    }
-    // A newer second ban on targets[0]: the 17th record, a repeat of the
-    // oldest one's target. The old ban for that target is what goes.
-    room.apply(prov_ban_delta(room.prov_ban(None, targets[0], 9_000)))
-        .unwrap();
-    let bans = &room.state.provisional.bans;
-    assert_eq!(bans.len(), 16);
-    for t in &targets {
-        assert!(
-            bans.iter().any(|b| b.ban.target == *t),
-            "every target stays banned"
-        );
-    }
-    let for_first: Vec<_> = bans.iter().filter(|b| b.ban.target == targets[0]).collect();
-    assert_eq!(for_first.len(), 1);
-    assert_eq!(
-        for_first[0].ban.banned_at,
-        (SystemTime::UNIX_EPOCH + Duration::from_secs(9_000)).into()
-    );
-}
-
-/// 8 authors with messages dated far ahead and one honest newcomer: the
-/// newcomer is in the pool, in either arrival order.
-#[test]
-fn far_future_provisional_messages_do_not_hold_the_pool() {
-    for futures_first in [true, false] {
-        let mut p = policy(0, 1);
-        p.max_provisional = 8;
-        p.max_provisional_messages = 30;
-        let mut room = Room::new(60, 10, Some(p));
-        let owner = sk(200);
-        room.apply(room.msg_delta(vec![room.msg(&owner, 1_000, "owner")]))
-            .unwrap();
-        let honest = sk(150);
-        let join_futures = |room: &mut Room| {
-            for i in 0..8u8 {
-                room.apply(room.join_delta(&sk(100 + i), 4_000_000_000 + i as u64, "x"))
-                    .unwrap();
-            }
-        };
-        if futures_first {
-            join_futures(&mut room);
-            room.apply(room.join_delta(&honest, 1_005, "hi")).unwrap();
-        } else {
-            room.apply(room.join_delta(&honest, 1_005, "hi")).unwrap();
-            join_futures(&mut room);
         }
-        assert!(
-            room.has_entry(&honest) && room.has_msg_by(&honest),
-            "futures_first={futures_first}: the honest newcomer was cut from the pool"
+        // A newer second ban on the oldest ban's target: the 17th record.
+        room.apply(prov_ban_delta(room.prov_ban(
+            None,
+            target_of(trial, 0),
+            9_000,
+        )))
+        .unwrap();
+        let bans = &room.state.provisional.bans;
+        assert_eq!(bans.len(), 16);
+        for i in 0..16u16 {
+            assert!(
+                bans.iter().any(|b| b.ban.target == target_of(trial, i)),
+                "trial {trial}: every target stays banned"
+            );
+        }
+        let for_first: Vec<_> = bans
+            .iter()
+            .filter(|b| b.ban.target == target_of(trial, 0))
+            .collect();
+        assert_eq!(for_first.len(), 1, "trial {trial}");
+        assert_eq!(
+            for_first[0].ban.banned_at,
+            (SystemTime::UNIX_EPOCH + Duration::from_secs(9_000)).into(),
+            "trial {trial}: the older repeat was kept"
         );
-        assert_eq!(room.state.provisional.entries.len(), 8);
     }
 }
 
-/// Deltas carrying far-future, near-future and honest provisional messages
-/// and provisional bans reach the same bytes in every order, and applying the
-/// result's own state again changes nothing.
+/// Bans with one `banned_at` are ordered by digest, so the kept set does not
+/// depend on arrival order.
 #[test]
-fn future_dated_provisional_deltas_converge_in_every_order() {
-    let mut p = policy(0, 1);
-    p.max_provisional = 3;
-    p.max_provisional_messages = 4;
-    p.max_provisional_bans = 3;
-    let mut base = Room::new(12, 10, Some(p));
-    let owner = sk(200);
-    base.apply(base.msg_delta(vec![base.msg(&owner, 1_000, "owner")]))
-        .unwrap();
-    let mut deltas: Vec<ChatRoomStateV1Delta> = Vec::new();
-    for (i, t) in [
-        4_000_000_000u64,
-        4_000_000_001,
-        1_000 + 700,
-        1_000 + 5,
-        1_000 + 9,
-    ]
-    .iter()
-    .enumerate()
-    {
-        deltas.push(base.join_delta(&sk(100 + i as u8), *t, "p"));
-    }
-    for i in 0..4u64 {
-        deltas.push(prov_ban_delta(base.prov_ban(
-            None,
-            id_of(&sk(150 + i as u8)),
-            if i == 0 { 4_000_000_000 } else { 2_000 + i },
-        )));
-    }
+fn provisional_bans_with_equal_banned_at_keep_the_same_set_in_every_order() {
+    let base = full_ban_room();
+    let bans: Vec<AuthorizedProvisionalBan> = (0..20u16)
+        .map(|i| base.prov_ban(None, target_of(7, i), 3_000))
+        .collect();
+    let deltas: Vec<ChatRoomStateV1Delta> = bans.iter().cloned().map(prov_ban_delta).collect();
     let refs: Vec<&ChatRoomStateV1Delta> = deltas.iter().collect();
     let forward = replay(&base, &refs);
-    let mut reversed = refs.clone();
-    reversed.reverse();
-    let backward = replay(&base, &reversed);
-    let mut rotated = refs.clone();
-    rotated.rotate_left(3);
-    let rot = replay(&base, &rotated);
+    let mut rev = refs.clone();
+    rev.reverse();
+    let backward = replay(&base, &rev);
+    let mut rot = refs.clone();
+    rot.rotate_left(7);
+    let rotated = replay(&base, &rot);
+    assert_eq!(forward.provisional.bans.len(), 16);
     assert_eq!(ser(&forward), ser(&backward));
-    assert_eq!(ser(&forward), ser(&rot));
-    let mut again = Room {
-        owner: base.owner.clone(),
-        params: base.params.clone(),
-        state: forward.clone(),
-        version: base.version,
+    assert_eq!(ser(&forward), ser(&rotated));
+}
+
+/// `banned_at` at the extremes: the epoch and `SignedTime::MAX` neither fail
+/// a merge nor break the order. The latest ban holds its slot, the epoch ban
+/// goes first, and the result does not depend on arrival order.
+#[test]
+fn provisional_bans_at_the_time_extremes_rank_newest_first() {
+    use river_core::signed_time::SignedTime;
+    let base = full_ban_room();
+    let at = |target: MemberId, t: SignedTime| {
+        AuthorizedProvisionalBan::new(
+            &base.params.owner,
+            ProvisionalBan {
+                banned_by: base.owner_id(),
+                banned_at: t,
+                target,
+            },
+            &base.owner,
+        )
     };
-    again.apply(ChatRoomStateV1Delta::default()).ok();
-    assert_eq!(ser(&forward), ser(&again.state));
+    let mut bans = vec![
+        at(target_of(9, 0), SignedTime::UNIX_EPOCH),
+        at(target_of(9, 1), SignedTime::MAX),
+    ];
+    for i in 2..16u16 {
+        bans.push(at(
+            target_of(9, i),
+            (SystemTime::UNIX_EPOCH + Duration::from_secs(1_000 + i as u64)).into(),
+        ));
+    }
+    // The 17th: an ordinary ban, newer than all but the MAX one.
+    bans.push(at(
+        target_of(9, 17),
+        (SystemTime::UNIX_EPOCH + Duration::from_secs(5_000)).into(),
+    ));
+    let deltas: Vec<ChatRoomStateV1Delta> = bans.iter().cloned().map(prov_ban_delta).collect();
+    let refs: Vec<&ChatRoomStateV1Delta> = deltas.iter().collect();
+    let forward = replay(&base, &refs);
+    let mut rev = refs.clone();
+    rev.reverse();
+    let backward = replay(&base, &rev);
+    assert_eq!(ser(&forward), ser(&backward));
+    let kept = &forward.provisional.bans;
+    assert_eq!(kept.len(), 16);
+    assert!(
+        kept.iter().any(|b| b.ban.target == target_of(9, 1)),
+        "MAX kept"
+    );
+    assert!(
+        kept.iter().any(|b| b.ban.target == target_of(9, 17)),
+        "newest ordinary kept"
+    );
+    assert!(
+        !kept.iter().any(|b| b.ban.target == target_of(9, 0)),
+        "the epoch ban is the one cut"
+    );
 }

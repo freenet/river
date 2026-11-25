@@ -849,43 +849,7 @@ pub(crate) struct ProvisionalPlan {
     pub pool_cap: usize,
     /// Issuers of the kept provisional bans: required ids in the member loop.
     pub ban_issuers: HashSet<MemberId>,
-    /// The anchor of the P6 time bound (see [`PROVISIONAL_TIME_SLACK`]), or
-    /// `None` when no message exists to anchor it. Fixed once per pass here,
-    /// so the member loop and step 5b rank by the same value.
-    pub anchor: Option<SignedTime>,
 }
-
-/// A message's position in the P6 window scan; larger is newer.
-pub(crate) type ScanKey = (SignedTime, bool, crate::room_state::message::MessageId);
-
-impl ProvisionalPlan {
-    /// The key the P6 window scan orders a message by, newest first. A
-    /// provisional author's message dated more than [`PROVISIONAL_TIME_SLACK`]
-    /// past the anchor is untrusted: it ranks AT the anchor (no newer than
-    /// the newest member message) and behind any message with the same time.
-    /// Clamping to `anchor + slack` instead would leave a far-future message
-    /// ahead of every honest newcomer for good, because the ceiling moves
-    /// with the room. Every site that applies P6 must order by this key.
-    pub(crate) fn scan_key(&self, m: &crate::room_state::message::AuthorizedMessageV1) -> ScanKey {
-        let (time, id) = (m.message.time, m.id());
-        match self.anchor {
-            Some(anchor)
-                if self.ids.contains(&m.message.author)
-                    && time > anchor + PROVISIONAL_TIME_SLACK =>
-            {
-                (anchor, false, id)
-            }
-            _ => (time, true, id),
-        }
-    }
-}
-
-/// How far past the anchor a provisional message's time is believed (P6).
-/// Ten minutes covers an honest newcomer's clock running a few minutes fast
-/// and the delay between signing and a peer receiving the message, while
-/// a message dated further ahead is ranked as if it were no newer than the
-/// anchor. Bans and member messages are not affected.
-pub const PROVISIONAL_TIME_SLACK: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// What ban enforcement fixed for [`ChatRoomStateV1::provisional_step`].
 pub(crate) struct BanInputs<'a> {
@@ -1132,30 +1096,11 @@ impl ChatRoomStateV1 {
         let ids: HashSet<MemberId> = entries.iter().map(|e| e.member_id()).collect();
         self.provisional.entries = entries;
         self.provisional.bans = kept_bans;
-        // P6 anchor: the newest message of the owner or a member, a pure
-        // function of the state at this point (members after ban
-        // enforcement), computed once and carried in the plan. With no such
-        // message there is no trustworthy reference (the only candidates are
-        // the provisional messages being ranked, so one old message, or the
-        // probe `admission_status` adds, would re-rank all the others), so
-        // nothing is bounded and provisional messages rank by their own time,
-        // as before.
-        let anchor = {
-            let member_ids: HashSet<MemberId> =
-                self.members.members.iter().map(|m| m.member.id()).collect();
-            self.recent_messages
-                .messages
-                .iter()
-                .filter(|m| m.message.author == owner_id || member_ids.contains(&m.message.author))
-                .map(|m| m.message.time)
-                .max()
-        };
         ProvisionalPlan {
             ids,
             quota,
             pool_cap: policy.pool_cap(),
             ban_issuers,
-            anchor,
         }
     }
 }

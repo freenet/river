@@ -1153,12 +1153,7 @@ impl ChatRoomStateV1 {
                 let mut provisional_taken = 0;
                 let mut scan_pool: HashSet<MemberId> = HashSet::new();
                 let mut keep = vec![false; messages.len()];
-                // Scan in P6 order (provisional times clamped), the order the
-                // member loop used; `messages` itself stays in retention order.
-                let mut scan_order: Vec<usize> = (0..messages.len()).collect();
-                scan_order.sort_by_key(|&i| plan.scan_key(&messages[i]));
-                for &i in scan_order.iter().rev() {
-                    let m = &messages[i];
+                for (i, m) in messages.iter().enumerate().rev() {
                     if taken >= cap {
                         break;
                     }
@@ -1298,7 +1293,6 @@ impl ChatRoomStateV1 {
             &self.recent_messages,
             &self.direct_messages,
             owner_id,
-            plan,
         );
         let mut required_ids = HashSet::new();
         for _ in 0..=candidates.len() {
@@ -1562,7 +1556,7 @@ impl ChatRoomStateV1 {
         let message_authors: HashSet<MemberId> = {
             let mut ordered: Vec<&crate::room_state::message::AuthorizedMessageV1> =
                 self.recent_messages.messages.iter().collect();
-            ordered.sort_by_key(|m| std::cmp::Reverse(plan.scan_key(m)));
+            ordered.sort_by_key(|m| std::cmp::Reverse(m.order_key()));
             let window = self.configuration.configuration.max_recent_messages;
             let mut authors = HashSet::new();
             let mut taken = 0;
@@ -1682,7 +1676,6 @@ impl<'c> MemberLoop<'c> {
         messages: &MessagesV1,
         direct_messages: &DirectMessagesV1,
         owner_id: MemberId,
-        plan: &crate::room_state::provisional::ProvisionalPlan,
     ) -> Self {
         let mut records_of: std::collections::HashMap<MemberId, Vec<usize>> = Default::default();
         let mut invited_by: std::collections::HashMap<MemberId, Vec<usize>> = Default::default();
@@ -1695,10 +1688,10 @@ impl<'c> MemberLoop<'c> {
         }
         // A stable sort by newest first, as the plain pass sorts its live
         // messages: filtering this order gives the same order.
-        let mut order: Vec<(crate::room_state::provisional::ScanKey, MemberId)> = messages
+        let mut order: Vec<(crate::room_state::message::MessageOrderKey, MemberId)> = messages
             .messages
             .iter()
-            .map(|m| (plan.scan_key(m), m.message.author))
+            .map(|m| (m.order_key(), m.message.author))
             .collect();
         order.sort_by(|a, b| b.0.cmp(&a.0));
         let mut lp = MemberLoop {
