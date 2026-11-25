@@ -2691,19 +2691,55 @@ fn far_future_provisional_messages_do_not_hold_the_pool() {
     }
 }
 
-/// With no member message at all, far-future provisional messages still do
-/// not outrank an honest one.
+/// Deltas carrying far-future, near-future and honest provisional messages
+/// and provisional bans reach the same bytes in every order, and applying the
+/// result's own state again changes nothing.
 #[test]
-fn far_future_provisional_messages_do_not_hold_the_pool_without_member_messages() {
+fn future_dated_provisional_deltas_converge_in_every_order() {
     let mut p = policy(0, 1);
-    p.max_provisional = 8;
-    p.max_provisional_messages = 30;
-    let mut room = Room::new(60, 10, Some(p));
-    let honest = sk(150);
-    room.apply(room.join_delta(&honest, 1_005, "hi")).unwrap();
-    for i in 0..8u8 {
-        room.apply(room.join_delta(&sk(100 + i), 4_000_000_000 + i as u64, "x"))
-            .unwrap();
+    p.max_provisional = 3;
+    p.max_provisional_messages = 4;
+    p.max_provisional_bans = 3;
+    let mut base = Room::new(12, 10, Some(p));
+    let owner = sk(200);
+    base.apply(base.msg_delta(vec![base.msg(&owner, 1_000, "owner")]))
+        .unwrap();
+    let mut deltas: Vec<ChatRoomStateV1Delta> = Vec::new();
+    for (i, t) in [
+        4_000_000_000u64,
+        4_000_000_001,
+        1_000 + 700,
+        1_000 + 5,
+        1_000 + 9,
+    ]
+    .iter()
+    .enumerate()
+    {
+        deltas.push(base.join_delta(&sk(100 + i as u8), *t, "p"));
     }
-    assert!(room.has_entry(&honest) && room.has_msg_by(&honest));
+    for i in 0..4u64 {
+        deltas.push(prov_ban_delta(base.prov_ban(
+            None,
+            id_of(&sk(150 + i as u8)),
+            if i == 0 { 4_000_000_000 } else { 2_000 + i },
+        )));
+    }
+    let refs: Vec<&ChatRoomStateV1Delta> = deltas.iter().collect();
+    let forward = replay(&base, &refs);
+    let mut reversed = refs.clone();
+    reversed.reverse();
+    let backward = replay(&base, &reversed);
+    let mut rotated = refs.clone();
+    rotated.rotate_left(3);
+    let rot = replay(&base, &rotated);
+    assert_eq!(ser(&forward), ser(&backward));
+    assert_eq!(ser(&forward), ser(&rot));
+    let mut again = Room {
+        owner: base.owner.clone(),
+        params: base.params.clone(),
+        state: forward.clone(),
+        version: base.version,
+    };
+    again.apply(ChatRoomStateV1Delta::default()).ok();
+    assert_eq!(ser(&forward), ser(&again.state));
 }

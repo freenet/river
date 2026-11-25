@@ -1138,25 +1138,20 @@ impl ChatRoomStateV1 {
         // P6 anchor: the newest message of the owner or a member, a pure
         // function of the state at this point (members after ban
         // enforcement), computed once and carried in the plan. With no such
-        // message the anchor is the OLDEST provisional message: an empty
-        // room has no clock, and this ranks every provisional message dated
-        // past it by the slack as untrusted. One provisional author can lower
-        // that anchor with an old message, which only ranks the later
-        // provisional messages by id until a member speaks.
+        // message there is no trustworthy reference (the only candidates are
+        // the provisional messages being ranked, so one old message, or the
+        // probe `admission_status` adds, would re-rank all the others), so
+        // nothing is bounded and provisional messages rank by their own time,
+        // as before.
         let anchor = {
             let member_ids: HashSet<MemberId> =
                 self.members.members.iter().map(|m| m.member.id()).collect();
-            let msgs = &self.recent_messages.messages;
-            msgs.iter()
+            self.recent_messages
+                .messages
+                .iter()
                 .filter(|m| m.message.author == owner_id || member_ids.contains(&m.message.author))
                 .map(|m| m.message.time)
                 .max()
-                .or_else(|| {
-                    msgs.iter()
-                        .filter(|m| ids.contains(&m.message.author))
-                        .map(|m| m.message.time)
-                        .min()
-                })
         };
         ProvisionalPlan {
             ids,
