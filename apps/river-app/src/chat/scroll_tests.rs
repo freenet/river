@@ -120,8 +120,17 @@ fn dm_scroll() -> String {
 
 /// A direct-message thread long enough to scroll, open.
 fn long_dm() -> (Runtime<RiverApp>, String) {
+    long_dm_with(false)
+}
+
+/// The same, with the peer a member of the room (`member`): the box takes text, as in a live
+/// thread. Otherwise it is read-only and says why.
+fn long_dm_with(member: bool) -> (Runtime<RiverApp>, String) {
     let mut rt = dm::app();
     rt.update(|s, _| s.chat.source = super::Source::Node(super::LinkStatus::Live));
+    if member {
+        dm::make_peer_a_member(&mut rt);
+    }
     let mut f = dm::Fixture::new();
     for i in 0..40u64 {
         let (from, to) = if i % 2 == 0 {
@@ -193,26 +202,63 @@ fn dm_line_y(rt: &Runtime<RiverApp>) -> f32 {
 
 #[test]
 fn up_and_down_scroll_a_direct_message_thread_after_a_click_on_text() {
-    let (mut rt, _) = long_dm();
+    for member in [true, false] {
+        let (mut rt, _) = long_dm_with(member);
+        let (x, y) = text_at(&rt, "dm line number 38");
+        click(&mut rt, x, y);
+        let before = dm_line_y(&rt);
+        key(&mut rt, Key::Up);
+        let up = dm_line_y(&rt);
+        assert!(
+            up > before + 20.0,
+            "Up scrolled the thread (member: {member}): {before} -> {up}"
+        );
+        key(&mut rt, Key::Down);
+        assert!(
+            (dm_line_y(&rt) - before).abs() < 1.0,
+            "Down came back (member: {member})"
+        );
+    }
+}
+
+#[test]
+fn a_thread_just_opened_is_scrolled_by_the_arrows_as_a_room_is() {
+    // As in a room, a focused composer owns the arrows (an editable member's box is focused when
+    // the thread opens, and the arrows stay in it until a click). A box that cannot take text
+    // holds no focus, so the arrows scroll the thread at once.
+    for member in [true, false] {
+        let (mut rt, _) = long_dm_with(member);
+        assert_eq!(rt.state.chat.dm.compose_edit().focused, member);
+        let before = dm_line_y(&rt);
+        key(&mut rt, Key::Up);
+        let moved = dm_line_y(&rt) > before + 20.0;
+        assert_eq!(moved, !member, "Up scrolled the thread (member: {member})");
+    }
+}
+
+#[test]
+fn a_box_that_turns_read_only_while_the_thread_is_open_gives_up_the_keyboard() {
+    let (mut rt, _) = long_dm_with(true);
+    assert!(rt.state.chat.dm.compose_edit().focused);
+    // The peer leaves the room.
+    rt.update(|s, _| s.chat.room_mut().unwrap().members[1].full_id = 1);
+    settle(&mut rt);
+    assert!(rt.state.chat.dm_block().is_some());
+    assert!(!rt.state.chat.dm.compose_edit().focused);
     let (x, y) = text_at(&rt, "dm line number 38");
     click(&mut rt, x, y);
+    assert_ne!(focused_key(&rt).as_deref(), Some("dm-composer-field"));
     let before = dm_line_y(&rt);
     key(&mut rt, Key::Up);
-    let up = dm_line_y(&rt);
-    assert!(
-        up > before + 20.0,
-        "Up scrolled the thread: {before} -> {up}"
-    );
-    key(&mut rt, Key::Down);
-    assert!((dm_line_y(&rt) - before).abs() < 1.0, "Down came back");
+    assert!(dm_line_y(&rt) > before + 20.0, "Up scrolled the thread");
 }
 
 #[test]
 fn the_arrows_stay_in_a_direct_message_box_that_has_text() {
-    let (mut rt, _) = long_dm();
+    let (mut rt, _) = long_dm_with(true);
     rt.update(|s, _| s.chat.dm.compose_edit().replace_text("hi"));
     settle(&mut rt);
-    assert!(!rt.state.chat.dm_draft_is_empty());
+    assert_eq!(rt.state.chat.dm.compose_edit().text, "hi");
     let before = dm_line_y(&rt);
     key(&mut rt, Key::Up);
     assert!((dm_line_y(&rt) - before).abs() < 1.0);
@@ -339,4 +385,34 @@ fn up_in_an_empty_composer_still_edits_the_last_message_after_the_history_was_cl
     click(&mut rt, x, y);
     key(&mut rt, Key::Up);
     assert!(rt.find("editing").is_some(), "Up edits my last message");
+}
+
+#[test]
+fn a_click_in_the_thread_blurs_the_direct_message_box() {
+    // `open_dm` hands the box the keyboard by flag. A click on the thread takes it away, as it does
+    // from the room composer (#1022): the box stops counting as focused and the thread has focus.
+    // A box that cannot take text (the peer left the room, a send waits for its answer) gets the
+    // same flag, and has to give it up the same way.
+    for (member, on_text) in [(true, false), (true, true), (false, false), (false, true)] {
+        let (mut rt, scroll) = long_dm_with(member);
+        assert_eq!(rt.state.chat.dm_block().is_none(), member);
+        if member {
+            assert_eq!(focused_key(&rt).as_deref(), Some("dm-composer-field"));
+        }
+        let (x, y) = if on_text {
+            text_at(&rt, "dm line number 38")
+        } else {
+            blank_spot(&rt, &scroll)
+        };
+        click(&mut rt, x, y);
+        assert_eq!(
+            focused_key(&rt).as_deref(),
+            Some(scroll.as_str()),
+            "member: {member}, text click: {on_text}"
+        );
+        assert!(
+            !rt.state.chat.dm.compose_edit().focused,
+            "the box's focus flag is cleared (member: {member}, text click: {on_text})"
+        );
+    }
 }
