@@ -639,53 +639,74 @@ fn initial_viewed_room() -> Option<ViewedRoom> {
 /// public room cannot be cancelled (the client API has no unsubscribe yet) and
 /// lasts until the socket closes.
 pub fn close() {
-    close_inner(None);
+    crate::util::defer(close_now);
 }
 
-/// Whether a deferred redirect captured for `captured` still applies: the
-/// viewer must still show that very room (freenet/river#1047).
-pub fn should_redirect(viewed: Option<VerifyingKey>, captured: VerifyingKey) -> bool {
-    viewed == Some(captured)
+/// What a deferred redirect captured for `captured` does once its timer fires
+/// (freenet/river#1047).
+#[derive(Debug, PartialEq, Eq)]
+pub enum RedirectAction {
+    /// The viewer was closed or shows another room: leave everything alone.
+    Skip,
+    /// The viewed signal was busy: re-arm the effect, nothing else.
+    Retry,
+    /// The viewer still shows the room: select it and close the viewer.
+    SwitchAndClose,
 }
 
-/// The viewed room's owner, or `None` if nothing is viewed or the signal is
-/// busy (`Err`).
-pub fn viewed_owner() -> Result<Option<VerifyingKey>, ()> {
-    VIEWED_ROOM
-        .try_peek()
-        .map(|v| v.as_ref().and_then(|r| r.owner_vk))
-        .map_err(|_| ())
+/// `viewed` is the viewed room's owner (`None`: nothing viewed), or `Err` if
+/// the signal could not be read.
+pub fn redirect_action(
+    viewed: Result<Option<VerifyingKey>, ()>,
+    captured: VerifyingKey,
+) -> RedirectAction {
+    match viewed {
+        Err(()) => RedirectAction::Retry,
+        Ok(v) if v == Some(captured) => RedirectAction::SwitchAndClose,
+        Ok(_) => RedirectAction::Skip,
+    }
 }
 
-/// As [`close`], but only if the viewer still shows `owner` when the deferred
-/// body runs: a timer scheduled for one room must not shut another the user
-/// opened meanwhile.
-pub fn close_if_viewing(owner: VerifyingKey) {
-    close_inner(Some(owner));
-}
-
-fn close_inner(only_if_viewing: Option<VerifyingKey>) {
+/// Open the room `owner`, which the user belongs to, as their own: select it
+/// and close the visitor view of it. One deferred body, so the selection and
+/// the close are decided by the same re-check; a room opened since the effect
+/// ran is left open and the selection unchanged.
+pub fn redirect_to_member_room(owner: VerifyingKey) {
     crate::util::defer(move || {
-        if let Some(owner) = only_if_viewing {
-            if !should_redirect(viewed_owner().ok().flatten(), owner) {
-                return;
+        let viewed = VIEWED_ROOM
+            .try_peek()
+            .map(|v| v.as_ref().and_then(|r| r.owner_vk))
+            .map_err(|_| ());
+        match redirect_action(viewed, owner) {
+            RedirectAction::Skip => {}
+            // Re-arm: the effect would not otherwise run again.
+            RedirectAction::Retry => crate::util::signal_guard::schedule_nudge(),
+            RedirectAction::SwitchAndClose => {
+                *crate::components::app::CURRENT_ROOM.write() = crate::room_data::CurrentRoom {
+                    owner_key: Some(owner),
+                };
+                close_now();
             }
         }
-        crate::public_join::reset();
-        set_mirror(None);
-        *HELD.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        set_answer_held(false);
-        let showing = VIEWED_ROOM.try_read().ok().is_some_and(|v| v.is_some());
-        if showing {
-            *VIEWED_ROOM.write() = None;
-        }
-        // Choosing a room from the rail, or closing the viewer, closes Discover too.
-        if DISCOVER_OPEN.try_read().is_ok_and(|open| *open) {
-            *DISCOVER_OPEN.write() = false;
-        }
-        #[cfg(target_arch = "wasm32")]
-        strip_room_param_from_url();
     });
+}
+
+/// The body of [`close`], for a caller already in a deferred context.
+fn close_now() {
+    crate::public_join::reset();
+    set_mirror(None);
+    *HELD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    set_answer_held(false);
+    let showing = VIEWED_ROOM.try_read().ok().is_some_and(|v| v.is_some());
+    if showing {
+        *VIEWED_ROOM.write() = None;
+    }
+    // Choosing a room from the rail, or closing the viewer, closes Discover too.
+    if DISCOVER_OPEN.try_read().is_ok_and(|open| *open) {
+        *DISCOVER_OPEN.write() = false;
+    }
+    #[cfg(target_arch = "wasm32")]
+    strip_room_param_from_url();
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1826,12 +1847,16 @@ mod tests {
     }
 
     #[test]
-    fn a_redirect_applies_only_while_the_viewer_shows_the_captured_room() {
-        let a = VerifyingKey::from(&ed25519_dalek::SigningKey::from_bytes(&[1; 32]));
-        let b = VerifyingKey::from(&ed25519_dalek::SigningKey::from_bytes(&[2; 32]));
-        assert!(should_redirect(Some(a), a));
-        assert!(!should_redirect(None, a), "viewer already closed");
-        assert!(!should_redirect(Some(b), a), "another room opened since");
+    fn a_redirect_acts_only_while_the_viewer_shows_the_captured_room() {
+        let key = |n: u8| VerifyingKey::from(&ed25519_dalek::SigningKey::from_bytes(&[n; 32]));
+        let (a, b) = (key(1), key(2));
+        assert_eq!(
+            redirect_action(Ok(Some(a)), a),
+            RedirectAction::SwitchAndClose
+        );
+        assert_eq!(redirect_action(Ok(None), a), RedirectAction::Skip);
+        assert_eq!(redirect_action(Ok(Some(b)), a), RedirectAction::Skip);
+        assert_eq!(redirect_action(Err(()), a), RedirectAction::Retry);
     }
 
     #[test]
