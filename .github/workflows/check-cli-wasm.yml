@@ -93,6 +93,12 @@ jobs:
           done
           exit $fail
 
+      - name: Check the committed room contract opts in to update_validates
+        run: |
+          for wasm in ui/public/contracts/room_contract.wasm cli/contracts/room_contract.wasm; do
+            scripts/check-update-validates-export.sh "$wasm"
+          done
+
       - name: Check if riverctl needs a version bump
         run: |
           # Check if WASM-related files changed in this PR/push
