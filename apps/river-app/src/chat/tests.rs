@@ -6468,6 +6468,8 @@ mod rune_bump {
         use super::super::dm_view_tests as dm;
         let thread_app = || {
             let mut rt = dm::app();
+            // A member, so the box takes text and with it the keyboard.
+            dm::make_peer_a_member(&mut rt);
             dm::give(&mut rt, dm::conversation().snapshot(true));
             rt
         };

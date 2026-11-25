@@ -24,6 +24,18 @@ type RiverTestHooks = {
   makeRoomPrivateWithoutSecret(): void;
   // Base58 owner key of an example room a ?room= link can open: "public" or "private"; "member" is a room in the list; "open", "hard" and "full" are public rooms that admit by proof of work (full has its one open slot held); "missing" is a valid key no room has. Only "member" is in the room list.
   viewableRoomKey(kind: "public" | "private" | "missing" | "member" | "open" | "hard" | "full"): string;
+  // Which solver the last join used: "workers" (Web Workers) or "main" (the fallback); "" before any join.
+  powSolverMode(): string;
+  // As retargetPolicy, for the room the user is a member of (the current room). False if there is none.
+  raiseMemberRoomPolicy(kind: "open" | "hard" | "full", bits: number, epoch: number): boolean;
+  // Nonces the join's solver reports tried so far (0 when not solving).
+  powTried(): number;
+  // Whether the last worker pool was handed the page's compiled wasm module (workers then neither fetch nor compile it).
+  powModuleShared(): boolean;
+  // How many times the join's solver followed a changed room policy.
+  powRetargets(): number;
+  // The owner of that example room signs a new open-admission policy (`bits` in `epoch`). False if the viewed room is not public.
+  retargetPolicy(kind: "open" | "hard" | "full", bits: number, epoch: number): boolean;
   // The owner of that open room bans the key the join in progress uses (a provisional ban). False if none.
   banJoiner(kind: "open" | "hard" | "full"): boolean;
   // The room prunes the current room's open-admission member (entry, messages, member_info). `forget` also forgets the proof held this session, as a reload does.

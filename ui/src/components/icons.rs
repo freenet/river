@@ -36,6 +36,8 @@ pub(crate) const REPLY_TARGET_ICON_PATH: &str = "M14 9 9 4 4 9M20 20h-7a4 4 0 0 
 pub(crate) const REACT_ICON_PATH: &str =
     "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM8 14s1.5 2 4 2 4-2 4-2M9 9h.01M15 9h.01";
 pub(crate) const EDIT_ICON_PATH: &str = "M12 20h9M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z";
+/// A circle with a slash: ban.
+pub(crate) const BAN_ICON_PATH: &str = "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM5.6 5.6l12.8 12.8";
 pub(crate) const DELETE_ICON_PATH: &str = "M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6M10 11v6M14 11v6";
 pub(crate) const INFO_ICON_PATH: &str = "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM12 16v-4M12 8h.01";
 pub(crate) const BELL_ICON_PATH: &str =

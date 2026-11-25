@@ -439,6 +439,33 @@ pub async fn sleep(duration: Duration) {
     }
 }
 
+/// Let the browser run its other tasks (input, painting, messages), then
+/// continue. Unlike `setTimeout(0)` a `MessageChannel` message is not held to
+/// the 4 ms minimum Chromium applies to nested timers, so a solver that yields
+/// often does not idle between slices. Works on the page and in a worker.
+pub async fn yield_now() {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let Ok(channel) = web_sys::MessageChannel::new() else {
+            return sleep(Duration::from_millis(0)).await;
+        };
+        let port = channel.port1();
+        let promise = js_sys::Promise::new(&mut |resolve, _| {
+            port.set_onmessage(Some(&resolve));
+        });
+        let _ = channel.port2().post_message(&wasm_bindgen::JsValue::NULL);
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+        port.set_onmessage(None);
+        port.close();
+        channel.port2().close();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = futures_timer::Delay::new(Duration::from_millis(0)).await;
+    }
+}
+
 #[cfg(feature = "example-data")]
 mod name_gen;
 #[cfg(all(test, feature = "example-data"))]
