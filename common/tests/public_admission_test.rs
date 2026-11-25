@@ -2578,3 +2578,132 @@ fn a_sponsored_member_and_another_key_for_their_id_merge_and_verify() {
         merge2(&victim.state, &attacker.state, &base.params);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Provisional ban ranking (newest first) and the provisional message time bound
+// ---------------------------------------------------------------------------
+
+/// A full list keeps the ban just issued and cuts the oldest, whatever the
+/// digests are. A digest-only order cut the new ban about 1 time in 17.
+#[test]
+fn a_new_owner_provisional_ban_is_kept_and_the_oldest_is_cut_on_a_full_list() {
+    for trial in 0..40u16 {
+        let mut p = policy(0, 1);
+        p.max_provisional_bans = 16;
+        let mut room = Room::new(20, 10, Some(p));
+        // Distinct random-ish targets per trial give different digests.
+        let target = |i: u16| id_of(&sk(((trial * 20 + i) % 200 + 20) as u8));
+        for i in 0..16u16 {
+            room.apply(prov_ban_delta(room.prov_ban(
+                None,
+                target(i),
+                1_000 + i as u64,
+            )))
+            .unwrap();
+        }
+        assert_eq!(room.state.provisional.bans.len(), 16);
+        let newest = target(17);
+        room.apply(prov_ban_delta(room.prov_ban(None, newest, 5_000)))
+            .unwrap();
+        let bans = &room.state.provisional.bans;
+        assert_eq!(bans.len(), 16);
+        assert!(
+            bans.iter().any(|b| b.ban.target == newest),
+            "trial {trial}: the new ban was cut"
+        );
+        assert!(
+            !bans.iter().any(|b| b.ban.target == target(0)),
+            "trial {trial}: the oldest ban stays"
+        );
+        for i in 1..16u16 {
+            assert!(
+                bans.iter().any(|b| b.ban.target == target(i)),
+                "trial {trial}"
+            );
+        }
+    }
+}
+
+/// The first ban per target still ranks before repeats: a newer repeat ban on
+/// a target replaces that target's older ban, and a repeat never displaces
+/// another target's only ban.
+#[test]
+fn provisional_ban_repeats_rank_after_first_bans_per_target() {
+    let mut p = policy(0, 1);
+    p.max_provisional_bans = 16;
+    let mut room = Room::new(20, 10, Some(p));
+    let targets: Vec<MemberId> = (0..16u8).map(|i| id_of(&sk(30 + i))).collect();
+    for (i, t) in targets.iter().enumerate() {
+        room.apply(prov_ban_delta(room.prov_ban(None, *t, 1_000 + i as u64)))
+            .unwrap();
+    }
+    // A newer second ban on targets[0]: the 17th record, a repeat of the
+    // oldest one's target. The old ban for that target is what goes.
+    room.apply(prov_ban_delta(room.prov_ban(None, targets[0], 9_000)))
+        .unwrap();
+    let bans = &room.state.provisional.bans;
+    assert_eq!(bans.len(), 16);
+    for t in &targets {
+        assert!(
+            bans.iter().any(|b| b.ban.target == *t),
+            "every target stays banned"
+        );
+    }
+    let for_first: Vec<_> = bans.iter().filter(|b| b.ban.target == targets[0]).collect();
+    assert_eq!(for_first.len(), 1);
+    assert_eq!(
+        for_first[0].ban.banned_at,
+        (SystemTime::UNIX_EPOCH + Duration::from_secs(9_000)).into()
+    );
+}
+
+/// 8 authors with messages dated far ahead and one honest newcomer: the
+/// newcomer is in the pool, in either arrival order.
+#[test]
+fn far_future_provisional_messages_do_not_hold_the_pool() {
+    for futures_first in [true, false] {
+        let mut p = policy(0, 1);
+        p.max_provisional = 8;
+        p.max_provisional_messages = 30;
+        let mut room = Room::new(60, 10, Some(p));
+        let owner = sk(200);
+        room.apply(room.msg_delta(vec![room.msg(&owner, 1_000, "owner")]))
+            .unwrap();
+        let honest = sk(150);
+        let join_futures = |room: &mut Room| {
+            for i in 0..8u8 {
+                room.apply(room.join_delta(&sk(100 + i), 4_000_000_000 + i as u64, "x"))
+                    .unwrap();
+            }
+        };
+        if futures_first {
+            join_futures(&mut room);
+            room.apply(room.join_delta(&honest, 1_005, "hi")).unwrap();
+        } else {
+            room.apply(room.join_delta(&honest, 1_005, "hi")).unwrap();
+            join_futures(&mut room);
+        }
+        assert!(
+            room.has_entry(&honest) && room.has_msg_by(&honest),
+            "futures_first={futures_first}: the honest newcomer was cut from the pool"
+        );
+        assert_eq!(room.state.provisional.entries.len(), 8);
+    }
+}
+
+/// With no member message at all, far-future provisional messages still do
+/// not outrank an honest one.
+#[test]
+fn far_future_provisional_messages_do_not_hold_the_pool_without_member_messages() {
+    let mut p = policy(0, 1);
+    p.max_provisional = 8;
+    p.max_provisional_messages = 30;
+    let mut room = Room::new(60, 10, Some(p));
+    let honest = sk(150);
+    room.apply(room.join_delta(&honest, 1_005, "hi")).unwrap();
+    for i in 0..8u8 {
+        room.apply(room.join_delta(&sk(100 + i), 4_000_000_000 + i as u64, "x"))
+            .unwrap();
+    }
+    assert!(room.has_entry(&honest) && room.has_msg_by(&honest));
+}

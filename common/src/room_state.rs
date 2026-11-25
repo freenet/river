@@ -1695,7 +1695,7 @@ impl<'c> MemberLoop<'c> {
         }
         // A stable sort by newest first, as the plain pass sorts its live
         // messages: filtering this order gives the same order.
-        let mut order: Vec<(crate::room_state::message::MessageOrderKey, MemberId)> = messages
+        let mut order: Vec<(crate::room_state::provisional::ScanKey, MemberId)> = messages
             .messages
             .iter()
             .map(|m| (plan.scan_key(m), m.message.author))
