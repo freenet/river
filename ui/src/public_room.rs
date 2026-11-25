@@ -639,7 +639,38 @@ fn initial_viewed_room() -> Option<ViewedRoom> {
 /// public room cannot be cancelled (the client API has no unsubscribe yet) and
 /// lasts until the socket closes.
 pub fn close() {
-    crate::util::defer(|| {
+    close_inner(None);
+}
+
+/// Whether a deferred redirect captured for `captured` still applies: the
+/// viewer must still show that very room (freenet/river#1047).
+pub fn should_redirect(viewed: Option<VerifyingKey>, captured: VerifyingKey) -> bool {
+    viewed == Some(captured)
+}
+
+/// The viewed room's owner, or `None` if nothing is viewed or the signal is
+/// busy (`Err`).
+pub fn viewed_owner() -> Result<Option<VerifyingKey>, ()> {
+    VIEWED_ROOM
+        .try_peek()
+        .map(|v| v.as_ref().and_then(|r| r.owner_vk))
+        .map_err(|_| ())
+}
+
+/// As [`close`], but only if the viewer still shows `owner` when the deferred
+/// body runs: a timer scheduled for one room must not shut another the user
+/// opened meanwhile.
+pub fn close_if_viewing(owner: VerifyingKey) {
+    close_inner(Some(owner));
+}
+
+fn close_inner(only_if_viewing: Option<VerifyingKey>) {
+    crate::util::defer(move || {
+        if let Some(owner) = only_if_viewing {
+            if !should_redirect(viewed_owner().ok().flatten(), owner) {
+                return;
+            }
+        }
         crate::public_join::reset();
         set_mirror(None);
         *HELD.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -1795,23 +1826,12 @@ mod tests {
     }
 
     #[test]
-    fn a_deferred_member_room_switch_checks_the_viewer_still_shows_that_room() {
-        // The effect that opens a room the user belongs to as their own defers
-        // the switch; the timer can fire after the viewer was closed and
-        // reopened on another room, which the stale close() then shut
-        // (freenet/river#1047, a webkit-only flake in pow-worker.spec.ts).
-        let src = handler_source("components/viewed_room.rs");
-        let deferred_at = src
-            .find("*CURRENT_ROOM.write() = CurrentRoom {\n                    owner_key: Some(owner),")
-            .expect("the deferred switch");
-        let guard_at = src[..deferred_at]
-            .rfind("== Some(owner)")
-            .expect("the guard");
-        let defer_at = src[..deferred_at].rfind("crate::util::defer(").unwrap();
-        assert!(
-            defer_at < guard_at,
-            "the deferred callback must re-check the viewed room first"
-        );
+    fn a_redirect_applies_only_while_the_viewer_shows_the_captured_room() {
+        let a = VerifyingKey::from(&ed25519_dalek::SigningKey::from_bytes(&[1; 32]));
+        let b = VerifyingKey::from(&ed25519_dalek::SigningKey::from_bytes(&[2; 32]));
+        assert!(should_redirect(Some(a), a));
+        assert!(!should_redirect(None, a), "viewer already closed");
+        assert!(!should_redirect(Some(b), a), "another room opened since");
     }
 
     #[test]
