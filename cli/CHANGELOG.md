@@ -2,6 +2,31 @@
 
 All notable changes to riverctl will be documented in this file.
 
+## [0.2.31] - Unreleased
+
+Built against river-core 0.6.0 and the new room contract. Rooms migrate to the
+new contract automatically. (This file has no entries between 0.2.23 and this
+one.)
+
+### Changed
+- Times that a room signs (messages, bans) keep their exact signed value
+  (`SignedTime`) through encoding and decoding, instead of being rounded
+  (freenet/river#1018).
+- The room contract validates a delta incrementally rather than re-checking the
+  whole room state (freenet/river#1031), and opts in to `update_validates`, so
+  a host that supports it does not validate an update's result a second time.
+- Open (public) rooms: the provisional-member ceilings are raised, each author
+  has a cap on provisional messages, and when a room is over its provisional
+  ban cap the newest bans are kept (freenet/river#982, #1037, #1041).
+
+### Fixed
+- The chat delegate reports a failed secret write during key rotation instead
+  of dropping it (freenet/river#1006, #1038).
+
+river-core 0.6.0: adds `SignedTime`, the room-state changes above, and the
+contract opt-in. Any river-core version change re-keys the room contract and
+the chat delegate; the outgoing generation is registered.
+
 ## [0.2.23] - Unreleased
 
 ### Changed
