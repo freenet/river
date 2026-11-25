@@ -48,11 +48,21 @@ use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStat
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-/// Nonces tried between two yields to the browser. About ten milliseconds of
-/// hashing in wasm, so the page stays responsive.
-const SLICE: u64 = 10_000;
-/// Slices between two progress updates (about a tenth of a second).
-const PROGRESS_EVERY: u32 = 10;
+/// Nonces tried between two looks at the clock when solving on the main
+/// thread (the fallback when workers are unavailable).
+const BUDGET: u64 = 2_048;
+/// Milliseconds of hashing on the main thread between two yields to the
+/// browser, so the page stays responsive and Cancel works.
+const SLICE_MS: u64 = 12;
+/// Milliseconds between two progress updates.
+const PROGRESS_MS: u64 = 100;
+/// Milliseconds between two looks at whether the room still admits this
+/// visitor on the same terms.
+const RECHECK_MS: u64 = 500;
+/// Longest a worker-driven solve goes without checking for a cancel, a test
+/// hold, or the room check.
+#[cfg(target_arch = "wasm32")]
+const WAKE_MS: u32 = 100;
 
 /// Why a join stopped, in words the visitor can act on.
 #[derive(Debug, Clone, PartialEq)]
@@ -347,6 +357,10 @@ pub struct JoinUi {
     /// A refusal that does not stop the join in progress (a message that is
     /// too long, or one sent while posting): shown with the composer.
     pub notice: Option<String>,
+    /// The solve in progress is because the room raised what it asks of
+    /// newcomers (more bits, or a new epoch voiding the proof held): shown as
+    /// an explanation, not an error.
+    pub raised: bool,
 }
 
 impl Default for JoinUi {
@@ -357,6 +371,7 @@ impl Default for JoinUi {
             queued: Vec::new(),
             returned: Vec::new(),
             notice: None,
+            raised: false,
         }
     }
 }
@@ -386,6 +401,11 @@ impl JoinUi {
         } else {
             None
         }
+    }
+
+    /// Whether `owner`'s solve is because the room raised what it asks.
+    pub fn raised_for(&self, owner: &VerifyingKey) -> bool {
+        self.owner.as_ref() == Some(owner) && self.raised
     }
 
     pub fn has_returned_for(&self, owner: &VerifyingKey) -> bool {
@@ -448,6 +468,7 @@ pub struct Machine {
     in_flight: Vec<String>,
     returned: Vec<(VerifyingKey, String)>,
     notice: Option<String>,
+    raised: bool,
     signing_key: Option<SigningKey>,
     entry: Option<AuthorizedProvisionalMember>,
     readmit: bool,
@@ -470,6 +491,7 @@ impl Machine {
             in_flight: Vec::new(),
             returned: Vec::new(),
             notice: None,
+            raised: false,
             signing_key: None,
             entry: None,
             readmit: false,
@@ -486,6 +508,14 @@ impl Machine {
             queued: self.in_flight.iter().chain(&self.queue).cloned().collect(),
             returned: self.returned.clone(),
             notice: self.notice.clone(),
+            raised: self.raised,
+        }
+    }
+
+    /// The room raised what it asks (see [`JoinUi::raised`]); only while solving.
+    pub fn note_raised(&mut self, generation: u64) {
+        if self.is_current(generation) && matches!(self.phase, JoinPhase::Solving { .. }) {
+            self.raised = true;
         }
     }
 
@@ -533,6 +563,7 @@ impl Machine {
         self.signing_key = None;
         self.entry = None;
         self.readmit = false;
+        self.raised = false;
     }
 
     /// Stop whatever is under way for another room. Its messages are handed
@@ -569,6 +600,7 @@ impl Machine {
         self.readmit = plan.readmit;
         self.joined = None;
         self.notice = None;
+        self.raised = false;
         self.phase = JoinPhase::Solving {
             tried: 0,
             expected: 0.0,
@@ -694,6 +726,7 @@ impl Machine {
         all.append(&mut self.queue);
         self.queue = all;
         self.entry = None;
+        self.raised = false;
         self.generation += 1;
         self.phase = JoinPhase::Solving {
             tried: 0,
@@ -804,12 +837,11 @@ fn machine() -> std::sync::MutexGuard<'static, Machine> {
 
 /// Run `f` on the machine, show the result, and carry out what it returns.
 fn step<T>(f: impl FnOnce(&mut Machine) -> T) -> T {
-    let (out, ui) = {
+    let out = {
         let mut m = machine();
-        let out = f(&mut m);
-        (out, m.ui())
+        f(&mut m)
     };
-    update_ui(move |j| *j = ui);
+    publish_ui();
     out
 }
 
@@ -836,24 +868,52 @@ fn fail(generation: u64, failure: JoinFailure) {
 /// The proof each room last admitted this session, so a member the room pruned
 /// is re-submitted at once when the policy still accepts it. Process memory
 /// only: after a reload the proof is solved again, with the same key.
-static HELD: Mutex<Vec<(VerifyingKey, AuthorizedProvisionalMember)>> = Mutex::new(Vec::new());
+/// Proofs made this session: the room, the entry, and the difficulty the room
+/// asked for when it was made (to tell a raised difficulty from other changes).
+type Held = (VerifyingKey, AuthorizedProvisionalMember, Option<u8>);
+static HELD: Mutex<Vec<Held>> = Mutex::new(Vec::new());
 
-fn held_lock() -> std::sync::MutexGuard<'static, Vec<(VerifyingKey, AuthorizedProvisionalMember)>> {
+fn held_lock() -> std::sync::MutexGuard<'static, Vec<Held>> {
     HELD.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn remember_entry(owner_vk: VerifyingKey, entry: AuthorizedProvisionalMember) {
+fn remember_entry(owner_vk: VerifyingKey, entry: AuthorizedProvisionalMember, bits: Option<u8>) {
     let mut held = held_lock();
-    held.retain(|(o, _)| *o != owner_vk);
-    held.push((owner_vk, entry));
+    held.retain(|(o, _, _)| *o != owner_vk);
+    held.push((owner_vk, entry, bits));
+}
+
+/// The difficulty `state`'s policy asks for.
+fn policy_bits(state: &ChatRoomStateV1) -> Option<u8> {
+    state
+        .configuration
+        .configuration
+        .public_admission
+        .as_ref()?
+        .pow
+        .as_ref()
+        .map(|p| p.difficulty_bits)
+}
+
+/// Whether `state` asks for more than the `held` proof was made for.
+fn difficulty_raised(state: &ChatRoomStateV1, held_bits: Option<u8>) -> bool {
+    matches!((policy_bits(state), held_bits), (Some(now), Some(then)) if now > then)
+}
+
+/// The difficulty the proof held for `owner_vk`'s room was made for.
+fn held_bits(owner_vk: &VerifyingKey) -> Option<u8> {
+    held_lock()
+        .iter()
+        .find(|(o, _, _)| o == owner_vk)
+        .and_then(|(_, _, b)| *b)
 }
 
 /// The proof held for `owner_vk`'s room, if this session made one.
 pub fn held_entry(owner_vk: &VerifyingKey) -> Option<AuthorizedProvisionalMember> {
     held_lock()
         .iter()
-        .find(|(o, _)| o == owner_vk)
-        .map(|(_, e)| e.clone())
+        .find(|(o, _, _)| o == owner_vk)
+        .map(|(_, e, _)| e.clone())
 }
 
 /// Test hook support: forget every held proof, as a reload does.
@@ -882,15 +942,27 @@ pub fn readmit_note(
     owner_vk: &VerifyingKey,
     member_vk: &VerifyingKey,
     entry: Option<&AuthorizedProvisionalMember>,
+    held_bits: Option<u8>,
     now: SystemTime,
 ) -> String {
     match check_admission_status(state, owner_vk, member_vk, entry, now) {
         Ok(_) if entry.is_some() => {
-            "The room removed you for being quiet. Your next message rejoins.".to_string()
+            "The room keeps a limited number of newcomers and their recent messages, \
+            and newer activity pushed yours out. Your next message rejoins."
+                .to_string()
         }
-        Ok(_) | Err(JoinFailure::PolicyChanged) => "The room removed you for being quiet. \
+        // The proof held no longer passes because the room asks for more bits.
+        Err(JoinFailure::PolicyChanged) if difficulty_raised(state, held_bits) => {
+            "Room security was raised. \
             Your next message rejoins after a short proof of work."
-            .to_string(),
+                .to_string()
+        }
+        Ok(_) | Err(JoinFailure::PolicyChanged) => {
+            "The room keeps a limited number of newcomers and their recent messages, \
+            and newer activity pushed yours out. \
+            Your next message rejoins after a short proof of work."
+                .to_string()
+        }
         Err(f) => f.message(),
     }
 }
@@ -903,14 +975,22 @@ pub fn readmit_note_for(room: &crate::room_data::RoomData) -> Option<String> {
         &room.owner_vk,
         &member_vk,
         held_entry(&room.owner_vk).as_ref(),
+        held_bits(&room.owner_vk),
         crate::util::get_current_system_time(),
     ))
 }
 
-/// Write the UI state from a clean execution context.
-fn update_ui(f: impl FnOnce(&mut JoinUi) + 'static) {
+/// Show the machine's state, from a clean execution context.
+///
+/// The state is read when the deferred closure RUNS, never captured when it is
+/// scheduled: deferred closures do not run in the order they were scheduled
+/// (a timer scheduled from inside a chain of timers is held to 4 ms, one from
+/// an event handler is not), so a snapshot taken at schedule time can overwrite
+/// a newer state.
+fn publish_ui() {
     crate::util::defer(move || {
-        JOIN.with_mut(f);
+        let ui = machine().ui();
+        JOIN.with_mut(|j| *j = ui);
     });
 }
 
@@ -930,6 +1010,15 @@ fn viewed_state() -> Option<(VerifyingKey, ChatRoomStateV1)> {
 #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
 pub fn session_member_vk() -> Option<VerifyingKey> {
     machine().signing_key.as_ref().map(|k| k.verifying_key())
+}
+
+/// Nonces the join in progress reports tried (test hooks; 0 when not solving).
+#[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+pub fn tried_for_test() -> u64 {
+    match machine().ui().phase {
+        JoinPhase::Solving { tried, .. } => tried,
+        _ => 0,
+    }
 }
 
 /// Test hook support: while set, the solver does no work, so a test that must
@@ -1049,8 +1138,7 @@ pub fn send(owner_vk: VerifyingKey, text: String) {
 pub fn take_returned(owner_vk: &VerifyingKey) -> Option<String> {
     let taken = machine().take_returned(owner_vk);
     if taken.is_some() {
-        let ui = machine().ui();
-        update_ui(move |j| *j = ui);
+        publish_ui();
     }
     taken
 }
@@ -1073,10 +1161,243 @@ pub fn take_carried_draft() -> String {
     };
     let taken = machine().take_carried(&owner);
     if taken.is_some() {
-        let ui = machine().ui();
-        update_ui(move |j| *j = ui);
+        publish_ui();
     }
     taken.unwrap_or_default()
+}
+
+/// How a solve ended.
+enum Solve {
+    Nonce(u64),
+    /// The join was cancelled or superseded.
+    Stopped,
+    Failed(JoinFailure),
+}
+
+/// What the room asks of this visitor, rechecked now and then while solving:
+/// it may change (a new epoch restarts the search, more bits raise the
+/// target), and one that no longer admits stops the solve.
+struct RoomWatch {
+    owner_vk: VerifyingKey,
+    member_vk: VerifyingKey,
+    readmit: bool,
+    req: PowRequirement,
+    checked: SystemTime,
+    /// The last change `check` saw asks for more than before.
+    raised: bool,
+}
+
+impl RoomWatch {
+    fn new(
+        owner_vk: VerifyingKey,
+        member_vk: VerifyingKey,
+        readmit: bool,
+        req: PowRequirement,
+    ) -> Self {
+        Self {
+            owner_vk,
+            member_vk,
+            readmit,
+            req,
+            checked: crate::util::get_current_system_time(),
+            raised: false,
+        }
+    }
+
+    /// `Ok(true)` when the requirement changed (`self.req` is the new one).
+    /// Looks at the room at most every [`RECHECK_MS`]: it clones the room state.
+    fn check(&mut self) -> Result<bool, JoinFailure> {
+        let now = crate::util::get_current_system_time();
+        if elapsed_ms(self.checked, now) < RECHECK_MS {
+            return Ok(false);
+        }
+        self.checked = now;
+        let Some(state) = source_state(&self.owner_vk, self.readmit) else {
+            return Ok(false);
+        };
+        match check_admission_status(&state, &self.owner_vk, &self.member_vk, None, now) {
+            Ok(new_req) if new_req != self.req => {
+                self.raised = new_req.difficulty_bits > self.req.difficulty_bits;
+                self.req = new_req;
+                Ok(true)
+            }
+            Ok(_) => Ok(false),
+            Err(f) => Err(f),
+        }
+    }
+
+    /// Whether `nonce` meets what the room now asks.
+    #[cfg(target_arch = "wasm32")]
+    fn accepts(&self, nonce: u64) -> bool {
+        let hash = river_core::room_state::provisional::pow_hash(
+            &self.owner_vk,
+            &self.member_vk,
+            self.req.epoch,
+            nonce,
+        );
+        river_core::room_state::provisional::leading_zero_bits(&hash)
+            >= self.req.difficulty_bits as u32
+    }
+}
+
+fn elapsed_ms(from: SystemTime, to: SystemTime) -> u64 {
+    to.duration_since(from).unwrap_or_default().as_millis() as u64
+}
+
+/// Test hook: a held solver does no hashing but still rechecks the room, so a
+/// ban or policy change is seen.
+fn solver_held_for_test() -> bool {
+    #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+    {
+        HOLD_SOLVER.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync")))]
+    {
+        false
+    }
+}
+
+/// Test hook: which solver a join used last, "workers" or "main".
+#[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+pub static SOLVER_MODE: Mutex<&'static str> = Mutex::new("");
+
+/// Test hook: how many times a solve followed a changed room policy.
+#[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+pub static RETARGETS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn note_retarget() {
+    #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+    RETARGETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn note_solver_mode(_mode: &'static str) {
+    #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+    {
+        *SOLVER_MODE.lock().unwrap_or_else(|e| e.into_inner()) = _mode;
+    }
+}
+
+/// Solve in Web Workers, off the page's main thread, and on the main thread
+/// when workers cannot be had.
+async fn solve(generation: u64, mut watch: RoomWatch) -> Solve {
+    #[cfg(target_arch = "wasm32")]
+    if let Some(done) = solve_in_workers(generation, &mut watch).await {
+        return done;
+    }
+    note_solver_mode("main");
+    solve_on_main_thread(generation, &mut watch).await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn solve_in_workers(generation: u64, watch: &mut RoomWatch) -> Option<Solve> {
+    let spawned = crate::pow_worker::Pool::spawn(crate::pow_worker::worker_count(), || {
+        is_current(generation)
+    })
+    .await;
+    if !is_current(generation) {
+        return Some(Solve::Stopped);
+    }
+    let mut pool = spawned?;
+    note_solver_mode("workers");
+    let mut held = solver_held_for_test();
+    pool.start(&watch.owner_vk, &watch.member_vk, &watch.req, held);
+    let mut tried = vec![0u64; pool.len()];
+    let mut reported = SystemTime::UNIX_EPOCH;
+    loop {
+        if !is_current(generation) {
+            return Some(Solve::Stopped);
+        }
+        let now_held = solver_held_for_test();
+        if now_held != held {
+            held = now_held;
+            pool.pause(held);
+        }
+        use crate::pow_worker::FromWorker;
+        match pool.next(WAKE_MS).await {
+            Some((_, FromWorker::Found { nonce })) => {
+                if watch.accepts(nonce) {
+                    return Some(Solve::Nonce(nonce));
+                }
+                // Found for a target the room has since raised: carry on.
+                pool.retarget(&watch.req);
+            }
+            // A count from before a retarget to a new epoch is not about this one.
+            Some((_, FromWorker::Progress { epoch, .. })) if epoch != watch.req.epoch => {}
+            Some((i, FromWorker::Progress { tried: t, .. })) => {
+                tried[i] = t;
+                let now = crate::util::get_current_system_time();
+                if elapsed_ms(reported, now) >= PROGRESS_MS {
+                    reported = now;
+                    let (sum, expected) = (tried.iter().sum(), watch.req.expected_hashes);
+                    step(|m| m.progress(generation, sum, expected));
+                }
+            }
+            Some((_, FromWorker::Failed(_))) => return None,
+            Some((_, FromWorker::Ready)) | None => {}
+        }
+        let epoch = watch.req.epoch;
+        match watch.check() {
+            Err(f) => return Some(Solve::Failed(f)),
+            Ok(true) => {
+                note_retarget();
+                if watch.raised {
+                    step(|m| m.note_raised(generation));
+                }
+                pool.retarget(&watch.req);
+                if watch.req.epoch != epoch {
+                    tried.fill(0);
+                }
+            }
+            Ok(false) => {}
+        }
+    }
+}
+
+async fn solve_on_main_thread(generation: u64, watch: &mut RoomWatch) -> Solve {
+    let mut solver = PowSolver::new(
+        &watch.owner_vk,
+        &watch.member_vk,
+        &watch.req,
+        watch.req.difficulty_bits,
+    );
+    let mut reported = SystemTime::UNIX_EPOCH;
+    loop {
+        if !is_current(generation) {
+            return Solve::Stopped;
+        }
+        if solver_held_for_test() {
+            crate::util::sleep(std::time::Duration::from_millis(20)).await;
+        } else {
+            let began = crate::util::get_current_system_time();
+            loop {
+                match solver.step(BUDGET) {
+                    PowStep::Found { nonce, .. } => return Solve::Nonce(nonce),
+                    PowStep::Progress { tried, expected } => {
+                        let now = crate::util::get_current_system_time();
+                        if elapsed_ms(reported, now) >= PROGRESS_MS {
+                            reported = now;
+                            step(|m| m.progress(generation, tried, expected));
+                        }
+                        if elapsed_ms(began, now) >= SLICE_MS {
+                            break;
+                        }
+                    }
+                }
+            }
+            crate::util::yield_now().await;
+        }
+        match watch.check() {
+            Err(f) => return Solve::Failed(f),
+            Ok(true) => {
+                note_retarget();
+                if watch.raised {
+                    step(|m| m.note_raised(generation));
+                }
+                solver.retarget(&watch.req, watch.req.difficulty_bits);
+            }
+            Ok(false) => {}
+        }
+    }
 }
 
 async fn run(generation: u64, owner_vk: VerifyingKey) {
@@ -1105,11 +1426,15 @@ async fn run(generation: u64, owner_vk: VerifyingKey) {
                 let action = step(|m| m.solved(generation, entry));
                 return act(action, owner_vk);
             }
-            Err(JoinFailure::PolicyChanged) => {}
+            Err(JoinFailure::PolicyChanged) => {
+                if difficulty_raised(&state, held_bits(&owner_vk)) {
+                    step(|m| m.note_raised(generation));
+                }
+            }
             Err(f) => return fail(generation, f),
         }
     }
-    let mut req = match check_admission_status(
+    let req = match check_admission_status(
         &state,
         &owner_vk,
         &member_vk,
@@ -1119,50 +1444,15 @@ async fn run(generation: u64, owner_vk: VerifyingKey) {
         Ok(r) => r,
         Err(f) => return fail(generation, f),
     };
-    let mut solver = PowSolver::new(&owner_vk, &member_vk, &req, req.difficulty_bits);
-    let mut slices = 0u32;
-    let nonce = loop {
-        if !is_current(generation) {
-            return;
-        }
-        // Test hook: a held solver skips the hashing but still re-checks the
-        // room below, so a ban or policy change is seen.
-        #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
-        let held_for_test = HOLD_SOLVER.load(std::sync::atomic::Ordering::Relaxed);
-        #[cfg(not(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync")))]
-        let held_for_test = false;
-        if !held_for_test {
-            match solver.step(SLICE) {
-                PowStep::Found { nonce, .. } => break nonce,
-                PowStep::Progress { tried, expected } => {
-                    slices += 1;
-                    if slices % PROGRESS_EVERY == 1 {
-                        step(|m| m.progress(generation, tried, expected));
-                    }
-                }
-            }
-        }
-        // The room may change what it asks of newcomers while this runs
-        // (a new epoch restarts the search, more bits raise the target); one
-        // that no longer admits stops it.
-        if let Some(now_state) = source_state(&owner_vk, readmit) {
-            match check_admission_status(
-                &now_state,
-                &owner_vk,
-                &member_vk,
-                None,
-                crate::util::get_current_system_time(),
-            ) {
-                Ok(new_req) if new_req != req => {
-                    solver.retarget(&new_req, new_req.difficulty_bits);
-                    req = new_req;
-                }
-                Ok(_) => {}
-                Err(f) => return fail(generation, f),
-            }
-        }
-        // Yield to the browser so the page stays responsive and Cancel works.
-        crate::util::sleep(std::time::Duration::from_millis(0)).await;
+    let nonce = match solve(
+        generation,
+        RoomWatch::new(owner_vk, member_vk, readmit, req),
+    )
+    .await
+    {
+        Solve::Nonce(n) => n,
+        Solve::Stopped => return,
+        Solve::Failed(f) => return fail(generation, f),
     };
     if !is_current(generation) {
         return;
@@ -1198,6 +1488,7 @@ async fn submit(generation: u64, owner_vk: VerifyingKey) {
     let Some(state) = source_state(&owner_vk, readmit) else {
         return fail(generation, JoinFailure::NotOpen);
     };
+    let solved_bits = policy_bits(&state);
     let nickname = nickname_for(&owner_vk, &signing_key, readmit);
     let submission = match build_submission_many(
         &state,
@@ -1243,7 +1534,7 @@ async fn submit(generation: u64, owner_vk: VerifyingKey) {
             // The messages go back to the composer; nothing was posted.
             return fail(generation, f);
         }
-        remember_entry(owner_vk, entry);
+        remember_entry(owner_vk, entry, solved_bits);
         step(|m| m.succeed(generation));
         if !readmit {
             crate::public_room::close();
@@ -1685,6 +1976,54 @@ mod tests {
     }
 
     #[test]
+    fn a_newcomer_ban_built_by_the_menu_is_kept_by_the_rooms_own_apply() {
+        use crate::components::conversation::newcomer_ban::{
+            ban_refusal, build_ban, outcome, BanOutcome,
+        };
+        use river_core::room_state::provisional::ProvisionalDelta;
+        use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
+        let state = room(PrivacyMode::Public, Some(policy(6, 2)));
+        let sk = SigningKey::from_bytes(&[41u8; 32]);
+        let (owner_vk, entry) = solved(&state, &sk);
+        let sub = build_submission(
+            &state,
+            &owner_vk,
+            &sk,
+            &entry,
+            "hi",
+            "Visitor",
+            SystemTime::now(),
+        )
+        .unwrap();
+        let mut after = sub.state_after;
+        let target = MemberId::from(&sk.verifying_key());
+        assert!(ban_refusal(&after, &owner_vk, Some(&owner_vk), target).is_none());
+        let ban = build_ban(&owner_vk, &owner(), target, SystemTime::now());
+        let before = after.clone();
+        after
+            .apply_delta(
+                &before,
+                &ChatRoomParametersV1 { owner: owner_vk },
+                &Some(ChatRoomStateV1Delta {
+                    provisional: Some(ProvisionalDelta {
+                        entries: vec![],
+                        bans: vec![ban.clone()],
+                    }),
+                    ..Default::default()
+                }),
+            )
+            .expect("the room accepts the ban");
+        assert_eq!(
+            outcome(&before.provisional.bans, &after, &ban),
+            BanOutcome::Stands
+        );
+        assert!(
+            ban_refusal(&after, &owner_vk, Some(&owner_vk), target).is_some(),
+            "not offered again"
+        );
+    }
+
+    #[test]
     fn a_pruned_open_member_is_told_and_a_held_proof_is_resubmitted_with_the_same_key() {
         let (data, sk, entry) = pruned_member();
         assert!(data.is_pruned_open_member());
@@ -1699,9 +2038,18 @@ mod tests {
             &owner_vk,
             &sk.verifying_key(),
             Some(&entry),
+            Some(2),
             now,
         );
         assert!(note.contains("Your next message rejoins."), "{note}");
+        assert!(
+            note.contains(
+                "The room keeps a limited number of newcomers and their recent messages, \
+                 and newer activity pushed yours out."
+            ),
+            "{note}"
+        );
+        assert!(!note.contains("quiet"), "{note}");
         // The held proof still passes, so it goes out as it is.
         let sub = build_submission(&data.room_state, &owner_vk, &sk, &entry, "again", "Me", now)
             .expect("re-admitted");
@@ -1734,9 +2082,37 @@ mod tests {
             &owner_vk,
             &sk.verifying_key(),
             Some(&old_entry),
+            Some(2),
             now,
         );
         assert!(note.contains("proof of work"), "{note}");
+        // The proof was made for 2 bits and the room now asks for 6.
+        assert!(note.contains("Room security was raised"), "{note}");
+        assert!(!note.contains("quiet"), "{note}");
+        // A new epoch at the same difficulty is not a raise, and an unknown
+        // difficulty (a reload) is not claimed to be one.
+        for held in [Some(6), None] {
+            let other = readmit_note(
+                &data.room_state,
+                &owner_vk,
+                &sk.verifying_key(),
+                Some(&old_entry),
+                held,
+                now,
+            );
+            assert!(!other.contains("security was raised"), "{other}");
+            // A pruned newcomer is told why, in plain words: newer arrivals
+            // took the limited newcomer places, not that they were quiet.
+            assert!(
+                other.contains(
+                    "The room keeps a limited number of newcomers and their recent messages, \
+                     and newer activity pushed yours out."
+                ),
+                "{other}"
+            );
+            assert!(other.contains("proof of work"), "{other}");
+            assert!(!other.contains("quiet"), "{other}");
+        }
         assert_eq!(
             build_submission(&data.room_state, &owner_vk, &sk, &old_entry, "x", "Me", now)
                 .unwrap_err(),
@@ -1774,6 +2150,7 @@ mod tests {
             &owner_vk,
             &sk.verifying_key(),
             Some(&entry),
+            None,
             now,
         );
         assert_eq!(note, JoinFailure::Banned.message());
@@ -1791,6 +2168,28 @@ mod tests {
             &owner(),
         ));
         assert!(!data.is_pruned_open_member());
+    }
+
+    #[test]
+    fn the_ui_is_published_from_the_machine_when_the_closure_runs() {
+        // See `publish_ui`: a snapshot captured at schedule time can land
+        // after a newer one.
+        let src = include_str!("public_join.rs");
+        let production = src.split("#[cfg(test)]").next().unwrap();
+        assert!(
+            !production.contains("update_ui"),
+            "a captured snapshot is back"
+        );
+        assert!(
+            !production.contains("*j = ui;\n        });\n    });"),
+            "snapshot"
+        );
+        let publish = production.split("fn publish_ui()").nth(1).unwrap();
+        let body = publish.split("\n}\n").next().unwrap();
+        assert!(
+            body.contains("defer(move || {\n        let ui = machine().ui();"),
+            "the machine must be read inside the deferred closure: {body}"
+        );
     }
 
     #[test]
@@ -1832,6 +2231,40 @@ mod tests {
 
     fn returned(m: &mut Machine, owner: &VerifyingKey) -> String {
         m.take_returned(owner).unwrap_or_default()
+    }
+
+    #[test]
+    fn a_solve_the_room_forced_is_marked_raised_only_while_it_runs() {
+        let (a, mut m) = (vk(1), Machine::new());
+        let Action::Solve(g) = m.send(a, "one", limits(), fresh()) else {
+            panic!("the first send starts the solve");
+        };
+        assert!(!m.ui().raised, "an ordinary join is not a raise");
+        m.note_raised(g + 1);
+        assert!(!m.ui().raised, "a stale generation is ignored");
+        m.note_raised(g);
+        assert!(m.ui().raised);
+        assert!(m.ui().raised_for(&a) && !m.ui().raised_for(&vk(2)));
+        m.cancel();
+        assert!(!m.ui().raised, "cancel clears it");
+        let Action::Solve(g) = m.send(a, "two", limits(), fresh()) else {
+            panic!("a new join starts");
+        };
+        assert!(!m.ui().raised, "and starts without it");
+        // A proof the room rejects at submit solves again with the message
+        // kept once; it is "raised" only if the driver says the bits grew.
+        m.note_raised(g);
+        assert_eq!(m.solved(g, some_entry()), Action::Submit(g));
+        let Action::Solve(g2) = m.restart_solving(g) else {
+            panic!("solves again");
+        };
+        assert!(!m.ui().raised, "a restart does not claim a raise by itself");
+        assert_eq!(m.ui().queued, vec!["two"], "kept once");
+        m.note_raised(g2);
+        assert!(m.ui().raised);
+        assert_eq!(m.solved(g2, some_entry()), Action::Submit(g2));
+        assert!(m.succeed(g2).is_some());
+        assert!(!m.ui().raised, "re-admission clears it");
     }
 
     #[test]

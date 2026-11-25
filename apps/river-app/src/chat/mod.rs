@@ -1233,16 +1233,8 @@ impl Chat {
             rune::Key::Down => LINE,
             _ => return false,
         };
-        // A direct-message thread's own box counts as nothing while it is empty (the DM box
-        // focus-flag issue, #1022, is why this workaround exists; remove it with
-        // that fix): it has no
-        // Up-to-edit, and a click in the thread leaves the box focused (rune does not blur a box
-        // focused by `open_dm`), so the thread's arrows must work from there.
-        let in_empty_dm_box = tx.focused() == Some("dm-composer-field")
-            && self.dm.is_open()
-            && self.dm_draft_is_empty();
         if ev.mods != rune::Mods::default()
-            || (tx.focused().is_some() && !in_empty_dm_box)
+            || tx.focused().is_some()
             || self.dialog_open()
             || self.members_overlay
             || self.emoji_open

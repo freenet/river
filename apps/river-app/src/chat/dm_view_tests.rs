@@ -123,6 +123,13 @@ pub(super) fn peer_key() -> String {
     dm::peer_key(id(PEER))
 }
 
+/// Make the fixture's peer a member of the open room, so a thread with them has a box that takes
+/// text (without it the box is read-only and says the person is not a member).
+pub(super) fn make_peer_a_member(rt: &mut Runtime<RiverApp>) {
+    let peer: i64 = peer_key().parse().unwrap();
+    rt.update(move |s, _| s.chat.room_mut().unwrap().members[1].full_id = peer);
+}
+
 pub(super) fn app() -> Runtime<RiverApp> {
     let mut state = RiverApp::detached();
     state.setup = Setup::Connected {
@@ -1761,6 +1768,43 @@ mod sending {
         rt.update(|s, _| s.chat.dm_write("ok thanks"));
         answer(&mut rt, t3, Ok(()));
         assert_eq!(the_box(&rt, ROOM, &uid), "ok thanks");
+    }
+
+    #[test]
+    fn a_box_made_read_only_by_a_send_is_not_focused_and_takes_the_keyboard_back_when_answered() {
+        use std::time::Instant;
+        let (mut rt, uid) = open_with("Jonas");
+        let focused = |rt: &Runtime<RiverApp>| {
+            rt.elements()
+                .into_iter()
+                .find(|e| e.focused)
+                .and_then(|e| e.key)
+        };
+        assert_eq!(focused(&rt).as_deref(), Some("dm-composer-field"));
+        type_text(&mut rt, "first");
+        assert!(rt.state.chat.dm_send_at(Instant::now()));
+        rt.invalidate();
+        rt.frame(0.2);
+        rt.frame(0.8);
+        assert!(
+            !rt.state.chat.dm.compose_edit_focused(),
+            "a read-only box does not count as focused"
+        );
+        assert_ne!(focused(&rt).as_deref(), Some("dm-composer-field"));
+        let Action::SendDm { ticket, .. } = sent(&rt)[0].1.clone() else {
+            panic!()
+        };
+        let u = uid.clone();
+        rt.update(move |s, _| {
+            s.chat.dm_sent(ROOM, &u, ticket, Ok(()));
+        });
+        rt.invalidate();
+        rt.frame(0.2);
+        rt.frame(0.8);
+        // The answer came: the user types on without a click.
+        assert_eq!(focused(&rt).as_deref(), Some("dm-composer-field"));
+        type_text(&mut rt, "second");
+        assert_eq!(the_box(&rt, ROOM, &uid), "second");
     }
 
     #[test]
