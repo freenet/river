@@ -35,6 +35,10 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TOML_PATH="pointer-records.toml"
+# The repo-relative path, for `git show <base>:<path>`. TOML_PATH itself is rebound to a
+# temp file in CI mode, and `git show <sha>:/tmp/...` fails silently (2>/dev/null), which
+# skipped the no-vanish and version-must-increase checks entirely.
+TOML_REL="$TOML_PATH"
 FREENET_MD="FREENET.md"
 
 # The signing/verifying tool, pinned by revision. Pinned rather than floating for
@@ -170,7 +174,7 @@ FAILED=0
 # silent.
 if [ "$MODE" = "ci" ]; then
     BASE_TOML_ALL="$(mktemp)"
-    if git show "$BASE_SHA:$TOML_PATH" > "$BASE_TOML_ALL" 2>/dev/null; then
+    if git show "$BASE_SHA:$TOML_REL" > "$BASE_TOML_ALL" 2>/dev/null; then
         # Compared as exact STRINGS via `grep -qxF` against the head file's
         # extracted app_id list — never by interpolating the app_id into a
         # regex. Both real app_ids contain a `.`, which is a regex wildcard, so
@@ -268,7 +272,7 @@ for i in $(seq 1 "$N"); do
     # downstream would ever tell us the release was ignored.
     if [ "$MODE" = "ci" ]; then
         BASE_TOML="$(mktemp)"
-        if git show "$BASE_SHA:$TOML_PATH" > "$BASE_TOML" 2>/dev/null; then
+        if git show "$BASE_SHA:$TOML_REL" > "$BASE_TOML" 2>/dev/null; then
             # Looked up BY app_id. An index-matched lookup skips this check
             # whenever the two blocks are reordered — for each index the base
             # and head apps differ, so both records dodge the version gate at

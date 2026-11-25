@@ -73,7 +73,13 @@ jobs:
           --rev "$REV" --features publish --locked freenet-pointer-contract
 
     - name: Verify every pointer record names the committed WASM and is signed
+      # Compared against the published lineage, not a stacked PR's unpublished
+      # base (scripts/ci-published-base.sh). Passed via env: a branch name is
+      # attacker-controlled and must not be spliced into the script text.
+      env:
+        BASE_REF: ${{ github.event.pull_request.base.ref }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       run: |
-        ./scripts/check-pointer-freshness.sh --ci \
-          "${{ github.event.pull_request.base.sha }}" \
-          "${{ github.event.pull_request.head.sha }}"
+        BASE="$(./scripts/ci-published-base.sh "$BASE_REF" "$BASE_SHA" "$HEAD_SHA")"
+        ./scripts/check-pointer-freshness.sh --ci "$BASE" "$HEAD_SHA"
