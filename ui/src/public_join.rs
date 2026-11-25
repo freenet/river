@@ -2741,7 +2741,7 @@ mod tests {
         let _ = m.send(a, "one", lim, fresh());
         let _ = m.send(a, "two", lim, fresh());
         let _ = m.send(a, "three", lim, fresh());
-        let notice = m.notice_for(&a).expect("a notice");
+        let notice = m.ui().notice_for(&a).expect("a notice");
         assert!(
             notice.contains(&format!(
                 "You can queue {PROVISIONAL_MESSAGES_PER_AUTHOR} messages"
@@ -2752,8 +2752,25 @@ mod tests {
     }
 
     #[test]
+    fn a_queue_of_one_says_one_message_in_the_singular() {
+        let mut m = Machine::default();
+        let a = vk(61);
+        let lim = Limits {
+            max_message_size: 100,
+            max_queued: 1,
+        };
+        let _ = m.send(a, "one", lim, fresh());
+        let _ = m.send(a, "two", lim, fresh());
+        let notice = m.ui().notice_for(&a).expect("a notice");
+        assert!(
+            notice.contains("You can queue 1 message before"),
+            "{notice}"
+        );
+        assert_eq!(returned(&mut m, &a), "two");
+    }
+
+    #[test]
     fn several_messages_are_admitted_in_one_delta_and_kept() {
-        use river_core::room_state::provisional::PROVISIONAL_MESSAGES_PER_AUTHOR;
         let state = room(PrivacyMode::Public, Some(policy(2, 2)));
         let sk = SigningKey::from_bytes(&[41u8; 32]);
         let (owner_vk, entry) = solved(&state, &sk);

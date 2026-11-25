@@ -458,16 +458,20 @@ fn PublicRoomView(
     let can_join = offers_join(&state);
     let member_count = member_names(&state, owner_vk.as_ref()).len();
     crate::util::signal_guard::anchor();
-    let queued = match owner_vk {
+    let (queued, waiting_line) = match owner_vk {
         Some(o) => match JOIN.try_read() {
-            Ok(j) => j.queued_for(&o),
+            Ok(j) => (
+                j.queued_for(&o),
+                solving_line(&j.phase_for(&o), j.raised_for(&o), false),
+            ),
             Err(_) => {
                 crate::util::signal_guard::schedule_nudge();
-                Vec::new()
+                (Vec::new(), None)
             }
         },
-        None => Vec::new(),
+        None => (Vec::new(), None),
     };
+    let last_queued = queued.len().saturating_sub(1);
     // Bring the newest row (or the waiting message) into view when the rows
     // change, as a joined room opens at its newest message.
     let end_key = format!("end-{}-{}", rows.len(), queued.len());
@@ -565,6 +569,15 @@ fn PublicRoomView(
                                 "data-testid": "viewed-room-sending-notice",
                                 span { "Sending in a moment\u{2026}" }
                                 span { class: "block", "A short delay that helps keep the room free of spam." }
+                                if i == last_queued {
+                                    if let Some(line) = waiting_line.clone() {
+                                        span {
+                                            class: "block tabular-nums",
+                                            "data-testid": "viewed-room-join-progress",
+                                            "{line}"
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -765,6 +778,36 @@ fn NicknamePrompt(default: String, on_done: EventHandler<NameAnswer>) -> Element
     }
 }
 
+/// The line shown while the work for a join is running. A re-admitted member
+/// keeps the re-join wording; a visitor's line sits under the queued message
+/// and uses plain words. The percentage is always present and padded, so the
+/// line does not change length when the first progress arrives and move Cancel
+/// under a pointer that is already on its way down.
+fn solving_line(phase: &JoinPhase, raised: bool, readmit: bool) -> Option<String> {
+    let JoinPhase::Solving { tried, expected } = phase else {
+        return None;
+    };
+    let pct = if *expected > 0.0 {
+        ((*tried as f64 / expected) * 100.0).min(99.0) as u32
+    } else {
+        0
+    };
+    Some(match (readmit, raised) {
+        (true, true) => {
+            "Room security was raised; confirming you're human. You can keep writing.".to_string()
+        }
+        (true, false) => format!(
+            "Joining: proving you are not a bot ({pct:\u{a0}>3}%). You can keep writing. Keep this tab open: a phone may pause a hidden tab."
+        ),
+        (false, true) => format!(
+            "The room asked for a longer wait while you were queued ({pct:\u{a0}>3}%). Keep this tab open: a phone may pause a hidden tab."
+        ),
+        (false, false) => format!(
+            "{pct:\u{a0}>3}% done. Keep this tab open: a phone may pause a hidden tab."
+        ),
+    })
+}
+
 /// The composer of a public room that admits by proof of work. A visitor just
 /// types and sends: the proof starts on the first focus or keystroke, and a
 /// message sent before it is done waits, shown as pending above, and posts
@@ -894,31 +937,16 @@ pub(crate) fn JoinComposer(
     let retryable = matches!(&phase, JoinPhase::Failed(f) if f.retryable());
     let failed = matches!(phase, JoinPhase::Failed(_));
     let solving = matches!(phase, JoinPhase::Solving { .. });
-    // The line under the composer. A visitor sees nothing about the work
-    // itself: the pending message says it once. A re-admitted member keeps
-    // the wording of the re-join.
+    // The line under the composer. A visitor's progress sits under the
+    // pending message; here they get only the notice and Cancel. A
+    // re-admitted member keeps the wording of the re-join.
     let (status_testid, status) = if readmit {
         match &phase {
             JoinPhase::Idle => ("viewed-room-join-idle", note.clone()),
             // The room raised what it asks of newcomers: say so, as an explanation.
-            JoinPhase::Solving { .. } if raised => (
+            JoinPhase::Solving { .. } => (
                 "viewed-room-join-progress",
-                "Room security was raised; confirming you're human. You can keep writing."
-                    .to_string(),
-            ),
-            JoinPhase::Solving { tried, expected } => (
-                "viewed-room-join-progress",
-                // Always with a percentage, so the line does not change length when
-                // the first progress arrives and move the Cancel button under a
-                // pointer that is already on its way down.
-                format!(
-                    "Joining: proving you are not a bot ({:\u{a0}>3}%). You can keep writing. Keep this tab open: a phone may pause a hidden tab.",
-                    if *expected > 0.0 {
-                        ((*tried as f64 / expected) * 100.0).min(99.0) as u32
-                    } else {
-                        0
-                    }
-                ),
+                solving_line(&phase, raised, true).unwrap_or_default(),
             ),
             JoinPhase::Ready => (
                 "viewed-room-join-ready",
