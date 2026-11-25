@@ -69,7 +69,7 @@ impl Room {
             MessageV1 {
                 room_owner: self.owner.id,
                 author: author.id,
-                time: SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000 + secs),
+                time: (SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000 + secs)).into(),
                 content: RoomMessageBody::public(format!("message {secs}")),
             },
             &signer.sk,
@@ -165,7 +165,7 @@ fn messages_that_share_an_id_are_judged_independently() {
     let base = room.baseline();
     let genuine = room.message(&room.a, &room.a, 10);
     let mut same_id = genuine.clone();
-    same_id.message.time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_011);
+    same_id.message.time = (SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_011)).into();
     assert!(same_id.id() == genuine.id());
 
     let one_delta = [
@@ -218,7 +218,7 @@ fn unsigned_messages_do_not_fail_a_private_room_delta() {
             SecretVersionRecordV1 {
                 version: 0,
                 cipher_spec: RoomCipherSpec::Aes256Gcm,
-                created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+                created_at: (SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)).into(),
             },
             &room.owner.sk,
         )],
@@ -232,7 +232,7 @@ fn unsigned_messages_do_not_fail_a_private_room_delta() {
             MessageV1 {
                 room_owner: room.owner.id,
                 author: author.id,
-                time: SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000 + secs),
+                time: (SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000 + secs)).into(),
                 content: RoomMessageBody::private_text(
                     format!("ciphertext {secs}").into_bytes(),
                     [0u8; 12],

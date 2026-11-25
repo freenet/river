@@ -46,7 +46,7 @@ fn msg(owner: MemberId, s: &SigningKey, t: u64) -> AuthorizedMessageV1 {
         MessageV1 {
             room_owner: owner,
             author: id(s),
-            time: at(t),
+            time: at(t).into(),
             content: RoomMessageBody::public(format!("m{t}")),
         },
         s,

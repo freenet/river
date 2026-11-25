@@ -718,7 +718,7 @@ pub(crate) mod tests {
                     AuthorizedUserBan::new(
                         UserBan {
                             owner_member_id: owner_id,
-                            banned_at: std::time::SystemTime::UNIX_EPOCH,
+                            banned_at: std::time::SystemTime::UNIX_EPOCH.into(),
                             banned_user: target,
                         },
                         issuer,
@@ -1387,7 +1387,7 @@ pub(crate) mod tests {
             AuthorizedUserBan::new(
                 UserBan {
                     owner_member_id: owner_id,
-                    banned_at: std::time::SystemTime::UNIX_EPOCH,
+                    banned_at: std::time::SystemTime::UNIX_EPOCH.into(),
                     banned_user: target,
                 },
                 a.id(),
@@ -1404,7 +1404,7 @@ pub(crate) mod tests {
         state.bans = BansV1(vec![AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: std::time::SystemTime::UNIX_EPOCH,
+                banned_at: std::time::SystemTime::UNIX_EPOCH.into(),
                 banned_user: y,
             },
             owner_id,

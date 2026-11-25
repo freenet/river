@@ -223,7 +223,7 @@ fn unsigned_message(
         room_owner: MemberId::from(room),
         author: MemberId::from(&identity.author_vk),
         content,
-        time: get_current_system_time(),
+        time: get_current_system_time().into(),
     };
     let mut bytes = Vec::new();
     if let Err(e) = ciborium::ser::into_writer(&message, &mut bytes) {
@@ -733,7 +733,7 @@ fn group_messages(
     for message in messages_state.display_messages() {
         let author_id = message.message.author;
         let message_id = message.id();
-        let raw_time = DateTime::<Utc>::from(message.message.time);
+        let raw_time = crate::util::utc_datetime(message.message.time);
         let sent_ms = raw_time.timestamp_millis();
         // Clamp target: when we first saw it, else the pass-wide "now".
         let clamp_to = clock.clamp_target(&message_id);
@@ -2365,7 +2365,7 @@ pub fn Conversation() -> Element {
                     room_owner: MemberId::from(current_room),
                     author: MemberId::from(&author_vk),
                     content,
-                    time: get_current_system_time(),
+                    time: get_current_system_time().into(),
                 };
 
                 // Serialize message to CBOR: the bytes the signature covers.
@@ -5886,7 +5886,7 @@ mod resolve_reply_strip_tests {
             MessageV1 {
                 room_owner: owner,
                 author: member_id_of(sk),
-                time: SystemTime::UNIX_EPOCH + Duration::from_secs(at_secs),
+                time: (SystemTime::UNIX_EPOCH + Duration::from_secs(at_secs)).into(),
                 content,
             },
             sk,
@@ -6734,7 +6734,9 @@ mod group_messages_clock_tests {
             MessageV1 {
                 room_owner: owner,
                 author: member_id_of(sk),
-                time: UNIX_EPOCH + StdDuration::from_millis(sent.timestamp_millis().max(0) as u64),
+                time: (UNIX_EPOCH
+                    + StdDuration::from_millis(sent.timestamp_millis().max(0) as u64))
+                .into(),
                 content: RoomMessageBody::public("hello".to_string()),
             },
             sk,

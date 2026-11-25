@@ -33,7 +33,7 @@ fn claimed_as(
     let signed = AuthorizedUserBan::new(
         UserBan {
             owner_member_id: owner,
-            banned_at: at(t),
+            banned_at: at(t).into(),
             banned_user: target,
         },
         MemberId::from(&real.verifying_key()),
@@ -78,7 +78,7 @@ fn a_new_ban_a_known_issuers_key_does_not_verify_is_skipped_not_refused() {
     let genuine = AuthorizedUserBan::new(
         UserBan {
             owner_member_id: owner,
-            banned_at: at(7),
+            banned_at: at(7).into(),
             banned_user: target,
         },
         a_id,
@@ -132,7 +132,7 @@ fn a_new_ban_an_evidence_issuers_key_does_not_verify_is_skipped() {
     let genuine = AuthorizedUserBan::new(
         UserBan {
             owner_member_id: owner,
-            banned_at: at(6),
+            banned_at: at(6).into(),
             banned_user: target,
         },
         e_id,
@@ -247,7 +247,7 @@ fn the_messages_bound_counts_new_messages_only() {
             MessageV1 {
                 room_owner: owner,
                 author: owner,
-                time: at(i),
+                time: at(i).into(),
                 content: RoomMessageBody::public(format!("m{i}")),
             },
             &o,
@@ -300,7 +300,7 @@ fn the_bans_raw_length_bound() {
     let ban = AuthorizedUserBan::new(
         UserBan {
             owner_member_id: owner,
-            banned_at: at(1),
+            banned_at: at(1).into(),
             banned_user: MemberId::from(&sk(60).verifying_key()),
         },
         owner,
@@ -331,7 +331,7 @@ fn the_merged_summary_delta_reads_a_raised_cap() {
             MessageV1 {
                 room_owner: owner,
                 author: owner,
-                time: at(i),
+                time: at(i).into(),
                 content: RoomMessageBody::public(format!("m{i}")),
             },
             &o,
@@ -376,7 +376,7 @@ fn owner_messages(o: &SigningKey, range: std::ops::Range<u64>) -> MessagesV1 {
                     MessageV1 {
                         room_owner: owner,
                         author: owner,
-                        time: at(i),
+                        time: at(i).into(),
                         content: RoomMessageBody::public(format!("m{i}")),
                     },
                     o,
@@ -423,7 +423,7 @@ fn the_incoming_path_is_not_held_to_the_delta_bound() {
         .recent_messages
         .messages
         .iter()
-        .map(|m| m.message.time)
+        .map(|m| std::time::SystemTime::from(m.message.time))
         .collect();
     assert_eq!(times, (n - 10..n).map(at).collect::<Vec<_>>());
 }

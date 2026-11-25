@@ -119,7 +119,7 @@ fn owner_ban(target: MemberId, owner: &Peer) -> AuthorizedUserBan {
     AuthorizedUserBan::new(
         UserBan {
             owner_member_id: owner.id,
-            banned_at: SystemTime::now(),
+            banned_at: SystemTime::now().into(),
             banned_user: target,
         },
         owner.id,
@@ -145,7 +145,7 @@ fn deputy_ban(target: MemberId, banner: &Peer, owner_id: MemberId) -> Authorized
     AuthorizedUserBan::new(
         UserBan {
             owner_member_id: owner_id,
-            banned_at: SystemTime::now(),
+            banned_at: SystemTime::now().into(),
             banned_user: target,
         },
         banner.id,
@@ -159,7 +159,7 @@ fn join_msg(who: &Peer, owner_id: MemberId) -> AuthorizedMessageV1 {
         MessageV1 {
             room_owner: owner_id,
             author: who.id,
-            time: SystemTime::now(),
+            time: SystemTime::now().into(),
             content: RoomMessageBody::join_event(),
         },
         &who.sk,
@@ -1039,7 +1039,7 @@ fn dm_ban_derivation_must_apply_the_user_ban_cap() {
         AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner.id,
-                banned_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+                banned_at: (std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)).into(),
                 banned_user: target,
             },
             banner.id,
@@ -1172,7 +1172,7 @@ fn dm_ban_derivation_applies_the_cap_pools() {
         AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner.id,
-                banned_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+                banned_at: (std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)).into(),
                 banned_user: target,
             },
             banner.id,

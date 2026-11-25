@@ -2561,7 +2561,7 @@ pub(crate) mod tests {
         // Test case 2: One banned member
         let banned_member = UserBan {
             owner_member_id: owner_id,
-            banned_at: SystemTime::now(),
+            banned_at: SystemTime::now().into(),
             banned_user: member2.id(),
         };
         let authorized_ban = AuthorizedUserBan::new(banned_member, owner_id, &owner_signing_key);
@@ -2596,7 +2596,7 @@ pub(crate) mod tests {
         };
         let banned_member = UserBan {
             owner_member_id: owner_id,
-            banned_at: SystemTime::now(),
+            banned_at: SystemTime::now().into(),
             banned_user: member4.id(),
         };
         let authorized_ban = AuthorizedUserBan::new(banned_member, owner_id, &owner_signing_key);
@@ -2754,7 +2754,7 @@ pub(crate) mod tests {
                 crate::room_state::message::MessageV1 {
                     room_owner: owner_id,
                     author: author.id(),
-                    time: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+                    time: (SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs)).into(),
                     content: crate::room_state::message::RoomMessageBody::public("hi".to_string()),
                 },
                 sk,
@@ -2993,7 +2993,7 @@ mod ban_context_tests {
         AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner,
-                banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + t),
+                banned_at: (SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + t)).into(),
                 banned_user: id(target),
             },
             id(by),

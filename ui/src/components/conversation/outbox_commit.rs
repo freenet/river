@@ -349,7 +349,7 @@ mod tests {
             room_owner: MemberId::from(&room),
             author: MemberId::from(&owner_sk().verifying_key()),
             content: RoomMessageBody::public(text.to_string()),
-            time: SystemTime::now() - Duration::from_secs(60) + Duration::from_millis(ms),
+            time: (SystemTime::now() - Duration::from_secs(60) + Duration::from_millis(ms)).into(),
         };
         let mut bytes = Vec::new();
         ciborium::ser::into_writer(&message, &mut bytes).unwrap();
@@ -423,7 +423,8 @@ mod tests {
                 room_owner: MemberId::from(&room),
                 author: MemberId::from(&owner_sk().verifying_key()),
                 content: body,
-                time: SystemTime::now() - Duration::from_secs(30) + Duration::from_millis(ms),
+                time: (SystemTime::now() - Duration::from_secs(30) + Duration::from_millis(ms))
+                    .into(),
             };
             let mut bytes = Vec::new();
             ciborium::ser::into_writer(&message, &mut bytes).unwrap();
@@ -508,7 +509,7 @@ mod tests {
             room_owner: MemberId::from(&room),
             author: MemberId::from(&stranger.verifying_key()),
             content: RoomMessageBody::edit(target.clone(), "hijacked".to_string()),
-            time: SystemTime::now(),
+            time: SystemTime::now().into(),
         };
         let mut bytes = Vec::new();
         ciborium::ser::into_writer(&message, &mut bytes).unwrap();
@@ -552,7 +553,7 @@ mod tests {
                 room_owner: MemberId::from(&room),
                 author: MemberId::from(&sk.verifying_key()),
                 content: body,
-                time: SystemTime::now(),
+                time: SystemTime::now().into(),
             };
             let mut bytes = Vec::new();
             ciborium::ser::into_writer(&message, &mut bytes).unwrap();
@@ -647,7 +648,7 @@ mod tests {
                     [0u8; 12],
                     version,
                 ),
-                time: SystemTime::now(),
+                time: SystemTime::now().into(),
             };
             let mut bytes = Vec::new();
             ciborium::ser::into_writer(&message, &mut bytes).unwrap();
@@ -699,7 +700,7 @@ mod tests {
                     [0u8; 12],
                     version,
                 ),
-                time: SystemTime::now(),
+                time: SystemTime::now().into(),
             };
             let mut bytes = Vec::new();
             ciborium::ser::into_writer(&message, &mut bytes).unwrap();
@@ -756,7 +757,7 @@ mod tests {
             room_owner: MemberId::from(&room),
             author: MemberId::from(&owner_sk().verifying_key()),
             content: seal.seal(&[6u8; 32], 1),
-            time: SystemTime::now(),
+            time: SystemTime::now().into(),
         };
         let mut bytes = Vec::new();
         ciborium::ser::into_writer(&message, &mut bytes).unwrap();

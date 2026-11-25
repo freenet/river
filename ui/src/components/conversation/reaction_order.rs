@@ -7,10 +7,10 @@ use crate::components::app::notifications::extract_action_content;
 use river_core::room_state::content::{ACTION_TYPE_REACTION, ACTION_TYPE_REMOVE_REACTION};
 use river_core::room_state::member::MemberId;
 use river_core::room_state::message::{MessageId, MessagesV1};
+use river_core::SignedTime;
 use std::collections::HashMap;
-use std::time::SystemTime;
 
-type EmojiRanks = HashMap<String, SystemTime>;
+type EmojiRanks = HashMap<String, SignedTime>;
 type ReactionRanks = HashMap<MessageId, EmojiRanks>;
 
 /// Earliest still-standing add for each emoji. Replay only when order can
@@ -51,7 +51,7 @@ pub(super) fn reaction_ranks_for(
     if targets.is_empty() {
         return HashMap::new();
     }
-    let mut standing: HashMap<(MessageId, String, MemberId), SystemTime> = HashMap::new();
+    let mut standing: HashMap<(MessageId, String, MemberId), SignedTime> = HashMap::new();
     for message in &messages.messages {
         let Some(action) = extract_action_content(&message.message.content, secrets) else {
             continue;
@@ -131,7 +131,7 @@ mod tests {
             MessageV1 {
                 room_owner: member(1),
                 author: member(author),
-                time: UNIX_EPOCH + Duration::from_secs(second),
+                time: (UNIX_EPOCH + Duration::from_secs(second)).into(),
                 content,
             },
             &key(author),
@@ -212,7 +212,11 @@ mod tests {
                     .expect("fixture actions are signed by keys 2..10");
                 signed(
                     author,
-                    m.message.time.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+                    m.message
+                        .time
+                        .duration_since(UNIX_EPOCH.into())
+                        .unwrap()
+                        .as_secs(),
                     SealInput::Action(action).seal(&SECRET, SECRET_VERSION),
                 )
             })
@@ -345,7 +349,7 @@ mod tests {
         let target = text();
         let id = target.id();
         let secrets = HashMap::new();
-        let at = |second| UNIX_EPOCH + Duration::from_secs(second);
+        let at = |second| SignedTime::new(second, 0).unwrap();
         let first = add(2, 5, &id, "z");
         let absent = MessageId(freenet_scaffold::util::FastHash(88));
         let malformed = ActionContentV1 {
@@ -409,7 +413,8 @@ mod tests {
         // Model a projection held while some retained action bytes cannot be
         // replayed. It is authoritative even when the order cannot be known.
         gap.messages.retain(|m| {
-            !m.message.content.is_action() || m.message.time != UNIX_EPOCH + Duration::from_secs(3)
+            !m.message.content.is_action()
+                || m.message.time != (UNIX_EPOCH + Duration::from_secs(3)).into()
         });
         assert_eq!(shown(&gap, &secrets, &id), names(&["z", "a"]));
         assert_eq!(gap.reactions(&id), state.reactions(&id));

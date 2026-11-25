@@ -41,7 +41,7 @@ fn room(texts: &[&str]) -> ChatRoomStateV1 {
                 MessageV1 {
                     room_owner: MemberId::from(&o.verifying_key()),
                     author: MemberId::from(&o.verifying_key()),
-                    time: now - Duration::from_secs(100 - i as u64),
+                    time: (now - Duration::from_secs(100 - i as u64)).into(),
                     content: RoomMessageBody::public((*t).to_owned()),
                 },
                 &o,

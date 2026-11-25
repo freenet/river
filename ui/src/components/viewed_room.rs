@@ -233,7 +233,7 @@ fn lines(state: &ChatRoomStateV1) -> Vec<Line> {
             let ms = m
                 .message
                 .time
-                .duration_since(UNIX_EPOCH)
+                .duration_since(UNIX_EPOCH.into())
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
             Some(Line {

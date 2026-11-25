@@ -614,7 +614,7 @@ dependencies = [
  "ciborium",
  "ed25519-dalek",
  "freenet-scaffold",
- "freenet-stdlib 0.12.1",
+ "freenet-stdlib 0.12.2",
  "rand 0.8.6",
  "river-core",
  "serde",
@@ -2335,9 +2335,9 @@ dependencies = [
 
 [[package]]
 name = "freenet-macros"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6447ac80d17ad1a22d87f470d1c170ca3cfa976a433883de6472c1ede381e525"
+checksum = "033a1d7ad74d3429a7e404ef0a478d5189087dd3fd99d813951776c2923b183e"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2355,7 +2355,7 @@ dependencies = [
  "ciborium",
  "ed25519-dalek",
  "freenet-scaffold",
- "freenet-stdlib 0.12.1",
+ "freenet-stdlib 0.12.2",
  "serde",
  "serde_with",
 ]
@@ -2453,9 +2453,9 @@ dependencies = [
 
 [[package]]
 name = "freenet-stdlib"
-version = "0.12.1"
+version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d1d34436ce7088f277e65a616951ab8ea43091e04bb18f9af562651019b656f"
+checksum = "d8373521ac2407fbd14502b69da90d54b6e799ac94224c144289bf740c8ed6c0"
 dependencies = [
  "bincode",
  "blake3",
@@ -2464,7 +2464,7 @@ dependencies = [
  "bytes",
  "chrono",
  "flatbuffers 24.12.23",
- "freenet-macros 0.3.1",
+ "freenet-macros 0.3.2",
  "futures",
  "js-sys",
  "semver",
@@ -4838,7 +4838,7 @@ dependencies = [
 
 [[package]]
 name = "river-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
@@ -4852,7 +4852,7 @@ dependencies = [
  "freenet-migrate-build",
  "freenet-scaffold",
  "freenet-scaffold-macro",
- "freenet-stdlib 0.12.1",
+ "freenet-stdlib 0.12.2",
  "hex",
  "proptest",
  "rand 0.8.6",
@@ -4865,7 +4865,7 @@ dependencies = [
 
 [[package]]
 name = "river-ui"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "aes-gcm",
  "blake3",
@@ -4879,7 +4879,7 @@ dependencies = [
  "freenet-migrate",
  "freenet-migrate-build",
  "freenet-scaffold",
- "freenet-stdlib 0.12.1",
+ "freenet-stdlib 0.12.2",
  "futures",
  "futures-timer",
  "getrandom 0.2.17",
@@ -4907,7 +4907,7 @@ dependencies = [
 
 [[package]]
 name = "riverctl"
-version = "0.2.30"
+version = "0.2.31"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -4925,7 +4925,7 @@ dependencies = [
  "ed25519-dalek",
  "freenet-migrate",
  "freenet-scaffold",
- "freenet-stdlib 0.12.1",
+ "freenet-stdlib 0.12.2",
  "freenet-test-network",
  "fs2",
  "futures",
@@ -4960,10 +4960,11 @@ dependencies = [
  "ed25519-dalek",
  "freenet",
  "freenet-scaffold",
- "freenet-stdlib 0.12.1",
+ "freenet-stdlib 0.12.2",
  "once_cell",
  "rand 0.8.6",
  "river-core",
+ "serde",
  "sha2",
  "tempfile",
  "testresult",
@@ -6911,7 +6912,7 @@ dependencies = [
  "byteorder",
  "ciborium",
  "ed25519-dalek",
- "freenet-stdlib 0.12.1",
+ "freenet-stdlib 0.12.2",
  "rand 0.8.6",
  "river-core",
  "tar",

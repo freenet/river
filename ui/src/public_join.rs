@@ -258,7 +258,7 @@ pub fn build_submission_many(
                     room_owner: MemberId::from(owner_vk),
                     author: id,
                     content: RoomMessageBody::public(text.clone()),
-                    time: now + std::time::Duration::from_millis(i as u64),
+                    time: (now + std::time::Duration::from_millis(i as u64)).into(),
                 },
                 signing_key,
             )
@@ -1796,7 +1796,7 @@ mod tests {
             &owner_vk,
             ProvisionalBan {
                 banned_by: MemberId::from(&owner_vk),
-                banned_at: SystemTime::now(),
+                banned_at: SystemTime::now().into(),
                 target: MemberId::from(&sk.verifying_key()),
             },
             &owner(),
@@ -2140,7 +2140,7 @@ mod tests {
                 &owner_vk,
                 ProvisionalBan {
                     banned_by: MemberId::from(&owner_vk),
-                    banned_at: now,
+                    banned_at: now.into(),
                     target: MemberId::from(&sk.verifying_key()),
                 },
                 &owner(),
@@ -2496,10 +2496,15 @@ mod tests {
 
     #[test]
     fn several_messages_are_admitted_in_one_delta_and_kept() {
+        use river_core::room_state::provisional::PROVISIONAL_MESSAGES_PER_AUTHOR;
         let state = room(PrivacyMode::Public, Some(policy(2, 2)));
         let sk = SigningKey::from_bytes(&[41u8; 32]);
         let (owner_vk, entry) = solved(&state, &sk);
-        let texts = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let texts: Vec<String> = ["a", "b", "c"]
+            .iter()
+            .take(PROVISIONAL_MESSAGES_PER_AUTHOR)
+            .map(|t| t.to_string())
+            .collect();
         let sub = build_submission_many(
             &state,
             &owner_vk,
@@ -2517,7 +2522,24 @@ mod tests {
             .iter()
             .map(|m| format!("{:?}", m.message.content))
             .collect();
-        assert_eq!(kept.len(), 3, "every message once: {kept:?}");
+        assert_eq!(
+            kept.len(),
+            PROVISIONAL_MESSAGES_PER_AUTHOR,
+            "every message once: {kept:?}"
+        );
+        // One more than the per-author cap: the room keeps only the newest
+        // PROVISIONAL_MESSAGES_PER_AUTHOR, so the submission is refused.
+        let three: Vec<String> = ["a", "b", "c"].iter().map(|t| t.to_string()).collect();
+        let over = build_submission_many(
+            &state,
+            &owner_vk,
+            &sk,
+            &entry,
+            &three,
+            "Me",
+            SystemTime::now(),
+        );
+        assert!(over.is_err(), "a third message does not all stay");
     }
 
     #[test]

@@ -909,7 +909,7 @@ mod tests {
             room_owner: owner_sk.verifying_key().into(),
             author: MemberId::from(&member_sk.verifying_key()),
             content: RoomMessageBody::join_event(),
-            time: std::time::SystemTime::now(),
+            time: std::time::SystemTime::now().into(),
         };
         state
             .recent_messages
@@ -1516,7 +1516,7 @@ mod tests {
                 SecretVersionRecordV1 {
                     version: 0,
                     cipher_spec: RoomCipherSpec::Aes256Gcm,
-                    created_at: std::time::SystemTime::now(),
+                    created_at: std::time::SystemTime::now().into(),
                 },
                 &owner,
             )],
@@ -1531,7 +1531,7 @@ mod tests {
             room_owner: owner_id,
             author: owner_id,
             content,
-            time: std::time::SystemTime::now(),
+            time: std::time::SystemTime::now().into(),
         };
         let auth = AuthorizedMessageV1::new(message, &owner);
         let delta = ChatRoomStateV1Delta {
@@ -1570,7 +1570,7 @@ mod tests {
             room_owner: MemberId::from(&owner.verifying_key()),
             author: MemberId::from(&owner.verifying_key()),
             content: RoomMessageBody::public("target".to_string()),
-            time: std::time::SystemTime::now(),
+            time: std::time::SystemTime::now().into(),
         };
         AuthorizedMessageV1::new(msg, &owner).id()
     }
@@ -1955,7 +1955,7 @@ mod tests {
                 SecretVersionRecordV1 {
                     version: 0,
                     cipher_spec: RoomCipherSpec::Aes256Gcm,
-                    created_at: std::time::SystemTime::now(),
+                    created_at: std::time::SystemTime::now().into(),
                 },
                 &owner,
             )],
@@ -1970,7 +1970,7 @@ mod tests {
             room_owner: owner_id,
             author: owner_id,
             content: text_body,
-            time: std::time::SystemTime::now(),
+            time: std::time::SystemTime::now().into(),
         };
         let text_auth = AuthorizedMessageV1::new(text_msg, &owner);
         let target_msg_id = text_auth.id();
@@ -2012,7 +2012,7 @@ mod tests {
                 room_owner: owner_id,
                 author: owner_id,
                 content: action_body,
-                time: std::time::SystemTime::now(),
+                time: std::time::SystemTime::now().into(),
             },
             &owner,
         );
@@ -2021,7 +2021,7 @@ mod tests {
                 room_owner: owner_id,
                 author: owner_id,
                 content: reply_body,
-                time: std::time::SystemTime::now(),
+                time: std::time::SystemTime::now().into(),
             },
             &owner,
         );

@@ -39,7 +39,7 @@ fn an_ancestor_referenced_only_through_an_owner_removed_record_is_not_kept() {
         AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 + t),
+                banned_at: (SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 + t)).into(),
                 banned_user: target,
             },
             by_sk.verifying_key().into(),
@@ -63,7 +63,7 @@ fn an_ancestor_referenced_only_through_an_owner_removed_record_is_not_kept() {
         MessageV1 {
             room_owner: owner_id,
             author: p.member.id(),
-            time: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_001),
+            time: (SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_001)).into(),
             content: RoomMessageBody::public("hi".into()),
         },
         &p_sk,

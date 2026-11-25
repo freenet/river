@@ -87,7 +87,7 @@ impl Room {
             MessageV1 {
                 room_owner: self.owner_id,
                 author: p.id,
-                time: SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000 + secs),
+                time: (SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000 + secs)).into(),
                 content: RoomMessageBody::public(format!("hello {secs}")),
             },
             &p.sk,
@@ -98,7 +98,8 @@ impl Room {
         AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: self.owner_id,
-                banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000 + secs),
+                banned_at: (SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000 + secs))
+                    .into(),
                 banned_user: target.id,
             },
             banner.id,
@@ -110,7 +111,8 @@ impl Room {
         AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: self.owner_id,
-                banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000 + secs),
+                banned_at: (SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000 + secs))
+                    .into(),
                 banned_user: target.id,
             },
             self.owner_id,
@@ -1106,7 +1108,7 @@ fn a_removed_member_cannot_react_edit_or_delete() {
             MessageV1 {
                 room_owner: room.owner_id,
                 author: a.id,
-                time: SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000 + secs),
+                time: (SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000 + secs)).into(),
                 content: body,
             },
             &a.sk,
@@ -3232,7 +3234,7 @@ type BanRecord = (MemberId, std::time::SystemTime, MemberId, MemberId);
 fn ban_record(b: &AuthorizedUserBan) -> BanRecord {
     (
         b.banned_by,
-        b.ban.banned_at,
+        b.ban.banned_at.into(),
         b.ban.banned_user,
         b.ban.owner_member_id,
     )
@@ -3247,7 +3249,8 @@ fn copy_signature(
     AuthorizedUserBan::with_signature(
         UserBan {
             owner_member_id: owner,
-            banned_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000 + at),
+            banned_at: (std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000 + at))
+                .into(),
             banned_user: target,
         },
         issuer,

@@ -166,8 +166,9 @@ fn build_fixture() -> Fixture {
                 MessageV1 {
                     room_owner: owner_id,
                     author: author_id,
-                    time: SystemTime::UNIX_EPOCH
-                        + Duration::from_secs(BASE_SECS + (i / MSG_PER_TIMESTAMP) as u64),
+                    time: (SystemTime::UNIX_EPOCH
+                        + Duration::from_secs(BASE_SECS + (i / MSG_PER_TIMESTAMP) as u64))
+                    .into(),
                     content: RoomMessageBody::public(format!("message {i}")),
                 },
                 &author_sk,
@@ -220,7 +221,7 @@ fn build_fixture() -> Fixture {
                 MessageV1 {
                     room_owner: owner_id,
                     author,
-                    time: SystemTime::UNIX_EPOCH + Duration::from_secs(BASE_SECS - 1),
+                    time: (SystemTime::UNIX_EPOCH + Duration::from_secs(BASE_SECS - 1)).into(),
                     content: RoomMessageBody::public("anchor".to_string()),
                 },
                 sk,

@@ -148,7 +148,7 @@ pub(crate) fn build_ban(
         owner_vk,
         ProvisionalBan {
             banned_by: MemberId::from(&signing_key.verifying_key()),
-            banned_at: now,
+            banned_at: now.into(),
             target,
         },
         signing_key,

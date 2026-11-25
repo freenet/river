@@ -50,6 +50,9 @@ freenet-stdlib.workspace = true
 
 [features]
 default = []
+# Counts real ed25519 checks (`room_state::sigcheck::real_checks`), for cost
+# tests. Off in every shipped build.
+sig-counters = []
 # ECIES helpers for room-secret distribution. Deterministic-only API surface
 # (encrypt_secret_for_member, decrypt_*, unseal_*). Off by default so
 # room-contract WASM stays small (it doesn't need these). The chat-delegate
@@ -132,6 +135,11 @@ serde_json = "1.0"
 # provisional ceilings (freenet/river#974). Plain `std::time`, no dependency.
 [[bench]]
 name = "provisional_pair"
+harness = false
+
+# Fixtures for timing the room contract on an Official-room-shaped room.
+[[bench]]
+name = "incremental_pair"
 harness = false
 
 # Measurement switches for out-of-tree tools only, set with RUSTFLAGS, never

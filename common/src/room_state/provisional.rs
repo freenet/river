@@ -21,12 +21,12 @@ use crate::room_state::configuration::Configuration;
 use crate::room_state::member::{AuthorizedMember, MemberId};
 use crate::room_state::privacy::PrivacyMode;
 use crate::room_state::ChatRoomParametersV1;
+use crate::signed_time::SignedTime;
 use crate::ChatRoomStateV1;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::time::SystemTime;
 
 /// Signing domain of a provisional member's self-signature.
 pub const ENTRY_SIGNING_TAG: &[u8] = b"river-provisional-member/v1";
@@ -39,29 +39,53 @@ pub const POW_DOMAIN_TAG: &[u8; 27] = b"river-room-admission-pow/v1";
 /// Largest `max_provisional` a policy may set. Set by the cost gate, not by
 /// taste: the host re-verifies every held entry's signature, its `member_info`
 /// and its message, and every provisional ban, in `validate_state` after every
-/// chat message, plus every ban again in `update_state`'s cleanup. Measured
-/// under wasmtime (about 0.4 ms a signature) that is about 2.5 ms per entry and
-/// ban pair: 100 and 100 added over 300 ms to a pair that must stay under
-/// 100 ms (design section 5: "if the pair exceeds 100 ms, lower the ceilings"),
-/// and 20 and 20 still measured 100.3 ms on a default-sized room (window 100,
-/// 26 members). At 16 and 16 a one-message delta measured about 86 ms, and
-/// the worst-case delta (every entry and ban carried) about 130 ms, over the
-/// 100 ms gate, which is set for one-message deltas; the worst case needs a
-/// delta that fills the per-delta floor and is paid once per such delta.
-/// Raising it needs a measurement, not an opinion: the benchmark
-/// is `common/benches/provisional_pair.rs` (native) and the same fixtures run
-/// under wasmtime in the PR.
-pub const MAX_PROVISIONAL_CEILING: u32 = 16;
+/// chat message, plus the bans again in `update_state`'s cleanup. The gate is
+/// 100 ms for the `update_state` and `validate_state` pair, measured under
+/// wasmtime with fresh instances on a default-sized room (window 100, 26
+/// members) by `tools/wasm-cost-bench`. Within one call a signature checked
+/// twice is verified once, and `update_state` takes the stored state's
+/// signatures as already validated (`sigcheck`), so only what a delta adds
+/// costs crypto. With that, the worst-case delta (every entry and ban carried,
+/// a `member_info` and a message for each new author) measures, as the median
+/// of 100 wasmtime runs on a 16-core host loaded by other jobs (load average 8
+/// to 25), about 56 ms at 16 and 16, 68 ms at 24 and 24 (p95 71 to 73 ms), and
+/// 81 ms at 32 and 32 (p95 86 to 89 ms, max up to 144 ms), so 24 is the ceiling.
+/// A one-message delta measures about 40 ms at 16, 47 ms at 24 and 51 ms at 32.
+/// The bench asserts each measured delta applies, so a skipped delta cannot
+/// pass as a fast one. Before those savings (#982) 16 and 16 measured about
+/// 130 ms worst case. Raising it again needs a measurement, not an opinion: the benchmark is
+/// `common/benches/provisional_pair.rs` (native; `BENCH_PROVISIONAL=<n>`
+/// sets the cap) and the same fixtures run under wasmtime.
+pub const MAX_PROVISIONAL_CEILING: u32 = 24;
+/// Messages one provisional author may hold in the room's message pool. A
+/// contract constant, not a signed policy value: it only bounds what one key
+/// can take of the shared newcomer quota (`max_provisional_messages`), so that
+/// a single key posting many messages cannot fill the quota and turn every
+/// other newcomer away as "room full". The per-author messages kept are the
+/// newest by `(time, id)`, the order the window already uses, so the rule is a
+/// function of the set of messages held and not of arrival order. It narrows
+/// the bound to `quota / PROVISIONAL_MESSAGES_PER_AUTHOR` keys; it does not
+/// remove it. Does not apply to the owner or to members.
+pub const PROVISIONAL_MESSAGES_PER_AUTHOR: usize = 2;
 /// Largest `max_provisional_messages` a policy may set.
 pub const MAX_PROVISIONAL_MESSAGES_CEILING: u32 = 500;
 /// Largest `max_provisional_bans` a policy may set (see
 /// [`MAX_PROVISIONAL_CEILING`] for why it is this low).
-pub const MAX_PROVISIONAL_BANS_CEILING: u32 = 16;
+pub const MAX_PROVISIONAL_BANS_CEILING: u32 = 24;
 /// Largest `difficulty_bits` a policy may set.
 pub const MAX_DIFFICULTY_BITS: u8 = 32;
 /// The least number of entries or provisional bans one delta may carry: a work
-/// bound, never below the caps (the ceilings are 16).
-pub const PROVISIONAL_DELTA_FLOOR: usize = 16;
+/// bound, never below the caps (the ceilings are 24). It applies to EVERY public
+/// room, whatever its configured caps: a room with `max_provisional = 1` still
+/// accepts a delta carrying 24 new entries and 24 new bans, each paying its
+/// signature check before it is dropped, so raising the floor from 16 to 24
+/// raised every public room's per-delta worst-case work by half (measured as
+/// the worst-case delta in `common/benches/provisional_pair.rs`).
+pub const PROVISIONAL_DELTA_FLOOR: usize = 24;
+const _: () = assert!(
+    PROVISIONAL_DELTA_FLOOR >= MAX_PROVISIONAL_CEILING as usize
+        && PROVISIONAL_DELTA_FLOOR >= MAX_PROVISIONAL_BANS_CEILING as usize
+);
 
 // --- policy (owner-signed, inside `Configuration`) ---------------------------
 
@@ -71,7 +95,7 @@ pub const PROVISIONAL_DELTA_FLOOR: usize = 16;
 pub struct PublicRoomPolicy {
     /// Atlas discovery opt-in; no effect on admission.
     pub listed: bool,
-    /// Provisional authors held at once, `1..=16` ([`MAX_PROVISIONAL_CEILING`]).
+    /// Provisional authors held at once, `1..=24` ([`MAX_PROVISIONAL_CEILING`]).
     ///
     /// When the pool is full a new author is not refused for being one too
     /// many: the pool is the authors of the newest provisional messages in the
@@ -79,11 +103,18 @@ pub struct PublicRoomPolicy {
     /// is oldest falls out, with its entry and messages, and may come back by
     /// sending a newer message. A newcomer whose message is older than every
     /// pooled author's is the one dropped (`RoomFull`).
+    ///
+    /// Each author holds at most [`PROVISIONAL_MESSAGES_PER_AUTHOR`] messages
+    /// of the quota, so the authors actually held are at most
+    /// `min(this, quota / PROVISIONAL_MESSAGES_PER_AUTHOR)`: with a quota of
+    /// 20 at most 10 authors, even where this says 16.
     pub max_provisional: u32,
     /// Window slots for provisional messages, `1..=500`. The effective quota is
-    /// `min(this, max_recent_messages / 2)` ([`Self::quota`]).
+    /// `min(this, max_recent_messages / 2)` ([`Self::quota`]). One provisional
+    /// author fills at most [`PROVISIONAL_MESSAGES_PER_AUTHOR`] of them (its
+    /// newest two messages, reactions, edits and deletes included).
     pub max_provisional_messages: u32,
-    /// Provisional ban list size, `0..=16` ([`MAX_PROVISIONAL_BANS_CEILING`]).
+    /// Provisional ban list size, `0..=24` ([`MAX_PROVISIONAL_BANS_CEILING`]).
     pub max_provisional_bans: u32,
     /// `None` admits nobody (a listed, invite-only room).
     pub pow: Option<PowPolicy>,
@@ -171,7 +202,7 @@ pub fn bans_cap(config: &Configuration) -> usize {
 }
 
 /// Most NEW entries one delta may carry in a room with `config`:
-/// `max(max_provisional, 16)`.
+/// `max(max_provisional, 24)`.
 pub fn entries_work_bound(config: &Configuration) -> usize {
     config
         .public_admission
@@ -180,7 +211,7 @@ pub fn entries_work_bound(config: &Configuration) -> usize {
         .max(PROVISIONAL_DELTA_FLOOR)
 }
 
-/// Most NEW provisional bans one delta may carry: `max(max_provisional_bans, 16)`.
+/// Most NEW provisional bans one delta may carry: `max(max_provisional_bans, 24)`.
 pub fn bans_work_bound(config: &Configuration) -> usize {
     config
         .public_admission
@@ -218,7 +249,7 @@ pub struct AuthorizedProvisionalMember {
 pub struct ProvisionalBan {
     pub banned_by: MemberId,
     /// Display only; never used to order anything.
-    pub banned_at: SystemTime,
+    pub banned_at: SignedTime,
     pub target: MemberId,
 }
 
@@ -347,14 +378,13 @@ impl AuthorizedProvisionalMember {
         }
         // `verify_strict`: also refuses a small-order key or `R`, so no
         // signature verifies without the key's secret.
-        let ok = self
-            .provisional
-            .member_vk
-            .verify_strict(
-                &provisional_signing_bytes(owner_vk, &self.provisional),
-                &self.signature,
-            )
-            .is_ok();
+        let ok = crate::room_state::sigcheck::verify(
+            crate::room_state::sigcheck::Kind::Strict,
+            &self.provisional.member_vk,
+            &provisional_signing_bytes(owner_vk, &self.provisional),
+            &self.signature,
+        )
+        .is_ok();
         crate::room_state::ban::signature_memo::record_provisional(key, ok);
         ok_or_invalid(ok, "provisional member")
     }
@@ -433,12 +463,13 @@ impl AuthorizedProvisionalBan {
         }
         // `verify_strict`, as for entry signatures: also refuses a small-order
         // key or `R`.
-        let ok = issuer_vk
-            .verify_strict(
-                &provisional_ban_signing_bytes(owner_vk, &self.ban),
-                &self.signature,
-            )
-            .is_ok();
+        let ok = crate::room_state::sigcheck::verify(
+            crate::room_state::sigcheck::Kind::Strict,
+            issuer_vk,
+            &provisional_ban_signing_bytes(owner_vk, &self.ban),
+            &self.signature,
+        )
+        .is_ok();
         crate::room_state::ban::signature_memo::record_provisional(key, ok);
         ok_or_invalid(ok, "provisional ban")
     }
@@ -608,7 +639,7 @@ impl ComposableState for ProvisionalV1 {
     /// Every held entry's self-signature, every held ban signature whose
     /// issuer is known, and the counts against the state's own caps. This is
     /// the cost `validate_state` pays after every changing update, so the
-    /// ceilings are 16 each ([`MAX_PROVISIONAL_CEILING`]).
+    /// ceilings are 24 each ([`MAX_PROVISIONAL_CEILING`]).
     fn verify(
         &self,
         parent_state: &Self::ParentState,
@@ -836,6 +867,57 @@ impl ProvisionalV1 {
 
 // --- cleanup -----------------------------------------------------------------
 
+/// The provisional share of the window scan (P6), shared by every place the
+/// pool is chosen so they cannot drift. Feed it the non-live provisional
+/// messages newest first; a message is taken only while the quota and the pool
+/// cap allow it and its author holds fewer than
+/// [`PROVISIONAL_MESSAGES_PER_AUTHOR`] taken messages. An author's messages
+/// arrive newest first, so this keeps each author's newest ones. A refusal
+/// is monotone (quota, pool and per-author counts only grow), so a message
+/// refused once stays refused later in the scan.
+pub(crate) struct ProvisionalScan {
+    quota: usize,
+    pool_cap: usize,
+    taken: usize,
+    per_author: HashMap<MemberId, usize>,
+}
+
+impl ProvisionalScan {
+    pub(crate) fn new(plan: &ProvisionalPlan) -> Self {
+        Self {
+            quota: plan.quota,
+            pool_cap: plan.pool_cap,
+            taken: 0,
+            per_author: HashMap::new(),
+        }
+    }
+
+    /// Whether the next (older) provisional message of `author` is taken.
+    ///
+    /// Every message by the author counts toward its
+    /// [`PROVISIONAL_MESSAGES_PER_AUTHOR`], reactions, edits and deletes
+    /// included. Exempting them would let one key fill the quota with
+    /// reactions, which is the hole this limit closes. The visible
+    /// consequence is that a provisional member's older messages roll off
+    /// after their third; an invited or sponsored member is not limited.
+    pub(crate) fn take(&mut self, author: MemberId) -> bool {
+        let held = self.per_author.get(&author).copied();
+        let ok = self.taken < self.quota
+            && held.unwrap_or(0) < PROVISIONAL_MESSAGES_PER_AUTHOR
+            && (held.is_some() || self.per_author.len() < self.pool_cap);
+        if ok {
+            self.taken += 1;
+            *self.per_author.entry(author).or_insert(0) += 1;
+        }
+        ok
+    }
+
+    /// The authors taken so far: the pool.
+    pub(crate) fn pool(&self) -> HashSet<MemberId> {
+        self.per_author.keys().copied().collect()
+    }
+}
+
 /// What `provisional_step` fixed for the member loop.
 #[derive(Default)]
 pub(crate) struct ProvisionalPlan {
@@ -977,23 +1059,42 @@ impl ChatRoomStateV1 {
                 }
             }
             // Owner bans first, then the first ban per target before repeats,
-            // then digest. A repeat is a ban whose target an earlier ban in
-            // (owner first, digest) order already names.
-            valid.sort_by_key(|(non_owner, digest, _)| (*non_owner, *digest));
+            // then NEWEST `banned_at` first, then digest. A repeat is a ban
+            // whose target an earlier ban in (owner first, newest first,
+            // digest) order already names. Newest first keeps the ban just
+            // issued when the list is full and cuts the oldest, as UserBans
+            // do (`BansV1::enforce_user_ban_cap`); a digest-only order cut a
+            // random ban, the new one about 1 time in `cap + 1`. A far-future
+            // `banned_at` holds a slot until the cap pushes it out, which is
+            // accepted: bans are signed by the owner or an owner deputy, who
+            // are trusted. This is the only place the provisional ban set is
+            // chosen: summaries and deltas carry `self.provisional.bans`
+            // as this step left it.
+            valid.sort_by_key(|(non_owner, digest, ban)| {
+                (*non_owner, std::cmp::Reverse(ban.ban.banned_at), *digest)
+            });
             let mut per_target: HashMap<MemberId, usize> = HashMap::new();
-            let mut ranked: Vec<(bool, usize, BanDigest, &AuthorizedProvisionalBan)> = valid
+            let mut ranked: Vec<_> = valid
                 .into_iter()
                 .map(|(non_owner, digest, ban)| {
                     let seen_before = per_target.entry(ban.ban.target).or_insert(0);
                     let rank = *seen_before;
                     *seen_before += 1;
-                    (non_owner, rank, digest, ban)
+                    (
+                        (
+                            non_owner,
+                            rank,
+                            std::cmp::Reverse(ban.ban.banned_at),
+                            digest,
+                        ),
+                        ban,
+                    )
                 })
                 .collect();
-            ranked.sort_by_key(|(non_owner, rank, digest, _)| (*non_owner, *rank, *digest));
+            ranked.sort_by_key(|(key, _)| *key);
             ranked.truncate(policy.ban_cap());
             let mut kept: Vec<AuthorizedProvisionalBan> =
-                ranked.into_iter().map(|(_, _, _, b)| b.clone()).collect();
+                ranked.into_iter().map(|(_, b)| b.clone()).collect();
             kept.sort_by_cached_key(ban_digest);
             kept
         };
@@ -1144,6 +1245,7 @@ mod tests {
     use super::*;
     use ed25519_dalek::Verifier;
     use freenet_scaffold::util::FastHash;
+    use std::time::SystemTime;
 
     fn owner() -> SigningKey {
         SigningKey::from_bytes(&[1u8; 32])
@@ -1169,7 +1271,8 @@ mod tests {
             &owner().verifying_key(),
             ProvisionalBan {
                 banned_by: MemberId::from(&owner().verifying_key()),
-                banned_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+                banned_at: (SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000))
+                    .into(),
                 target: MemberId(FastHash(2)),
             },
             &owner(),
@@ -1328,9 +1431,9 @@ mod tests {
     fn policy_values_are_absolute_ranges() {
         let ok = PublicRoomPolicy {
             listed: false,
-            max_provisional: 16,
+            max_provisional: 24,
             max_provisional_messages: 500,
-            max_provisional_bans: 16,
+            max_provisional_bans: 24,
             pow: Some(PowPolicy {
                 difficulty_bits: 32,
                 epoch: 0,
@@ -1340,7 +1443,7 @@ mod tests {
         let mut p = ok.clone();
         p.max_provisional = 0;
         assert!(p.check_values().is_err());
-        p.max_provisional = 17;
+        p.max_provisional = 25;
         assert!(p.check_values().is_err());
         let mut p = ok.clone();
         p.max_provisional_messages = 0;
@@ -1348,7 +1451,7 @@ mod tests {
         p.max_provisional_messages = 501;
         assert!(p.check_values().is_err());
         let mut p = ok.clone();
-        p.max_provisional_bans = 17;
+        p.max_provisional_bans = 25;
         assert!(p.check_values().is_err());
         p.max_provisional_bans = 0;
         assert!(p.check_values().is_ok());
@@ -1417,7 +1520,7 @@ mod tests {
                     MessageV1 {
                         room_owner: owner_id,
                         author: x_id,
-                        time: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(5),
+                        time: (SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(5)).into(),
                         content: RoomMessageBody::public("under another key".to_string()),
                     },
                     &y,

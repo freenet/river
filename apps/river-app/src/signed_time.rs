@@ -1,11 +1,13 @@
 //! Timestamps that get signed.
 //!
-//! River signs the CBOR of structs holding a `SystemTime` (`MessageV1.time`, `UserBan.banned_at`,
-//! `SecretVersionRecordV1.created_at`). A verifier decodes the struct and serialises it again to
-//! check the signature. On Windows a `SystemTime` has 100 ns resolution, so a timestamp whose
-//! nanosecond field is not a multiple of 100 changes when it is decoded there, the bytes differ and
-//! the signature fails (freenet/river#971). Every time this app signs is therefore a whole
-//! millisecond, the precision the web UI stamps and one every platform keeps exactly.
+//! River signs the CBOR of structs holding a `SignedTime` (`MessageV1.time`, `UserBan.banned_at`,
+//! `SecretVersionRecordV1.created_at`). `SignedTime` keeps the exact `(secs, nanos)` pair, so a
+//! verifier's decode and re-encode returns the signed bytes on every platform, Windows included
+//! (freenet/river#971, #1018). For stamps this build makes, the whole-millisecond rounding here is
+//! therefore no longer needed for signatures to verify. It stays for two reasons: it keeps stamps
+//! compatible with the web UI's millisecond precision, and older Windows builds of riverctl and the
+//! desktop app (which floor decoded times to 100ns) can only verify stamps that are whole
+//! milliseconds.
 //!
 //! Never apply this to a timestamp that is already signed: it would change the signed bytes.
 
@@ -37,12 +39,6 @@ mod tests {
     use river_core::room_state::ban::{AuthorizedUserBan, UserBan};
     use river_core::room_state::member::MemberId;
     use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
-
-    /// A decode on Windows: the nanosecond field keeps only whole 100 ns units.
-    fn windows_decode(t: SystemTime) -> SystemTime {
-        let d = t.duration_since(UNIX_EPOCH).unwrap();
-        UNIX_EPOCH + Duration::new(d.as_secs(), d.subsec_nanos() / 100 * 100)
-    }
 
     /// Not a multiple of 100 ns, as `SystemTime::now()` is on Linux and macOS.
     fn awkward() -> SystemTime {
@@ -89,18 +85,14 @@ mod tests {
         out
     }
 
-    /// What a verifier does: decode the signed bytes into the real struct. On Windows that decode
-    /// floors the time to 100 ns by itself; elsewhere `windows_decode` does what it does, so the
-    /// check fails for the same reason on every platform.
+    /// What a verifier does: decode the signed bytes into the real struct.
     fn decoded_message(bytes: &[u8], sig: ed25519_dalek::Signature) -> AuthorizedMessageV1 {
-        let mut m: MessageV1 = ciborium::de::from_reader(bytes).unwrap();
-        m.time = windows_decode(m.time);
+        let m: MessageV1 = ciborium::de::from_reader(bytes).unwrap();
         AuthorizedMessageV1::with_signature(m, sig)
     }
 
     fn decoded_ban(bytes: &[u8], by: MemberId, sig: ed25519_dalek::Signature) -> AuthorizedUserBan {
-        let mut b: UserBan = ciborium::de::from_reader(bytes).unwrap();
-        b.banned_at = windows_decode(b.banned_at);
+        let b: UserBan = ciborium::de::from_reader(bytes).unwrap();
         AuthorizedUserBan::with_signature(b, by, sig)
     }
 
@@ -133,24 +125,20 @@ mod tests {
     }
 
     #[test]
-    fn a_time_with_nanoseconds_signed_by_another_platform_fails_after_decode() {
+    fn a_time_with_nanoseconds_signed_by_another_platform_verifies_after_decode() {
         // 123_456_789 ns is what `SystemTime::now()` gives on Linux, not a multiple of 100.
         let (sk, m, ms, b, bs) = signed_raw(123_456_789);
         let me = MemberId::from(sk.verifying_key());
-        assert!(
-            decoded_message(&m, ms)
-                .validate(&sk.verifying_key())
-                .is_err()
-        );
-        assert!(
-            decoded_ban(&b, me, bs)
-                .verify_signature(&sk.verifying_key())
-                .is_err()
-        );
+        decoded_message(&m, ms)
+            .validate(&sk.verifying_key())
+            .unwrap();
+        decoded_ban(&b, me, bs)
+            .verify_signature(&sk.verifying_key())
+            .unwrap();
     }
 
     #[test]
-    fn a_whole_millisecond_signed_the_same_way_verifies_after_decode() {
+    fn a_whole_millisecond_verifies_after_decode() {
         let (sk, m, ms, b, bs) = signed_raw(123_000_000);
         let me = MemberId::from(sk.verifying_key());
         decoded_message(&m, ms)

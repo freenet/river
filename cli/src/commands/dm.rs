@@ -771,10 +771,7 @@ async fn execute_list(
                             .into_iter()
                             .map(|dm| {
                                 let datetime: DateTime<Utc> =
-                                    SystemTime::UNIX_EPOCH
-                                        .checked_add(std::time::Duration::from_secs(dm.timestamp))
-                                        .map(DateTime::<Utc>::from)
-                                        .unwrap_or_else(Utc::now);
+                                    crate::signed_time::utc_datetime_from_unix_secs(dm.timestamp);
                                 json!({
                                     "direction": if dm.outgoing { "outgoing" } else { "incoming" },
                                     "timestamp": datetime.to_rfc3339(),
@@ -1455,14 +1452,9 @@ fn format_dm_body_for_cli(
 }
 
 fn format_unix_local(unix_secs: u64) -> String {
-    SystemTime::UNIX_EPOCH
-        .checked_add(std::time::Duration::from_secs(unix_secs))
-        .map(|st| {
-            let dt: DateTime<Utc> = st.into();
-            let local: DateTime<Local> = dt.into();
-            local.format("%Y-%m-%d %H:%M:%S").to_string()
-        })
-        .unwrap_or_else(|| "<bad timestamp>".to_string())
+    let dt = crate::signed_time::utc_datetime_from_unix_secs(unix_secs);
+    let local: DateTime<Local> = dt.into();
+    local.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 #[cfg(test)]

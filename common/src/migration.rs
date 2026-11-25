@@ -146,8 +146,11 @@ mod tests {
         //
         // V40 registers the open-admission generation, before member content
         // was checked against the key that holds the id.
-        assert_eq!(LEGACY_ROOM_CONTRACT_CODE_HASHES.len(), 40);
-        assert_eq!(&hasher.finalize().to_hex()[..16], "f0d5f4684f243c51");
+        //
+        // V41 registers the last generation that re-verified the whole state
+        // on every update, before deltas were validated incrementally.
+        assert_eq!(LEGACY_ROOM_CONTRACT_CODE_HASHES.len(), 41);
+        assert_eq!(&hasher.finalize().to_hex()[..16], "e41ceadd739b65e1");
     }
 
     #[test]

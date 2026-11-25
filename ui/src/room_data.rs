@@ -1082,7 +1082,9 @@ impl RoomData {
                 // Get the creation time from the first secret version
                 if let Some(first_version) = self.room_state.secrets.versions.first() {
                     let creation_time = first_version.record.created_at;
-                    if let Ok(duration) = get_current_system_time().duration_since(creation_time) {
+                    if let Ok(duration) =
+                        get_current_system_time().duration_since(creation_time.into())
+                    {
                         // Rotate if it's been more than 7 days since creation
                         return duration.as_secs() > 7 * 24 * 60 * 60;
                     }
@@ -1883,7 +1885,7 @@ impl RoomData {
         let secret_version = SecretVersionRecordV1 {
             version: new_version,
             cipher_spec: RoomCipherSpec::Aes256Gcm,
-            created_at: get_current_system_time(),
+            created_at: get_current_system_time().into(),
         };
 
         let authorized_version = AuthorizedSecretVersionRecord::new(secret_version, &self_sk);
@@ -2462,7 +2464,8 @@ pub(crate) fn test_generation_copy(
                     AuthorizedUserBan::new(
                         UserBan {
                             owner_member_id: owner_id,
-                            banned_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(i),
+                            banned_at: (std::time::UNIX_EPOCH + std::time::Duration::from_secs(i))
+                                .into(),
                             banned_user: river_core::room_state::member::MemberId::from(
                                 SigningKey::from_bytes(&{
                                     let mut b = [4u8; 32];
@@ -2488,7 +2491,9 @@ pub(crate) fn test_generation_copy(
                 MessageV1 {
                     room_owner: owner_id,
                     author: owner_id,
-                    time: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000 + i as u64),
+                    time: (std::time::UNIX_EPOCH
+                        + std::time::Duration::from_secs(1_000 + i as u64))
+                    .into(),
                     content: RoomMessageBody::public(t.to_string()),
                 },
                 owner_sk,
@@ -2539,7 +2544,7 @@ pub(crate) fn test_room_with_messages(
                 MessageV1 {
                     room_owner: owner_vk.into(),
                     author: owner_vk.into(),
-                    time: base + std::time::Duration::from_secs(i as u64),
+                    time: (base + std::time::Duration::from_secs(i as u64)).into(),
                     content: RoomMessageBody::public(format!("message {i}")),
                 },
                 owner_sk,
@@ -2582,7 +2587,7 @@ impl Rooms {
             let secret_version = SecretVersionRecordV1 {
                 version: 0,
                 cipher_spec: RoomCipherSpec::Aes256Gcm,
-                created_at: get_current_system_time(),
+                created_at: get_current_system_time().into(),
             };
 
             let authorized_version = AuthorizedSecretVersionRecord::new(secret_version, &self_sk);
@@ -4136,7 +4141,7 @@ mod tests {
                 MessageV1 {
                     room_owner: vk.into(),
                     author: MemberId::from(member_sk.verifying_key()),
-                    time: std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000),
+                    time: (std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000)).into(),
                     content: RoomMessageBody::public("by the member".to_string()),
                 },
                 &member_sk,
@@ -5133,7 +5138,7 @@ mod tests {
             MessageV1 {
                 room_owner: vk.into(),
                 author: old_identity.verifying_key().into(),
-                time: get_current_system_time(),
+                time: get_current_system_time().into(),
                 content: RoomMessageBody::public("only in the old copy".to_string()),
             },
             &old_identity,
@@ -5403,7 +5408,7 @@ mod tests {
             MessageV1 {
                 room_owner: vk.into(),
                 author: vk.into(),
-                time: get_current_system_time(),
+                time: get_current_system_time().into(),
                 content: RoomMessageBody::public("public message".to_string()),
             },
             &owner,
@@ -6581,7 +6586,7 @@ mod tests {
         let v0_record = SecretVersionRecordV1 {
             version: 0,
             cipher_spec: RoomCipherSpec::Aes256Gcm,
-            created_at: get_current_system_time(),
+            created_at: get_current_system_time().into(),
         };
         room_state
             .secrets
@@ -6698,7 +6703,7 @@ mod tests {
         let original_msg = MessageV1 {
             room_owner: owner_id,
             author: owner_id,
-            time: get_current_system_time(),
+            time: get_current_system_time().into(),
             content: RoomMessageBody::private(
                 CONTENT_TYPE_TEXT,
                 TEXT_CONTENT_VERSION,
@@ -6718,7 +6723,7 @@ mod tests {
         let edit_msg = MessageV1 {
             room_owner: owner_id,
             author: owner_id,
-            time: get_current_system_time() + std::time::Duration::from_secs(1),
+            time: (get_current_system_time() + std::time::Duration::from_secs(1)).into(),
             content: RoomMessageBody::private_action(edit_ct, edit_nonce, secret_version),
         };
         let auth_edit = AuthorizedMessageV1::new(edit_msg, &owner_sk);
@@ -6753,7 +6758,7 @@ mod tests {
         let new_msg = MessageV1 {
             room_owner: owner_id,
             author: owner_id,
-            time: get_current_system_time() + std::time::Duration::from_secs(2),
+            time: (get_current_system_time() + std::time::Duration::from_secs(2)).into(),
             content: RoomMessageBody::private(
                 CONTENT_TYPE_TEXT,
                 TEXT_CONTENT_VERSION,
@@ -7886,7 +7891,7 @@ mod tests {
         let v0_record = SecretVersionRecordV1 {
             version: 0,
             cipher_spec: RoomCipherSpec::Aes256Gcm,
-            created_at: get_current_system_time(),
+            created_at: get_current_system_time().into(),
         };
         room_state
             .secrets
@@ -9238,7 +9243,7 @@ mod tests {
             let v0_record = SecretVersionRecordV1 {
                 version: 0,
                 cipher_spec: RoomCipherSpec::Aes256Gcm,
-                created_at: get_current_system_time(),
+                created_at: get_current_system_time().into(),
             };
             room_state
                 .secrets
@@ -9314,7 +9319,7 @@ mod tests {
         use river_core::room_state::ban::{AuthorizedUserBan, UserBan};
         let ban = UserBan {
             owner_member_id: room.owner_vk.into(),
-            banned_at: get_current_system_time(),
+            banned_at: get_current_system_time().into(),
             banned_user: target,
         };
         room.room_state
@@ -9488,7 +9493,7 @@ mod tests {
         // (enforcing) regardless of deputies.
         let ban = UserBan {
             owner_member_id: owner_id,
-            banned_at: get_current_system_time(),
+            banned_at: get_current_system_time().into(),
             banned_user: s_id,
         };
         room_state
@@ -9943,7 +9948,7 @@ mod tests {
         // Owner bans R (the subtree root).
         let ban = UserBan {
             owner_member_id: owner_id,
-            banned_at: get_current_system_time(),
+            banned_at: get_current_system_time().into(),
             banned_user: r_id,
         };
         room_state

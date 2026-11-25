@@ -70,7 +70,7 @@ pub fn BanButton(member_to_ban: MemberId, can_ban: bool, nickname: String) -> El
 
             let ban = UserBan {
                 owner_member_id: MemberId::from(&current_room),
-                banned_at: get_current_system_time(),
+                banned_at: get_current_system_time().into(),
                 banned_user: member_to_ban,
             };
 

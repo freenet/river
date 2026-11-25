@@ -81,7 +81,7 @@ impl Room {
             MessageV1 {
                 room_owner: self.owner.id,
                 author: who.id,
-                time: Self::at(secs),
+                time: Self::at(secs).into(),
                 content: match self.privacy {
                     PrivacyMode::Public => RoomMessageBody::public(format!("message {secs}")),
                     PrivacyMode::Private => RoomMessageBody::private_text(
@@ -99,7 +99,7 @@ impl Room {
         AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: self.owner.id,
-                banned_at: Self::at(secs),
+                banned_at: Self::at(secs).into(),
                 banned_user: target,
             },
             self.owner.id,
@@ -116,7 +116,7 @@ impl Room {
                     SecretVersionRecordV1 {
                         version: 0,
                         cipher_spec: RoomCipherSpec::Aes256Gcm,
-                        created_at: Self::at(0),
+                        created_at: Self::at(0).into(),
                     },
                     &self.owner.sk,
                 )],
@@ -399,7 +399,7 @@ fn bans_sharing_an_id_are_order_independent() {
     let genuine = AuthorizedUserBan::new(
         UserBan {
             owner_member_id: room.owner.id,
-            banned_at: Room::at(5),
+            banned_at: Room::at(5).into(),
             banned_user: Peer::new().id,
         },
         absent.id,
@@ -433,7 +433,7 @@ fn bans_sharing_an_id_from_a_rejoining_banner_are_order_independent() {
     let genuine = AuthorizedUserBan::new(
         UserBan {
             owner_member_id: room.owner.id,
-            banned_at: Room::at(5),
+            banned_at: Room::at(5).into(),
             banned_user: Peer::new().id,
         },
         banner.id,
@@ -475,7 +475,7 @@ fn messages_sharing_an_id_are_order_independent() {
         let base = room.baseline();
         let genuine = room.message(&room.a, 10);
         let mut same_id = genuine.clone();
-        same_id.message.time = Room::at(11);
+        same_id.message.time = Room::at(11).into();
         assert!(same_id.id() == genuine.id());
         assert_order_independent(
             &format!("{privacy:?}"),

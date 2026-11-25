@@ -73,7 +73,7 @@ fn message(who: &Peer, owner_id: MemberId, text: &str) -> AuthorizedMessageV1 {
         MessageV1 {
             room_owner: owner_id,
             author: who.id,
-            time: SystemTime::UNIX_EPOCH,
+            time: SystemTime::UNIX_EPOCH.into(),
             content: RoomMessageBody::public(text.to_string()),
         },
         &who.sk,
@@ -94,7 +94,7 @@ fn ban(target: MemberId, banner: &Peer, owner_id: MemberId) -> AuthorizedUserBan
     AuthorizedUserBan::new(
         UserBan {
             owner_member_id: owner_id,
-            banned_at: SystemTime::UNIX_EPOCH,
+            banned_at: SystemTime::UNIX_EPOCH.into(),
             banned_user: target,
         },
         banner.id,
@@ -121,7 +121,7 @@ fn owner_ban_purges_the_banned_members_messages_and_member_info() {
         MessageV1 {
             room_owner: owner_id,
             author: bystander.id,
-            time: SystemTime::UNIX_EPOCH,
+            time: SystemTime::UNIX_EPOCH.into(),
             content: RoomMessageBody::reply(
                 "please stop".to_string(),
                 abusive.id(),

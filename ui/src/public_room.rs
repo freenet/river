@@ -922,7 +922,7 @@ mod tests {
             MessageV1 {
                 room_owner: MemberId::from(&sk.verifying_key()),
                 author: MemberId::from(&sk.verifying_key()),
-                time: std::time::SystemTime::UNIX_EPOCH,
+                time: std::time::SystemTime::UNIX_EPOCH.into(),
                 content: RoomMessageBody::public("hi".to_string()),
             },
             &sk,

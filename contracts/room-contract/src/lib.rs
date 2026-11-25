@@ -12,7 +12,14 @@ use river_core::ChatRoomStateV1;
 #[allow(dead_code)]
 struct Contract;
 
-#[contract]
+// `update_validates` is a promise to freenet-core: `update_state`, given a state
+// this node stored, treats every update (including a whole `State`) as
+// untrusted input and returns `Err` unless its output passes `validate_state`
+// (the whole-state check at the end of `update_state`). A core release that
+// honours the marker (none does yet) may then skip its own `validate_state`
+// both before (of an incoming `State`) and after (of the result), and skip the
+// recovery that replaces a stored state failing `validate_state`.
+#[contract(update_validates)]
 impl ContractInterface for Contract {
     fn validate_state(
         parameters: Parameters<'static>,
@@ -30,19 +37,23 @@ impl ContractInterface for Contract {
         let parameters = from_reader::<ChatRoomParametersV1, &[u8]>(parameters.as_ref())
             .map_err(|e| ContractError::Deser(e.to_string()))?;
 
-        // `verify`, and then that cleanup leaves the state unchanged, so every
-        // state a peer holds is canonical (`validate_whole_state` explains the
-        // byte comparison and the shared signature memo). Every merge and
-        // delta apply ends in cleanup, so a state a peer produced already is;
-        // clients send `ChatRoomStateV1::normalized` in whole-state PUTs. Not
-        // in `ComposableState::verify`, which also runs on partial states
-        // while a delta's fields are applied.
-        chat_state
-            .validate_whole_state(&parameters, bytes)
-            .map_err(|e| ContractError::InvalidUpdateWithInfo {
-                reason: e.to_string(),
-            })?;
-        Ok(ValidateResult::Valid)
+        // One signature memo for the whole call, so a signature checked twice
+        // inside it is verified once. It never seeds: this input is untrusted.
+        river_core::room_state::sigcheck::scope(|| {
+            // `verify`, and then that cleanup leaves the state unchanged, so every
+            // state a peer holds is canonical (`validate_whole_state` explains the
+            // byte comparison and the shared signature memo). Every merge and
+            // delta apply ends in cleanup, so a state a peer produced already is;
+            // clients send `ChatRoomStateV1::normalized` in whole-state PUTs. Not
+            // in `ComposableState::verify`, which also runs on partial states
+            // while a delta's fields are applied.
+            chat_state
+                .validate_whole_state(&parameters, bytes)
+                .map_err(|e| ContractError::InvalidUpdateWithInfo {
+                    reason: e.to_string(),
+                })?;
+            Ok(ValidateResult::Valid)
+        })
     }
 
     fn update_state(
@@ -50,62 +61,97 @@ impl ContractInterface for Contract {
         state: State<'static>,
         data: Vec<UpdateData<'static>>,
     ) -> Result<UpdateModification<'static>, freenet_stdlib::prelude::ContractError> {
-        let parameters = from_reader::<ChatRoomParametersV1, &[u8]>(parameters.as_ref())
-            .map_err(|e| ContractError::Deser(e.to_string()))?;
-        let mut chat_state = from_reader::<ChatRoomStateV1, &[u8]>(state.as_ref())
-            .map_err(|e| ContractError::Deser(e.to_string()))?;
+        river_core::room_state::sigcheck::scope(|| {
+            let parameters = from_reader::<ChatRoomParametersV1, &[u8]>(parameters.as_ref())
+                .map_err(|e| ContractError::Deser(e.to_string()))?;
+            let mut chat_state = from_reader::<ChatRoomStateV1, &[u8]>(state.as_ref())
+                .map_err(|e| ContractError::Deser(e.to_string()))?;
 
-        for update in data {
-            match update {
-                UpdateData::State(new_state) => {
-                    let new_state = from_reader::<ChatRoomStateV1, &[u8]>(new_state.as_ref())
-                        .map_err(|e| ContractError::Deser(e.to_string()))?;
-                    // The room's own whole-state merge (the trait default is
-                    // not commutative for rooms, freenet/river#703), called
-                    // without the parent argument it ignores, so the state is
-                    // not cloned to supply one.
-                    chat_state
-                        .merge_from(&parameters, &new_state)
-                        .map_err(|e| ContractError::InvalidUpdateWithInfo {
-                            reason: e.to_string(),
-                        })?;
-                }
-                UpdateData::Delta(d) => {
-                    if d.as_ref().is_empty() {
-                        continue;
+            // Validate deltas incrementally. The signatures the stored
+            // state's `verify` relies on are recorded as already checked, and
+            // only signatures a delta adds cost crypto. Apply, cleanup and
+            // the whole-state check below are the unchanged rules. This
+            // relies on the stored state being valid: a stored state that
+            // is not (disk damage) seeds its bad signatures as good, and
+            // the output check below cannot see them.
+            //
+            // This contract opts in to `update_validates`. When a core
+            // release honours that opt-in (not yet released), core will skip
+            // its own `validate_state` on hosts that already hold a state
+            // for this key, and rely on the whole-state check at the end of
+            // this function. Then a corrupted stored state can yield an `Ok`
+            // output that fails `validate_state`, and core would commit it.
+            // The opt-in is sound only if core first validates a key's stored
+            // state before trusting it (once per process); that is a
+            // precondition core is expected to provide, planned and not yet
+            // built. A seeding error (a structural fault in the stored state)
+            // continues unseeded.
+            // `seed_from` is called from here and nowhere else.
+            let _ = river_core::room_state::sigcheck::seed_from(|| {
+                chat_state.verify(&chat_state, &parameters)
+            });
+
+            for update in data {
+                match update {
+                    UpdateData::State(new_state) => {
+                        let new_state = from_reader::<ChatRoomStateV1, &[u8]>(new_state.as_ref())
+                            .map_err(|e| ContractError::Deser(e.to_string()))?;
+                        // The room's own whole-state merge (the trait default is
+                        // not commutative for rooms, freenet/river#703), called
+                        // without the parent argument it ignores, so the state is
+                        // not cloned to supply one.
+                        chat_state
+                            .merge_from(&parameters, &new_state)
+                            .map_err(|e| ContractError::InvalidUpdateWithInfo {
+                                reason: e.to_string(),
+                            })?;
                     }
-                    let delta = from_reader::<ChatRoomStateV1Delta, &[u8]>(d.as_ref())
-                        .map_err(|e| ContractError::Deser(e.to_string()))?;
-                    chat_state
-                        .apply_delta(&chat_state.clone(), &parameters, &Some(delta))
-                        .map_err(|e| ContractError::InvalidUpdateWithInfo {
-                            reason: e.to_string(),
-                        })?;
-                }
-                UpdateData::RelatedState {
-                    related_to: _,
-                    state: _,
-                } => {
-                    // TODO: related room_state handling not needed for river
-                }
-                // `UpdateData` became `#[non_exhaustive]` in freenet-stdlib
-                // 0.6.0. Unknown variants (including other Related* shapes
-                // we don't handle) are rejected rather than panicking with
-                // `unreachable!()` — a panic inside contract WASM would
-                // kill the runtime for this room and surface as a generic
-                // execution error. Returning `InvalidUpdate` is
-                // recoverable and gives a clearer diagnostic.
-                _ => {
-                    return Err(ContractError::InvalidUpdate);
+                    UpdateData::Delta(d) => {
+                        if d.as_ref().is_empty() {
+                            continue;
+                        }
+                        let delta = from_reader::<ChatRoomStateV1Delta, &[u8]>(d.as_ref())
+                            .map_err(|e| ContractError::Deser(e.to_string()))?;
+                        chat_state
+                            .apply_delta(&chat_state.clone(), &parameters, &Some(delta))
+                            .map_err(|e| ContractError::InvalidUpdateWithInfo {
+                                reason: e.to_string(),
+                            })?;
+                    }
+                    UpdateData::RelatedState {
+                        related_to: _,
+                        state: _,
+                    } => {
+                        // TODO: related room_state handling not needed for river
+                    }
+                    // `UpdateData` became `#[non_exhaustive]` in freenet-stdlib
+                    // 0.6.0. Unknown variants (including other Related* shapes
+                    // we don't handle) are rejected rather than panicking with
+                    // `unreachable!()` — a panic inside contract WASM would
+                    // kill the runtime for this room and surface as a generic
+                    // execution error. Returning `InvalidUpdate` is
+                    // recoverable and gives a clearer diagnostic.
+                    _ => {
+                        return Err(ContractError::InvalidUpdate);
+                    }
                 }
             }
-        }
 
-        let mut updated_state = vec![];
-        into_writer(&chat_state, &mut updated_state)
-            .map_err(|e| ContractError::Deser(e.to_string()))?;
+            let mut updated_state = vec![];
+            into_writer(&chat_state, &mut updated_state)
+                .map_err(|e| ContractError::Deser(e.to_string()))?;
 
-        Ok(UpdateModification::valid(updated_state.into()))
+            // The same whole-state check `validate_state` runs, on the result.
+            // For a valid stored state, an `Ok` here is a state that passes
+            // `validate_state`; its signature checks are memo hits.
+            chat_state
+                .validate_whole_state(&parameters, &updated_state)
+                .map_err(|e| ContractError::InvalidUpdateWithInfo {
+                    reason: e.to_string(),
+                })?;
+
+            Ok(UpdateModification::valid(updated_state.into()))
+        })
     }
 
     fn summarize_state(
@@ -157,12 +203,29 @@ impl ContractInterface for Contract {
 }
 
 #[cfg(test)]
+mod incremental_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use river_core::room_state::ban::{AuthorizedUserBan, BansV1, UserBan};
     use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
     use river_core::room_state::member::MemberId;
+
+    /// The `update_validates` opt-in is the export `__frnt__update_validates`
+    /// returning 1, which core reads from the built module. Dropping the
+    /// attribute fails this. `scripts/check-update-validates-export.sh` checks
+    /// the same on the built WASM.
+    #[test]
+    fn contract_exports_the_update_validates_marker() {
+        assert_eq!(super::__frnt__update_validates(), 1);
+        let src = include_str!("lib.rs");
+        assert!(
+            src.contains("#[contract(update_validates)]\nimpl ContractInterface for Contract"),
+            "the room contract must opt in with #[contract(update_validates)]"
+        );
+    }
 
     macro_rules! cbor {
         ($v:expr) => {{
@@ -205,8 +268,9 @@ mod tests {
                 AuthorizedUserBan::new(
                     UserBan {
                         owner_member_id: owner_id,
-                        banned_at: std::time::SystemTime::UNIX_EPOCH
-                            + std::time::Duration::from_secs(i),
+                        banned_at: (std::time::SystemTime::UNIX_EPOCH
+                            + std::time::Duration::from_secs(i))
+                        .into(),
                         banned_user: MemberId::from(&target.verifying_key()),
                     },
                     owner_id,
@@ -288,8 +352,9 @@ mod tests {
                         MessageV1 {
                             room_owner: owner_id,
                             author: MemberId::from(&a.verifying_key()),
-                            time: std::time::SystemTime::UNIX_EPOCH
-                                + std::time::Duration::from_secs(i as u64),
+                            time: (std::time::SystemTime::UNIX_EPOCH
+                                + std::time::Duration::from_secs(i as u64))
+                            .into(),
                             content: RoomMessageBody::public(format!("m{i}")),
                         },
                         a,
@@ -376,8 +441,9 @@ mod tests {
                             MessageV1 {
                                 room_owner: owner_id,
                                 author: owner_id,
-                                time: std::time::SystemTime::UNIX_EPOCH
-                                    + std::time::Duration::from_secs(1_000 + i),
+                                time: (std::time::SystemTime::UNIX_EPOCH
+                                    + std::time::Duration::from_secs(1_000 + i))
+                                .into(),
                                 content: RoomMessageBody::public(format!("m{i}")),
                             },
                             &owner_sk,
@@ -533,7 +599,7 @@ mod tests {
                         room_owner: owner_id,
                         author: id,
                         content: RoomMessageBody::public(format!("message {k} from {i}")),
-                        time: at(i as u64 * 10 + k),
+                        time: at(i as u64 * 10 + k).into(),
                     },
                     sk,
                 ));
@@ -547,7 +613,7 @@ mod tests {
                     room_owner: owner_id,
                     author: MemberId::from(&sks[i].verifying_key()),
                     content: RoomMessageBody::edit(target, format!("edited {i}")),
-                    time: at(5_000 + i as u64),
+                    time: at(5_000 + i as u64).into(),
                 },
                 &sks[i],
             ));
@@ -557,7 +623,7 @@ mod tests {
                 AuthorizedUserBan::new(
                     UserBan {
                         owner_member_id: owner_id,
-                        banned_at: at(6_000 + t),
+                        banned_at: at(6_000 + t).into(),
                         banned_user: MemberId::from(&key(500 + t as usize).verifying_key()),
                     },
                     owner_id,
@@ -698,8 +764,9 @@ mod tests {
                         room_owner: owner_id,
                         author: owner_id,
                         content: RoomMessageBody::public(format!("at {secs}")),
-                        time: std::time::SystemTime::UNIX_EPOCH
-                            + std::time::Duration::from_secs(1_700_000_000 + secs),
+                        time: (std::time::SystemTime::UNIX_EPOCH
+                            + std::time::Duration::from_secs(1_700_000_000 + secs))
+                        .into(),
                     },
                     &owner_sk,
                 ));
@@ -740,8 +807,9 @@ mod tests {
                     room_owner: owner_id,
                     author: owner_id,
                     content: RoomMessageBody::edit(target, "edited".to_string()),
-                    time: std::time::SystemTime::UNIX_EPOCH
-                        + std::time::Duration::from_secs(1_700_000_030),
+                    time: (std::time::SystemTime::UNIX_EPOCH
+                        + std::time::Duration::from_secs(1_700_000_030))
+                    .into(),
                 },
                 &owner_sk,
             ));

@@ -74,7 +74,7 @@ fn a_new_private_rooms_secret_record_is_stamped_a_whole_millisecond() {
         let d = v
             .record
             .created_at
-            .duration_since(SystemTime::UNIX_EPOCH)
+            .duration_since(SystemTime::UNIX_EPOCH.into())
             .unwrap();
         assert_eq!(d.subsec_nanos() % 1_000_000, 0, "{d:?}");
     }
@@ -251,7 +251,7 @@ fn joining_adds_the_invitee_their_nickname_and_a_join_event() {
     assert_eq!(messages[0].message.content, RoomMessageBody::join_event());
     assert_eq!(
         messages[0].message.time,
-        crate::signed_time::whole_millis(at)
+        crate::signed_time::whole_millis(at).into()
     );
     // Joining again at the same time sends the same bytes (a resend after a lost answer).
     let again = join(&inv, "Bea", &state, key, at).unwrap();
@@ -361,7 +361,7 @@ fn a_room_that_would_not_take_the_invitee_refuses_the_join() {
     let ban = river_core::room_state::ban::AuthorizedUserBan::new(
         river_core::room_state::ban::UserBan {
             owner_member_id: MemberId::from(&owner.verifying_key()),
-            banned_at: SystemTime::now(),
+            banned_at: SystemTime::now().into(),
             banned_user: MemberId::from(&inv.invitee_signing_key.verifying_key()),
         },
         MemberId::from(&owner.verifying_key()),

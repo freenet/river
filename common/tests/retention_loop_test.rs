@@ -205,7 +205,7 @@ fn msg_at(r: &Room, secs: u64) -> AuthorizedMessageV1 {
         MessageV1 {
             room_owner: r.owner_id,
             author: r.author_id,
-            time: SystemTime::UNIX_EPOCH + Duration::from_secs(BASE_SECS + secs),
+            time: (SystemTime::UNIX_EPOCH + Duration::from_secs(BASE_SECS + secs)).into(),
             content: RoomMessageBody::public(format!("message {secs}")),
         },
         &r.author_sk,
@@ -227,7 +227,7 @@ fn held(m: &MessagesV1) -> Vec<u64> {
         .map(|m| {
             m.message
                 .time
-                .duration_since(SystemTime::UNIX_EPOCH)
+                .duration_since(SystemTime::UNIX_EPOCH.into())
                 .expect("message time is after the epoch")
                 .as_secs()
                 - BASE_SECS
@@ -690,7 +690,7 @@ fn ban_sweep_reopening_the_horizon_still_loops_known_gap() {
             MessageV1 {
                 room_owner: r.owner_id,
                 author,
-                time: SystemTime::UNIX_EPOCH + Duration::from_secs(BASE_SECS + secs),
+                time: (SystemTime::UNIX_EPOCH + Duration::from_secs(BASE_SECS + secs)).into(),
                 content: RoomMessageBody::public(format!("m{secs}")),
             },
             sk,
@@ -723,7 +723,7 @@ fn ban_sweep_reopening_the_horizon_still_loops_known_gap() {
     let ban = AuthorizedUserBan::new(
         UserBan {
             owner_member_id: r.owner_id,
-            banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(BASE_SECS + 500),
+            banned_at: (SystemTime::UNIX_EPOCH + Duration::from_secs(BASE_SECS + 500)).into(),
             banned_user: x_id,
         },
         r.owner_id,

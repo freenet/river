@@ -69,7 +69,7 @@ fn join(who: &Peer, owner_id: MemberId) -> AuthorizedMessageV1 {
         MessageV1 {
             room_owner: owner_id,
             author: who.id,
-            time: SystemTime::now(),
+            time: SystemTime::now().into(),
             content: RoomMessageBody::join_event(),
         },
         &who.sk,
@@ -80,7 +80,7 @@ fn ban(target: MemberId, banner: &Peer, owner_id: MemberId) -> AuthorizedUserBan
     AuthorizedUserBan::new(
         UserBan {
             owner_member_id: owner_id,
-            banned_at: SystemTime::now(),
+            banned_at: SystemTime::now().into(),
             banned_user: target,
         },
         banner.id,
@@ -928,7 +928,7 @@ fn ban_at(target: MemberId, banner: &Peer, owner_id: MemberId, secs: u64) -> Aut
     AuthorizedUserBan::new(
         UserBan {
             owner_member_id: owner_id,
-            banned_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+            banned_at: (SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs)).into(),
             banned_user: target,
         },
         banner.id,
@@ -1092,7 +1092,7 @@ fn garbage_sig_ban_from_present_member_rejected_by_verify() {
         bans: BansV1(vec![AuthorizedUserBan::with_signature(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: SystemTime::now(),
+                banned_at: SystemTime::now().into(),
                 banned_user: t.id,
             },
             m.id,
@@ -1465,7 +1465,7 @@ fn same_delta_replayed_deputy_forged_ban_is_inert_and_swept() {
     let forged = AuthorizedUserBan::with_signature(
         UserBan {
             owner_member_id: owner_id,
-            banned_at: SystemTime::now(),
+            banned_at: SystemTime::now().into(),
             banned_user: v.id,
         },
         d.id,
@@ -1719,7 +1719,7 @@ fn post_apply_cleanup_is_idempotent_for_garbage_sig_member_banner() {
     let z = AuthorizedUserBan::with_signature(
         UserBan {
             owner_member_id: owner_id,
-            banned_at: SystemTime::now(),
+            banned_at: SystemTime::now().into(),
             banned_user: absent.id,
         },
         p_member.id,

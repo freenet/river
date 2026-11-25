@@ -149,7 +149,7 @@ fn test_message_validation_after_invitation_acceptance() -> Result<()> {
         room_owner: owner_vk.into(),
         author: invitee_vk.into(),
         content: RoomMessageBody::public("Hello from invited user!".to_string()),
-        time: SystemTime::now(),
+        time: SystemTime::now().into(),
     };
     let auth_message = AuthorizedMessageV1::new(message, &invitee_sk);
 
@@ -215,7 +215,7 @@ fn test_uninvited_user_messages_are_filtered() -> Result<()> {
         room_owner: owner_vk.into(),
         author: uninvited_vk.into(),
         content: RoomMessageBody::public("Hello from uninvited user!".to_string()),
-        time: SystemTime::now(),
+        time: SystemTime::now().into(),
     };
     let auth_message = AuthorizedMessageV1::new(message, &uninvited_sk);
 

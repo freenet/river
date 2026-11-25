@@ -23,7 +23,7 @@ fn message(text: &str, ms: u64) -> (MessageV1, Vec<u8>) {
         room_owner: MemberId::from(&room()),
         author: MemberId::from(&author().verifying_key()),
         content: RoomMessageBody::public(text.to_string()),
-        time: SystemTime::UNIX_EPOCH + Duration::from_millis(ms),
+        time: (SystemTime::UNIX_EPOCH + Duration::from_millis(ms)).into(),
     };
     let mut bytes = Vec::new();
     ciborium::ser::into_writer(&message, &mut bytes).unwrap();
@@ -87,7 +87,7 @@ fn a_send_shows_as_pending_until_its_signature_arrives_then_commits_once() {
         .expect("the committed message verifies under the author's key");
     assert_eq!(
         signed[0].message.time,
-        SystemTime::UNIX_EPOCH + Duration::from_millis(10),
+        (SystemTime::UNIX_EPOCH + Duration::from_millis(10)).into(),
         "signing does not restamp the message"
     );
     assert!(
@@ -547,7 +547,7 @@ fn a_message_signed_across_a_rotation_is_sealed_again_and_committed_in_order() {
     assert_eq!(version_of(&ready[0]), 2, "committed under the new secret");
     assert_eq!(
         ready[0].messages[0].message.time,
-        SystemTime::UNIX_EPOCH + Duration::from_millis(10),
+        (SystemTime::UNIX_EPOCH + Duration::from_millis(10)).into(),
         "keeping its Enter-time timestamp"
     );
     ready[0].authorized()[0]

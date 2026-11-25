@@ -1575,7 +1575,7 @@ mod tests {
                 room_owner: owner_id,
                 author: owner_id,
                 content: RoomMessageBody::public(body.to_string()),
-                time: base + Duration::from_secs(n),
+                time: (base + Duration::from_secs(n)).into(),
             };
             state
                 .recent_messages
@@ -1819,8 +1819,9 @@ mod tests {
                     AuthorizedUserBan::new(
                         UserBan {
                             owner_member_id: owner_id,
-                            banned_at: std::time::SystemTime::UNIX_EPOCH
-                                + std::time::Duration::from_secs(i),
+                            banned_at: (std::time::SystemTime::UNIX_EPOCH
+                                + std::time::Duration::from_secs(i))
+                            .into(),
                             banned_user: MemberId::from(
                                 &SigningKey::from_bytes(&{
                                     let mut b = [3u8; 32];

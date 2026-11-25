@@ -93,7 +93,7 @@ fn private_room(r: &Room) -> ChatRoomStateV1 {
             SecretVersionRecordV1 {
                 version: 1,
                 cipher_spec: RoomCipherSpec::Aes256Gcm,
-                created_at: at(0),
+                created_at: at(0).into(),
             },
             &r.owner_sk,
         )],
@@ -107,7 +107,7 @@ fn msg(r: &Room, t: u64, content: RoomMessageBody) -> AuthorizedMessageV1 {
         MessageV1 {
             room_owner: r.owner_id,
             author: r.member.member.id(),
-            time: at(t),
+            time: at(t).into(),
             content,
         },
         &r.member_sk,
@@ -272,7 +272,7 @@ fn equal_version_secret_records_merge_the_same_way_and_forgeries_fail() {
             SecretVersionRecordV1 {
                 version,
                 cipher_spec: RoomCipherSpec::Aes256Gcm,
-                created_at,
+                created_at: created_at.into(),
             },
             sk,
         )
@@ -367,7 +367,7 @@ fn forged_secret_records_never_replace_a_held_record() {
             SecretVersionRecordV1 {
                 version: 1,
                 cipher_spec: RoomCipherSpec::Aes256Gcm,
-                created_at,
+                created_at: created_at.into(),
             },
             sk,
         )
@@ -462,7 +462,7 @@ fn member_ban(
     river_core::room_state::ban::AuthorizedUserBan::new(
         river_core::room_state::ban::UserBan {
             owner_member_id: r.owner_id,
-            banned_at: at(t),
+            banned_at: at(t).into(),
             banned_user: target,
         },
         r.member.member.id(),
@@ -592,7 +592,7 @@ fn two_records_held_at_one_version_are_normalized_in_both_directions() {
     let base = private_room(&r);
     let mut holder = base.clone();
     let mut second = base.secrets.versions[0].record.clone();
-    second.created_at = at(77);
+    second.created_at = at(77).into();
     holder
         .secrets
         .versions
@@ -664,7 +664,7 @@ fn lowering_the_nickname_limit_drops_no_record() {
             MessageV1 {
                 room_owner: r.owner_id,
                 author: e.member.id(),
-                time: at(2),
+                time: at(2).into(),
                 content: RoomMessageBody::public("hey".into()),
             },
             &e_sk,
@@ -845,7 +845,7 @@ fn a_ban_with_a_bad_signature_from_a_known_issuer_is_dropped_in_both_directions(
     let target = MemberId::from(&SigningKey::from_bytes(&[15; 32]).verifying_key());
     let ban = UserBan {
         owner_member_id: r.owner_id,
-        banned_at: at(5),
+        banned_at: at(5).into(),
         banned_user: target,
     };
     let other_sk = SigningKey::from_bytes(&[16; 32]);

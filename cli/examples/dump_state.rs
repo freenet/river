@@ -65,7 +65,7 @@ fn main() -> Result<()> {
             let timestamp = msg
                 .message
                 .time
-                .duration_since(SystemTime::UNIX_EPOCH)
+                .duration_since(SystemTime::UNIX_EPOCH.into())
                 .map(|d| d.as_secs())
                 .unwrap_or_default();
             match &msg.message.content {

@@ -29,22 +29,18 @@
 //!   makes, are `ensure_subscription_writes`, tested directly below with a
 //!   stored key; only the secret-store read itself is WASM-only.
 //!
-//! - **Cache-not-updated-when-signing-key-missing** (Fix 3): exercising
-//!   the cache-discipline rule needs `set_secret` to actually persist the
-//!   member-set bytes for a follow-up call to read back. Today's tests
-//!   cover the byte-shape of the rotation outputs and the version
-//!   arithmetic; the cache discipline is enforced by code review until a
-//!   harness lands.
-//!
-//! Filed as a follow-up in the PR description; the cleanest fix is a
-//! `MockDelegateCtx` trait wrapper but that requires changes upstream in
-//! `freenet-stdlib`.
+//! - **Notification handler with a store that can refuse writes**:
+//!   `handle_contract_notification` takes the `SecretStore` trait, so the
+//!   `RefusingStore` tests at the end of this file drive it end to end
+//!   (rotation stores the secret and member set; a refused write publishes
+//!   nothing and advances nothing; a retry succeeds). The host `DelegateCtx`
+//!   itself is still a stub.
 
 use super::*;
 use ed25519_dalek::SigningKey;
 use freenet_stdlib::prelude::{
-    ApplicationMessage, ContractInstanceId, DelegateCtx, DelegateInterface, InboundDelegateMsg,
-    MessageOrigin, Parameters,
+    ApplicationMessage, ContractInstanceId, ContractNotification, DelegateCtx, DelegateInterface,
+    InboundDelegateMsg, MessageOrigin, OutboundDelegateMsg, Parameters, UpdateData,
 };
 use rand::rngs::OsRng;
 use river_core::chat_delegate::ChatDelegateRequestMsg;
@@ -225,7 +221,7 @@ fn signs_secret_version_record_correctly() {
     let record = SecretVersionRecordV1 {
         version: 3,
         cipher_spec: RoomCipherSpec::Aes256Gcm,
-        created_at: UNIX_EPOCH,
+        created_at: UNIX_EPOCH.into(),
     };
     let bytes = cbor(&record);
     let sig = owner_sk.sign(&bytes);
@@ -264,7 +260,7 @@ fn rotates_on_member_set_change_after_state_apply() {
     let record = SecretVersionRecordV1 {
         version: new_version,
         cipher_spec: RoomCipherSpec::Aes256Gcm,
-        created_at: UNIX_EPOCH,
+        created_at: UNIX_EPOCH.into(),
     };
     let record_sig = owner_sk.sign(&cbor(&record));
     let authorized_record = AuthorizedSecretVersionRecord::with_signature(record, record_sig);
@@ -335,7 +331,7 @@ fn concurrent_rotations_produce_identical_signed_records() {
     let record_a = SecretVersionRecordV1 {
         version: 7,
         cipher_spec: RoomCipherSpec::Aes256Gcm,
-        created_at: UNIX_EPOCH,
+        created_at: UNIX_EPOCH.into(),
     };
     let record_b = record_a.clone();
 
@@ -396,7 +392,7 @@ fn ciborium_serialization_is_deterministic_for_signed_structs() {
         let record = SecretVersionRecordV1 {
             version,
             cipher_spec: RoomCipherSpec::Aes256Gcm,
-            created_at: UNIX_EPOCH + std::time::Duration::from_secs(secs),
+            created_at: (UNIX_EPOCH + std::time::Duration::from_secs(secs)).into(),
         };
         let bytes_a = cbor(&record);
         let bytes_b = cbor(&record);
@@ -1044,9 +1040,9 @@ fn a_notification_whose_configuration_the_owner_did_not_sign_resolves_to_no_room
     );
 }
 
-/// `handle_contract_notification` reads the delegate's secret store, which
-/// the host `DelegateCtx` stubs out, so no host test can drive it. Its two
-/// routing checks are pinned by reading the source instead (the idiom of
+/// The host `DelegateCtx` stubs out the secret store, so the behavioural
+/// tests at the end of this file use `RefusingStore`. Its two routing checks
+/// are also pinned by reading the source (the idiom of
 /// `cli/src/commands/debug.rs`): it must resolve the room through
 /// `resolve_notified_room` (never a plain read of the reverse index), and
 /// must ignore a notification for a contract the room's subscription does
@@ -1090,4 +1086,326 @@ fn the_notification_handler_routes_through_the_owner_and_the_subscribed_contract
         resolve < check && check < acts,
         "both checks run before the handler acts on the notified state"
     );
+}
+
+/// A secret store that can refuse writes to chosen keys, for the failure
+/// paths the host `DelegateCtx` stub cannot reach.
+#[derive(Default)]
+struct RefusingStore {
+    map: std::collections::HashMap<Vec<u8>, Vec<u8>>,
+    /// A write to a key starting with one of these is refused.
+    refuse_prefixes: Vec<Vec<u8>>,
+}
+
+impl SecretStore for RefusingStore {
+    fn get_secret(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.map.get(key).cloned()
+    }
+    fn set_secret(&mut self, key: &[u8], value: &[u8]) -> bool {
+        if self.refuse_prefixes.iter().any(|p| key.starts_with(p)) {
+            return false;
+        }
+        self.map.insert(key.to_vec(), value.to_vec());
+        true
+    }
+    fn remove_secret(&mut self, key: &[u8]) {
+        self.map.remove(key);
+    }
+}
+
+const ORIGIN_B58: &str = "origin";
+
+/// A store holding the subscription and the owner's signing key for a
+/// private room, and a notification of that room with one member in it (a
+/// member set no cache has seen, so it triggers a rotation to v1).
+fn rotation_fixture() -> (RefusingStore, ContractNotification, String) {
+    let owner_sk = SigningKey::generate(&mut OsRng);
+    let alice_sk = SigningKey::generate(&mut OsRng);
+    let owner_vk = owner_sk.verifying_key().to_bytes();
+    let cid = [9u8; 32];
+    let room_b58 = room_owner_b58(&owner_vk);
+    let mut store = RefusingStore::default();
+    for (k, v) in
+        ensure_subscription_writes(ORIGIN_B58, owner_vk, cid, KeyCheck::Unavailable).unwrap()
+    {
+        store.map.insert(k, v);
+    }
+    store.map.insert(
+        signing_key_secret_key(ORIGIN_B58, &room_b58),
+        owner_sk.to_bytes().to_vec(),
+    );
+    let state = private_room_state(&owner_sk, &[&alice_sk]);
+    let notification = ContractNotification {
+        contract_id: ContractInstanceId::new(cid),
+        new_state: freenet_stdlib::prelude::WrappedState::new(cbor(&state)),
+        context: Default::default(),
+    };
+    (store, notification, room_b58)
+}
+
+fn has_update(out: &[OutboundDelegateMsg]) -> bool {
+    out.iter()
+        .any(|m| matches!(m, OutboundDelegateMsg::UpdateContractRequest(_)))
+}
+
+#[test]
+fn rotation_succeeds_and_stores_the_secret_and_member_set() {
+    let (mut store, n, room) = rotation_fixture();
+    let out = handle_contract_notification(&mut store, n).unwrap();
+    assert!(has_update(&out));
+    assert!(store.map.contains_key(&secret_keys::secret(&room, 1)));
+    assert!(store.map.contains_key(&secret_keys::member_set(&room)));
+}
+
+#[test]
+fn a_refused_secret_write_still_publishes_the_rotation_and_is_reported() {
+    let (mut store, n, room) = rotation_fixture();
+    store.refuse_prefixes = vec![secret_keys::secret(&room, 1)];
+    let out = handle_contract_notification(&mut store, n.clone()).unwrap();
+    assert!(
+        has_update(&out),
+        "the rotation must not depend on the local copy"
+    );
+    assert!(!store.map.contains_key(&secret_keys::secret(&room, 1)));
+    // The cache still advances, so the next notification does not re-rotate.
+    assert!(store.map.contains_key(&secret_keys::member_set(&room)));
+
+    // The failure is observable, and names no secret bytes.
+    let mut store2 = RefusingStore {
+        refuse_prefixes: vec![secret_keys::secret(&room, 1)],
+        ..Default::default()
+    };
+    let state: ChatRoomStateV1 = ciborium::from_reader(n.new_state.as_ref()).unwrap();
+    let secret = [0xABu8; 32];
+    let warnings = store_rotation_copies(&mut store2, &room, 1, &secret, &state);
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("local secret copy"));
+    assert!(!warnings[0].contains("171") && !warnings[0].contains("ab, ab"));
+}
+
+#[test]
+fn a_refused_member_set_write_still_publishes_the_rotation_and_is_reported() {
+    let (mut store, n, room) = rotation_fixture();
+    store.refuse_prefixes = vec![secret_keys::member_set(&room)];
+    let out = handle_contract_notification(&mut store, n.clone()).unwrap();
+    assert!(has_update(&out));
+    assert!(!store.map.contains_key(&secret_keys::member_set(&room)));
+    assert!(store.map.contains_key(&secret_keys::secret(&room, 1)));
+
+    let mut store2 = RefusingStore {
+        refuse_prefixes: vec![secret_keys::member_set(&room)],
+        ..Default::default()
+    };
+    let state: ChatRoomStateV1 = ciborium::from_reader(n.new_state.as_ref()).unwrap();
+    let warnings = store_rotation_copies(&mut store2, &room, 1, &[1u8; 32], &state);
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("member-set cache"));
+}
+
+/// The room state after the delegate's published rotation was applied.
+fn apply_rotation(n: &ContractNotification, out: &[OutboundDelegateMsg]) -> ContractNotification {
+    let mut state: ChatRoomStateV1 = ciborium::from_reader(n.new_state.as_ref()).unwrap();
+    for m in out {
+        if let OutboundDelegateMsg::UpdateContractRequest(req) = m {
+            if let UpdateData::Delta(d) = &req.update {
+                let delta: river_core::room_state::ChatRoomStateV1Delta =
+                    ciborium::from_reader(d.as_ref()).unwrap();
+                let sd = delta.secrets.unwrap();
+                state.secrets.current_version = sd.current_version.unwrap();
+                state.secrets.versions.extend(sd.new_versions);
+                state
+                    .secrets
+                    .encrypted_secrets
+                    .extend(sd.new_encrypted_secrets);
+            }
+        }
+    }
+    ContractNotification {
+        new_state: freenet_stdlib::prelude::WrappedState::new(cbor(&state)),
+        ..n.clone()
+    }
+}
+
+#[test]
+fn writes_refused_every_time_still_publish_on_each_notification_and_do_not_wedge() {
+    let (mut store, n, room) = rotation_fixture();
+    // Every write to the delegate's secret store is refused, including the cache.
+    store.refuse_prefixes = vec![
+        secret_keys::SECRET_PREFIX.as_bytes().to_vec(),
+        secret_keys::member_set(&room),
+    ];
+    for _ in 0..3 {
+        let out = handle_contract_notification(&mut store, n.clone()).unwrap();
+        assert!(has_update(&out), "a refused store must not pause rotation");
+    }
+    assert!(!store.map.contains_key(&secret_keys::member_set(&room)));
+    assert!(!store.map.contains_key(&secret_keys::secret(&room, 1)));
+}
+
+/// Rotate a private room with members {A, B} (B invited by A) through the
+/// delegate, apply the rotation to the state, and return the store (cache now
+/// holds {A, B}), the rotated state and the keys.
+fn rotated_room_ab() -> (
+    RefusingStore,
+    ContractNotification,
+    ChatRoomStateV1,
+    [SigningKey; 3],
+) {
+    let owner_sk = SigningKey::generate(&mut OsRng);
+    let a_sk = SigningKey::generate(&mut OsRng);
+    let b_sk = SigningKey::generate(&mut OsRng);
+    let owner_id = MemberId::from(&owner_sk.verifying_key());
+    let mut state = private_room_state(&owner_sk, &[&a_sk]);
+    state.members.members.push(AuthorizedMember::new(
+        Member {
+            owner_member_id: owner_id,
+            invited_by: MemberId::from(&a_sk.verifying_key()),
+            member_vk: b_sk.verifying_key(),
+        },
+        &a_sk,
+    ));
+    let owner_vk = owner_sk.verifying_key().to_bytes();
+    let cid = [9u8; 32];
+    let room_b58 = room_owner_b58(&owner_vk);
+    let mut store = RefusingStore::default();
+    for (k, v) in
+        ensure_subscription_writes(ORIGIN_B58, owner_vk, cid, KeyCheck::Unavailable).unwrap()
+    {
+        store.map.insert(k, v);
+    }
+    store.map.insert(
+        signing_key_secret_key(ORIGIN_B58, &room_b58),
+        owner_sk.to_bytes().to_vec(),
+    );
+    let n = ContractNotification {
+        contract_id: ContractInstanceId::new(cid),
+        new_state: freenet_stdlib::prelude::WrappedState::new(cbor(&state)),
+        context: Default::default(),
+    };
+    let out = handle_contract_notification(&mut store, n.clone()).unwrap();
+    assert!(has_update(&out));
+    let rotated = apply_rotation(&n, &out);
+    let state: ChatRoomStateV1 = ciborium::from_reader(rotated.new_state.as_ref()).unwrap();
+    assert_eq!(state.secrets.current_version, 1);
+    (store, rotated, state, [owner_sk, a_sk, b_sk])
+}
+
+/// Removing a member erases their blobs, so afterwards the current version's
+/// blob holders equal the remaining members. The delegate must still rotate:
+/// a skip based on "blobs cover exactly the members" would leave the removed
+/// member able to read.
+fn assert_removal_rotates(ban_by: usize, banned: usize, expect_members: usize) {
+    use freenet_scaffold::ComposableState;
+    use river_core::room_state::ban::{AuthorizedUserBan, UserBan};
+    use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
+
+    let (mut store, rotated, state, keys) = rotated_room_ab();
+    let owner_id = MemberId::from(&keys[0].verifying_key());
+    let ban = AuthorizedUserBan::new(
+        UserBan {
+            owner_member_id: owner_id,
+            banned_at: std::time::SystemTime::now().into(),
+            banned_user: MemberId::from(&keys[banned].verifying_key()),
+        },
+        MemberId::from(&keys[ban_by].verifying_key()),
+        &keys[ban_by],
+    );
+    let params = ChatRoomParametersV1 {
+        owner: keys[0].verifying_key(),
+    };
+    let mut after = state.clone();
+    after
+        .apply_delta(
+            &state,
+            &params,
+            &Some(ChatRoomStateV1Delta {
+                bans: Some(vec![ban]),
+                ..Default::default()
+            }),
+        )
+        .expect("the ban applies");
+    assert_eq!(after.members.members.len(), expect_members);
+
+    // The premise: the removed member's blob is gone, so holders == members.
+    let banned_id = MemberId::from(&keys[banned].verifying_key());
+    assert!(!after
+        .secrets
+        .encrypted_secrets
+        .iter()
+        .any(|s| s.secret.member_id == banned_id));
+    let holders: std::collections::BTreeSet<MemberId> = after
+        .secrets
+        .encrypted_secrets
+        .iter()
+        .filter(|s| s.secret.secret_version == after.secrets.current_version)
+        .map(|s| s.secret.member_id)
+        .filter(|id| *id != owner_id)
+        .collect();
+    let members: std::collections::BTreeSet<MemberId> = after
+        .members
+        .members
+        .iter()
+        .map(|m| MemberId::from(&m.member.member_vk))
+        .collect();
+    assert_eq!(holders, members);
+
+    let n = ContractNotification {
+        new_state: freenet_stdlib::prelude::WrappedState::new(cbor(&after)),
+        ..rotated
+    };
+    let out = handle_contract_notification(&mut store, n).unwrap();
+    assert!(has_update(&out), "a removal must rotate the secret");
+}
+
+#[test]
+fn an_owner_ban_of_a_member_rotates_the_secret() {
+    assert_removal_rotates(0, 2, 1);
+}
+
+#[test]
+fn a_deputy_banning_the_member_it_invited_rotates_the_secret() {
+    assert_removal_rotates(1, 2, 1);
+}
+
+#[test]
+fn banning_a_deputy_removes_its_invitee_too_and_rotates_the_secret() {
+    // Owner bans A; B, invited by A, is dropped with it.
+    assert_removal_rotates(0, 1, 0);
+}
+
+#[test]
+fn a_refused_member_set_write_for_a_public_room_is_not_an_error() {
+    let (mut store, n, room) = rotation_fixture();
+    // Re-state the notification as a public room.
+    let mut state: ChatRoomStateV1 = ciborium::from_reader(n.new_state.as_ref()).unwrap();
+    let mut config = state.configuration.configuration.clone();
+    config.privacy_mode = PrivacyMode::Public;
+    config.configuration_version += 1;
+    // Re-signing needs the owner key held in the store.
+    let seed: [u8; 32] = store
+        .map
+        .get(&signing_key_secret_key(ORIGIN_B58, &room))
+        .unwrap()
+        .as_slice()
+        .try_into()
+        .unwrap();
+    state.configuration = AuthorizedConfigurationV1::new(config, &SigningKey::from_bytes(&seed));
+    let n = ContractNotification {
+        new_state: freenet_stdlib::prelude::WrappedState::new(cbor(&state)),
+        ..n
+    };
+    // Positive control: with the store healthy the public branch does run
+    // and stores the cache, so the refused case below reaches the same branch.
+    let mut healthy = RefusingStore {
+        map: store.map.clone(),
+        ..Default::default()
+    };
+    let out = handle_contract_notification(&mut healthy, n.clone()).unwrap();
+    assert!(out.is_empty());
+    assert!(healthy.map.contains_key(&secret_keys::member_set(&room)));
+
+    store.refuse_prefixes = vec![secret_keys::member_set(&room)];
+    let out = handle_contract_notification(&mut store, n).unwrap();
+    assert!(out.is_empty());
+    assert!(!store.map.contains_key(&secret_keys::member_set(&room)));
 }

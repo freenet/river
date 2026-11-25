@@ -122,7 +122,7 @@ impl Room {
             MessageV1 {
                 room_owner: self.owner.id,
                 author: who.id,
-                time,
+                time: time.into(),
                 content,
             },
             &who.sk,
@@ -139,7 +139,7 @@ impl Room {
         AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: self.owner.id,
-                banned_at: SystemTime::now(),
+                banned_at: SystemTime::now().into(),
                 banned_user: self.x.id,
             },
             by.id,
@@ -156,7 +156,7 @@ impl Room {
                     SecretVersionRecordV1 {
                         version: 0,
                         cipher_spec: RoomCipherSpec::Aes256Gcm,
-                        created_at: SystemTime::now(),
+                        created_at: SystemTime::now().into(),
                     },
                     &self.owner.sk,
                 )],
@@ -463,7 +463,7 @@ fn ban_evicted_case(privacy: PrivacyMode) {
     delta.bans = Some(vec![AuthorizedUserBan::new(
         UserBan {
             owner_member_id: room.owner.id,
-            banned_at: SystemTime::now() + Duration::from_secs(60),
+            banned_at: (SystemTime::now() + Duration::from_secs(60)).into(),
             banned_user: other.id,
         },
         room.d.id,
@@ -580,7 +580,7 @@ fn actions_from_a_removed_author_are_not_kept() {
                 MessageV1 {
                     room_owner: room.owner.id,
                     author: room.x.id,
-                    time: room.after_baseline(200),
+                    time: room.after_baseline(200).into(),
                     content,
                 },
                 &room.x.sk,

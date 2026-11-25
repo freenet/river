@@ -2,13 +2,13 @@ use crate::room_state::member::MemberId;
 use crate::room_state::member_info::{outranks, sig_digest, SigDigest};
 use crate::room_state::privacy::{RoomCipherSpec, SecretVersion};
 use crate::room_state::ChatRoomParametersV1;
+use crate::signed_time::SignedTime;
 use crate::util::{sign_struct, verify_struct};
 use crate::ChatRoomStateV1;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::time::SystemTime;
 
 /// Room secrets state managing encrypted secret distribution
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
@@ -355,7 +355,7 @@ pub struct SecretsDelta {
 pub struct SecretVersionRecordV1 {
     pub version: SecretVersion,
     pub cipher_spec: RoomCipherSpec,
-    pub created_at: SystemTime,
+    pub created_at: SignedTime,
 }
 
 /// Authorized secret version record signed by room owner
@@ -612,6 +612,7 @@ mod tests {
     use crate::room_state::member::{AuthorizedMember, Member};
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
+    use std::time::SystemTime;
 
     fn create_test_state_and_params() -> (ChatRoomStateV1, ChatRoomParametersV1, SigningKey) {
         let owner_signing_key = SigningKey::generate(&mut OsRng);
@@ -632,7 +633,7 @@ mod tests {
         let record = SecretVersionRecordV1 {
             version,
             cipher_spec: RoomCipherSpec::Aes256Gcm,
-            created_at: SystemTime::now(),
+            created_at: SystemTime::now().into(),
         };
         AuthorizedSecretVersionRecord::new(record, owner_sk)
     }
@@ -669,7 +670,7 @@ mod tests {
         let record = SecretVersionRecordV1 {
             version: 1,
             cipher_spec: RoomCipherSpec::Aes256Gcm,
-            created_at: SystemTime::now(),
+            created_at: SystemTime::now().into(),
         };
 
         let authorized_record =

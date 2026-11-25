@@ -131,7 +131,7 @@ fn every_refusal_is_said_in_fixed_words_and_nothing_is_queued() {
     banned.bans.0.push(AuthorizedUserBan::new(
         UserBan {
             owner_member_id: f.owner_id(),
-            banned_at: secs(BASE),
+            banned_at: secs(BASE).into(),
             banned_user: f.me_id(),
         },
         f.owner_id(),
@@ -577,7 +577,7 @@ fn a_send_is_failed_not_sent_when_you_can_no_longer_send_or_the_identity_changed
     banned_state.bans.0.push(AuthorizedUserBan::new(
         UserBan {
             owner_member_id: f.owner_id(),
-            banned_at: secs(BASE),
+            banned_at: secs(BASE).into(),
             banned_user: f.me_id(),
         },
         f.owner_id(),

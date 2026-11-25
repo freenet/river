@@ -205,7 +205,11 @@ under one ban-signature memo scope; struct `==` is wrong because
 So every state a peer holds is canonical, and clients send
 `ChatRoomStateV1::normalized` in every whole-state PUT and full-state UPDATE:
 freenet-core validates every incoming whole state before it merges it (UPDATE
-as well as PUT), so a non-canonical whole state is refused on every path.
+as well as PUT), so a non-canonical whole state is refused on every path. That
+holds for a host whose core does not honour the room contract's
+`update_validates` marker. A core that honours it (none yet) skips that
+pre-validation on hosts already holding the key, and the contract's own
+`update_state` merges the valid part of a partly invalid whole state instead.
 Deltas are not affected: the receiver applies them and then runs cleanup.
 
 Two refusal modes follow from comparing against cleanup's output, and both

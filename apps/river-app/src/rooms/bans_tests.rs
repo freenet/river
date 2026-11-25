@@ -168,7 +168,7 @@ impl World {
             let record = SecretVersionRecordV1 {
                 version: 0,
                 cipher_spec: RoomCipherSpec::Aes256Gcm,
-                created_at: at(1),
+                created_at: at(1).into(),
             };
             state.secrets.versions.push(AuthorizedSecretVersionRecord {
                 owner_signature: sign_struct(&record, self.owner()),
@@ -285,7 +285,7 @@ fn the_owner_bans_in_a_public_room_and_the_contract_removes_the_member_and_their
     assert_eq!(next.bans.0.len(), 1);
     assert_eq!(next.bans.0[0].ban.banned_user, id(&w.ann));
     assert_eq!(next.bans.0[0].banned_by, id(w.owner()));
-    assert_eq!(next.bans.0[0].ban.banned_at, at(TIME));
+    assert_eq!(next.bans.0[0].ban.banned_at, at(TIME).into());
     assert!(built.held_in(&LiveRoom::new({
         let mut s = room.stored.clone();
         s.room_state = next;
@@ -307,17 +307,17 @@ fn a_ban_and_its_rotation_are_signed_a_whole_millisecond() {
     let room = w.room(state, w.owner());
     let t = at(TIME) + Duration::new(0, 123_456_789);
     let built = build(&room, id(&w.ann), t).unwrap();
-    whole_ms(built.ban.as_ref().unwrap().ban.banned_at);
+    whole_ms(built.ban.as_ref().unwrap().ban.banned_at.into());
     let versions = &built.secrets.as_ref().unwrap().new_versions;
     assert!(!versions.is_empty());
     for r in versions {
-        whole_ms(r.record.created_at);
+        whole_ms(r.record.created_at.into());
     }
     let rotated = build_rotation(&room, t).unwrap();
     let versions = &rotated.secrets.as_ref().unwrap().new_versions;
     assert!(!versions.is_empty());
     for r in versions {
-        whole_ms(r.record.created_at);
+        whole_ms(r.record.created_at.into());
     }
 }
 
@@ -566,7 +566,7 @@ fn a_member_with_another_ban_kept_is_not_called_lifted() {
         AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: w.f.owner_id(),
-                banned_at: at(secs),
+                banned_at: at(secs).into(),
                 banned_user: id(who),
             },
             id(w.owner()),
@@ -621,7 +621,7 @@ fn only_a_ban_the_room_enforces_on_a_member_who_is_gone_counts() {
     let inert = AuthorizedUserBan::new(
         UserBan {
             owner_member_id: w.f.owner_id(),
-            banned_at: at(TIME),
+            banned_at: at(TIME).into(),
             banned_user: id(&w.cy),
         },
         id(&w.ann),
@@ -734,7 +734,7 @@ fn the_next_version_never_wraps() {
     let record = SecretVersionRecordV1 {
         version: u32::MAX,
         cipher_spec: RoomCipherSpec::Aes256Gcm,
-        created_at: at(5),
+        created_at: at(5).into(),
     };
     state.secrets.versions.push(AuthorizedSecretVersionRecord {
         owner_signature: sign_struct(&record, w.owner()),
@@ -1207,7 +1207,7 @@ fn a_waiting_private_ban_that_a_deputy_already_made_still_gets_its_rotation() {
     let deputy_ban = AuthorizedUserBan::new(
         UserBan {
             owner_member_id: w.f.owner_id(),
-            banned_at: at(TIME + 5),
+            banned_at: at(TIME + 5).into(),
             banned_user: id(&w.cy),
         },
         id(w.owner()),
@@ -1240,7 +1240,7 @@ fn ban_only(w: &World, state: &ChatRoomStateV1, who: &SigningKey, secs: u64) -> 
     let ban = AuthorizedUserBan::new(
         UserBan {
             owner_member_id: w.f.owner_id(),
-            banned_at: at(secs),
+            banned_at: at(secs).into(),
             banned_user: id(who),
         },
         id(w.owner()),
@@ -1384,7 +1384,7 @@ fn the_preview_is_what_building_the_ban_does_even_with_an_inert_ban_or_one_on_it
     state.bans.0.push(AuthorizedUserBan::new(
         UserBan {
             owner_member_id: w.f.owner_id(),
-            banned_at: at(5),
+            banned_at: at(5).into(),
             banned_user: id(&w.cy),
         },
         id(&w.ann),

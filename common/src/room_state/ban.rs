@@ -2,6 +2,7 @@ use crate::room_state::ban_evidence::{BanEvidenceV1, EvidenceDigest};
 use crate::room_state::member::{AuthorizedMember, BanContext, BanResolution, MemberId, MembersV1};
 use crate::room_state::member_info::MemberInfoV1;
 use crate::room_state::ChatRoomParametersV1;
+use crate::signed_time::SignedTime;
 use crate::util::{sign_struct, verify_struct};
 use crate::ChatRoomStateV1;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
@@ -10,7 +11,6 @@ use freenet_scaffold::ComposableState;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::time::SystemTime;
 
 /// Represents a collection of user bans in a chat room
 ///
@@ -817,7 +817,7 @@ impl AuthorizedUserBan {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct UserBan {
     pub owner_member_id: MemberId,
-    pub banned_at: SystemTime,
+    pub banned_at: SignedTime,
     pub banned_user: MemberId,
 }
 
@@ -830,6 +830,7 @@ pub struct BanId(pub FastHash);
 #[cfg(test)]
 mod ban_digest_golden {
     use super::*;
+    use std::time::SystemTime;
 
     /// A fixed ban record: fixed fields and fixed signature bytes (a
     /// `Signature` is not validated on construction), so the digest input is
@@ -842,7 +843,8 @@ mod ban_digest_golden {
         AuthorizedUserBan::with_signature(
             UserBan {
                 owner_member_id: MemberId(freenet_scaffold::util::FastHash(1)),
-                banned_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+                banned_at: (SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000))
+                    .into(),
                 banned_user: MemberId(freenet_scaffold::util::FastHash(2)),
             },
             MemberId(freenet_scaffold::util::FastHash(3)),
@@ -893,11 +895,11 @@ mod ban_digest_golden {
 ///   reads; a hit returns the choice those inputs determine.
 pub(crate) mod signature_memo {
     use crate::room_state::member::MemberId;
+    use crate::signed_time::SignedTime;
     use std::cell::RefCell;
     use std::collections::HashMap;
-    use std::time::SystemTime;
 
-    type Key = ([u8; 64], [u8; 32], MemberId, SystemTime, MemberId);
+    type Key = ([u8; 64], [u8; 32], MemberId, SignedTime, MemberId);
     /// A provisional record check: (digest of the whole record, owner key,
     /// key it was checked against, kind), the whole input of the check.
     pub(crate) type ProvisionalKey = ([u8; 32], [u8; 32], [u8; 32], u8);
@@ -973,6 +975,24 @@ pub(crate) mod signature_memo {
         });
     }
 
+    /// The entries of the two signature memos, to put back with [`restore`].
+    pub(crate) type Snapshot = (
+        Option<HashMap<Key, bool>>,
+        Option<HashMap<ProvisionalKey, bool>>,
+    );
+
+    pub(crate) fn snapshot() -> Snapshot {
+        (
+            MEMO.with(|m| m.borrow().clone()),
+            PROVISIONAL_MEMO.with(|m| m.borrow().clone()),
+        )
+    }
+
+    pub(crate) fn restore(held: Snapshot) {
+        MEMO.with(|m| *m.borrow_mut() = held.0);
+        PROVISIONAL_MEMO.with(|m| *m.borrow_mut() = held.1);
+    }
+
     /// Run `f` with the memo set aside (neither read nor written), restoring
     /// it afterwards: for the debug-build cross-check in cleanup, so debug
     /// builds verify the same signatures release builds do.
@@ -981,7 +1001,7 @@ pub(crate) mod signature_memo {
         let held = MEMO.with(|m| m.borrow_mut().take());
         let held_provisional = PROVISIONAL_MEMO.with(|m| m.borrow_mut().take());
         let held_cap = LAST_CAP.with(|c| c.borrow_mut().take());
-        let r = f();
+        let r = crate::room_state::sigcheck::set_aside(f);
         MEMO.with(|m| *m.borrow_mut() = held);
         PROVISIONAL_MEMO.with(|m| *m.borrow_mut() = held_provisional);
         LAST_CAP.with(|c| *c.borrow_mut() = held_cap);
@@ -1019,6 +1039,7 @@ pub(crate) mod signature_memo {
 mod tests {
     use super::*;
     use crate::room_state::configuration::AuthorizedConfigurationV1;
+    use std::time::SystemTime;
 
     thread_local! {
         /// Ban signature checks (`AuthorizedUserBan::verify_signature`).
@@ -1032,7 +1053,7 @@ mod tests {
     #[test]
     fn a_nested_memo_scope_keeps_the_outer_memo() {
         let id = MemberId::from(&SigningKey::from_bytes(&[3u8; 32]).verifying_key());
-        let key = ([1u8; 64], [2u8; 32], id, SystemTime::UNIX_EPOCH, id);
+        let key = ([1u8; 64], [2u8; 32], id, SignedTime::UNIX_EPOCH, id);
         signature_memo::active_while(|| {
             signature_memo::record(key, true);
             signature_memo::active_while(|| {
@@ -1062,7 +1083,7 @@ mod tests {
         let owner_id: MemberId = owner_sk.verifying_key().into();
         let ban_at = |secs: u64, target: u8| UserBan {
             owner_member_id: owner_id,
-            banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+            banned_at: (SystemTime::UNIX_EPOCH + Duration::from_secs(secs)).into(),
             banned_user: MemberId::from(&SigningKey::from_bytes(&[target; 32]).verifying_key()),
         };
         let good = AuthorizedUserBan::new(ban_at(10, 7), owner_id, &owner_sk);
@@ -1104,7 +1125,7 @@ mod tests {
             AuthorizedUserBan::new(
                 UserBan {
                     owner_member_id: owner_id,
-                    banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+                    banned_at: (SystemTime::UNIX_EPOCH + Duration::from_secs(secs)).into(),
                     banned_user: target(t),
                 },
                 owner_id,
@@ -1176,7 +1197,7 @@ mod tests {
             AuthorizedUserBan::new(
                 UserBan {
                     owner_member_id: owner_id,
-                    banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(i),
+                    banned_at: (SystemTime::UNIX_EPOCH + Duration::from_secs(i)).into(),
                     banned_user: MemberId::from(
                         &SigningKey::generate(&mut rand::thread_rng()).verifying_key(),
                     ),
@@ -1267,7 +1288,7 @@ mod tests {
         let ban1 = AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: SystemTime::now(),
+                banned_at: SystemTime::now().into(),
                 banned_user: member1_id,
             },
             owner_id,
@@ -1287,7 +1308,7 @@ mod tests {
             many_bans.push(AuthorizedUserBan::new(
                 UserBan {
                     owner_member_id: owner_id,
-                    banned_at: SystemTime::now(),
+                    banned_at: SystemTime::now().into(),
                     banned_user: member1_id,
                 },
                 owner_id,
@@ -1308,7 +1329,7 @@ mod tests {
         let pruned_ban = AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: SystemTime::now(),
+                banned_at: SystemTime::now().into(),
                 banned_user: member2_id,
             },
             pruned_id,
@@ -1331,7 +1352,7 @@ mod tests {
         let orphaned_ban = AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: SystemTime::now(),
+                banned_at: SystemTime::now().into(),
                 banned_user: member2_id,
             },
             orphaned_id,
@@ -1341,7 +1362,7 @@ mod tests {
         let ban_of_orphaned = AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: SystemTime::now(),
+                banned_at: SystemTime::now().into(),
                 banned_user: orphaned_id,
             },
             owner_id,
@@ -1357,7 +1378,7 @@ mod tests {
         let ban_by_member = AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: SystemTime::now(),
+                banned_at: SystemTime::now().into(),
                 banned_user: member2_id,
             },
             member1_id,
@@ -1382,7 +1403,7 @@ mod tests {
         let ban1 = AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: id,
-                banned_at: SystemTime::now(),
+                banned_at: SystemTime::now().into(),
                 banned_user: id,
             },
             id,
@@ -1392,7 +1413,7 @@ mod tests {
         let ban2 = AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: id,
-                banned_at: SystemTime::now() + Duration::from_secs(1),
+                banned_at: (SystemTime::now() + Duration::from_secs(1)).into(),
                 banned_user: id,
             },
             id,
@@ -1418,7 +1439,7 @@ mod tests {
         let ban1 = AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: id,
-                banned_at: SystemTime::now(),
+                banned_at: SystemTime::now().into(),
                 banned_user: id,
             },
             id,
@@ -1428,7 +1449,7 @@ mod tests {
         let ban2 = AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: id,
-                banned_at: SystemTime::now() + Duration::from_secs(1),
+                banned_at: (SystemTime::now() + Duration::from_secs(1)).into(),
                 banned_user: id,
             },
             id,
@@ -1492,7 +1513,7 @@ mod tests {
         let new_ban = AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: SystemTime::now(),
+                banned_at: SystemTime::now().into(),
                 banned_user: member_id,
             },
             owner_id,
@@ -1526,7 +1547,7 @@ mod tests {
             many_bans.push(AuthorizedUserBan::new(
                 UserBan {
                     owner_member_id: owner_id,
-                    banned_at: SystemTime::now() + Duration::from_secs(i as u64 + 10),
+                    banned_at: (SystemTime::now() + Duration::from_secs(i as u64 + 10)).into(),
                     banned_user: member_id,
                 },
                 owner_id,
@@ -1566,7 +1587,7 @@ mod tests {
             additional_bans.push(AuthorizedUserBan::new(
                 UserBan {
                     owner_member_id: owner_id,
-                    banned_at: SystemTime::now() + Duration::from_secs(i as u64 + 100),
+                    banned_at: (SystemTime::now() + Duration::from_secs(i as u64 + 100)).into(),
                     banned_user: member_id,
                 },
                 owner_id,
@@ -1595,7 +1616,7 @@ mod tests {
 
         let ban = UserBan {
             owner_member_id: owner_id,
-            banned_at: SystemTime::now(),
+            banned_at: SystemTime::now().into(),
             banned_user: member_id,
         };
 
@@ -1621,7 +1642,7 @@ mod tests {
         let another_ban = AuthorizedUserBan::new(
             UserBan {
                 owner_member_id: owner_id,
-                banned_at: SystemTime::now() + Duration::from_secs(1),
+                banned_at: (SystemTime::now() + Duration::from_secs(1)).into(),
                 banned_user: member_id,
             },
             owner_id,
@@ -1654,7 +1675,7 @@ mod tests {
             AuthorizedUserBan::new(
                 UserBan {
                     owner_member_id: owner_id,
-                    banned_at: SystemTime::UNIX_EPOCH + Duration::from_secs(i),
+                    banned_at: (SystemTime::UNIX_EPOCH + Duration::from_secs(i)).into(),
                     banned_user: MemberId(FastHash(i as i64)),
                 },
                 owner_id,
