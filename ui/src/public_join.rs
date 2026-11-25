@@ -947,7 +947,9 @@ pub fn readmit_note(
 ) -> String {
     match check_admission_status(state, owner_vk, member_vk, entry, now) {
         Ok(_) if entry.is_some() => {
-            "The room removed you for being quiet. Your next message rejoins.".to_string()
+            "The room keeps a limited number of newcomers and their recent messages, \
+            and newer activity pushed yours out. Your next message rejoins."
+                .to_string()
         }
         // The proof held no longer passes because the room asks for more bits.
         Err(JoinFailure::PolicyChanged) if difficulty_raised(state, held_bits) => {
@@ -955,9 +957,12 @@ pub fn readmit_note(
             Your next message rejoins after a short proof of work."
                 .to_string()
         }
-        Ok(_) | Err(JoinFailure::PolicyChanged) => "The room removed you for being quiet. \
+        Ok(_) | Err(JoinFailure::PolicyChanged) => {
+            "The room keeps a limited number of newcomers and their recent messages, \
+            and newer activity pushed yours out. \
             Your next message rejoins after a short proof of work."
-            .to_string(),
+                .to_string()
+        }
         Err(f) => f.message(),
     }
 }
@@ -1971,6 +1976,54 @@ mod tests {
     }
 
     #[test]
+    fn a_newcomer_ban_built_by_the_menu_is_kept_by_the_rooms_own_apply() {
+        use crate::components::conversation::newcomer_ban::{
+            ban_refusal, build_ban, outcome, BanOutcome,
+        };
+        use river_core::room_state::provisional::ProvisionalDelta;
+        use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1Delta};
+        let state = room(PrivacyMode::Public, Some(policy(6, 2)));
+        let sk = SigningKey::from_bytes(&[41u8; 32]);
+        let (owner_vk, entry) = solved(&state, &sk);
+        let sub = build_submission(
+            &state,
+            &owner_vk,
+            &sk,
+            &entry,
+            "hi",
+            "Visitor",
+            SystemTime::now(),
+        )
+        .unwrap();
+        let mut after = sub.state_after;
+        let target = MemberId::from(&sk.verifying_key());
+        assert!(ban_refusal(&after, &owner_vk, Some(&owner_vk), target).is_none());
+        let ban = build_ban(&owner_vk, &owner(), target, SystemTime::now());
+        let before = after.clone();
+        after
+            .apply_delta(
+                &before,
+                &ChatRoomParametersV1 { owner: owner_vk },
+                &Some(ChatRoomStateV1Delta {
+                    provisional: Some(ProvisionalDelta {
+                        entries: vec![],
+                        bans: vec![ban.clone()],
+                    }),
+                    ..Default::default()
+                }),
+            )
+            .expect("the room accepts the ban");
+        assert_eq!(
+            outcome(&before.provisional.bans, &after, &ban),
+            BanOutcome::Stands
+        );
+        assert!(
+            ban_refusal(&after, &owner_vk, Some(&owner_vk), target).is_some(),
+            "not offered again"
+        );
+    }
+
+    #[test]
     fn a_pruned_open_member_is_told_and_a_held_proof_is_resubmitted_with_the_same_key() {
         let (data, sk, entry) = pruned_member();
         assert!(data.is_pruned_open_member());
@@ -1989,6 +2042,14 @@ mod tests {
             now,
         );
         assert!(note.contains("Your next message rejoins."), "{note}");
+        assert!(
+            note.contains(
+                "The room keeps a limited number of newcomers and their recent messages, \
+                 and newer activity pushed yours out."
+            ),
+            "{note}"
+        );
+        assert!(!note.contains("quiet"), "{note}");
         // The held proof still passes, so it goes out as it is.
         let sub = build_submission(&data.room_state, &owner_vk, &sk, &entry, "again", "Me", now)
             .expect("re-admitted");
@@ -2040,6 +2101,17 @@ mod tests {
                 now,
             );
             assert!(!other.contains("security was raised"), "{other}");
+            // A pruned newcomer is told why, in plain words: newer arrivals
+            // took the limited newcomer places, not that they were quiet.
+            assert!(
+                other.contains(
+                    "The room keeps a limited number of newcomers and their recent messages, \
+                     and newer activity pushed yours out."
+                ),
+                "{other}"
+            );
+            assert!(other.contains("proof of work"), "{other}");
+            assert!(!other.contains("quiet"), "{other}");
         }
         assert_eq!(
             build_submission(&data.room_state, &owner_vk, &sk, &old_entry, "x", "Me", now)
