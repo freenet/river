@@ -149,6 +149,51 @@ pub static VIEWED_ROOM: GlobalSignal<Option<ViewedRoom>> = Global::new(initial_v
 /// How long a fetch may go unanswered before the viewer offers a retry.
 const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// How long a held answer may wait for the user's rooms to load before it is
+/// shown as a visitor's view anyway, counted from the GET being sent. The same
+/// length as the rooms-load migration backstop.
+const HELD_ANSWER_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How often a held answer is re-checked after the lookup timeout.
+const HELD_RECHECK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// What the lookup timeout does once `FETCH_TIMEOUT` has passed.
+#[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "no-sync", allow(dead_code))]
+enum TimeoutAction {
+    /// Nothing: the lookup was answered, replaced or closed.
+    Nothing,
+    /// Offer a retry: nothing has answered.
+    TimedOut,
+    /// A good answer is held and the rooms are still loading: keep showing
+    /// "Loading your rooms" and look again shortly.
+    KeepWaiting,
+    /// Show the held answer now: the rooms loaded, or the backstop passed.
+    Release,
+}
+
+/// What to do when the lookup timeout fires or a held answer is re-checked.
+/// `waited` is the time since the GET was sent. Pure, so it is unit-tested.
+#[cfg_attr(feature = "no-sync", allow(dead_code))]
+fn timeout_action(
+    still_waiting: bool,
+    held: bool,
+    rooms_ready: bool,
+    waited: std::time::Duration,
+) -> TimeoutAction {
+    if !still_waiting {
+        return TimeoutAction::Nothing;
+    }
+    if !held {
+        return TimeoutAction::TimedOut;
+    }
+    if rooms_ready || waited >= HELD_ANSWER_BACKSTOP {
+        TimeoutAction::Release
+    } else {
+        TimeoutAction::KeepWaiting
+    }
+}
+
 /// What the response handlers need to know about the viewed room, kept out of
 /// any signal so they can read it from any context. The status is a copy of
 /// the signal's, written first.
@@ -356,6 +401,12 @@ pub fn release_held() {
     if !rooms_ready() {
         return;
     }
+    release_held_now(false);
+}
+
+/// Route the held answer. `as_visitor` shows the room as a visitor's even when
+/// the user's rooms have not loaded, for the backstop in [`request_fetch`].
+fn release_held_now(as_visitor: bool) {
     let taken = HELD.lock().unwrap_or_else(|e| e.into_inner()).take();
     let Some((id, held)) = taken else { return };
     set_answer_held(false);
@@ -363,7 +414,12 @@ pub fn release_held() {
         Held::State(bytes) => Answer::State(bytes),
         Held::NotFound => Answer::NotFound,
     };
-    deliver_now(&id, answer);
+    if as_visitor {
+        let m = mirror();
+        deliver_with(m.as_ref(), false, &id, answer, &mut Live);
+    } else {
+        deliver_now(&id, answer);
+    }
 }
 
 /// A network answer about the viewed contract.
@@ -793,9 +849,26 @@ pub fn request_fetch(owner_vk: VerifyingKey) {
             lookup_log("retry sent");
         }
         crate::util::sleep(FETCH_TIMEOUT - LOOKUP_RETRY_AFTER).await;
-        if lookup_still_waiting(mirror().as_ref(), &owner_vk, current()) {
-            lookup_log("timeout");
-            set_status(owner_vk, ViewedRoomStatus::TimedOut);
+        let mut waited = FETCH_TIMEOUT;
+        loop {
+            let waiting = lookup_still_waiting(mirror().as_ref(), &owner_vk, current());
+            match timeout_action(waiting, answer_is_held(), rooms_ready(), waited) {
+                TimeoutAction::Nothing => break,
+                TimeoutAction::TimedOut => {
+                    lookup_log("timeout");
+                    set_status(owner_vk, ViewedRoomStatus::TimedOut);
+                    break;
+                }
+                TimeoutAction::Release => {
+                    lookup_log("held answer released at the timeout");
+                    release_held_now(true);
+                    break;
+                }
+                TimeoutAction::KeepWaiting => {
+                    crate::util::sleep(HELD_RECHECK).await;
+                    waited += HELD_RECHECK;
+                }
+            }
         }
     });
 }
@@ -1338,6 +1411,51 @@ mod tests {
     fn the_retry_comes_before_the_timeout_which_is_unchanged() {
         assert!(LOOKUP_RETRY_AFTER < FETCH_TIMEOUT);
         assert_eq!(FETCH_TIMEOUT, std::time::Duration::from_secs(20));
+    }
+
+    #[test]
+    fn a_held_answer_is_not_reported_as_a_timeout_while_rooms_load() {
+        use std::time::Duration;
+        let at_timeout = FETCH_TIMEOUT;
+        // Nothing held: the timeout is as it always was.
+        assert_eq!(
+            timeout_action(true, false, false, at_timeout),
+            TimeoutAction::TimedOut
+        );
+        assert_eq!(
+            timeout_action(true, false, true, at_timeout),
+            TimeoutAction::TimedOut
+        );
+        // A good answer is held and the rooms are still loading: no error.
+        assert_eq!(
+            timeout_action(true, true, false, at_timeout),
+            TimeoutAction::KeepWaiting
+        );
+        // The rooms loaded: show the answer.
+        assert_eq!(
+            timeout_action(true, true, true, at_timeout),
+            TimeoutAction::Release
+        );
+        // The backstop: show it as a visitor's view even though they have not.
+        assert_eq!(
+            timeout_action(true, true, false, HELD_ANSWER_BACKSTOP),
+            TimeoutAction::Release
+        );
+        assert_eq!(
+            timeout_action(
+                true,
+                true,
+                false,
+                HELD_ANSWER_BACKSTOP - Duration::from_secs(1)
+            ),
+            TimeoutAction::KeepWaiting
+        );
+        // Answered, replaced or closed meanwhile.
+        assert_eq!(
+            timeout_action(false, true, false, at_timeout),
+            TimeoutAction::Nothing
+        );
+        assert!(HELD_ANSWER_BACKSTOP > FETCH_TIMEOUT);
     }
 
     #[test]

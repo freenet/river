@@ -231,6 +231,32 @@ pub fn install_test_hooks() {
         .into_js_value(),
     );
 
+    // `count` messages "<text> NN" from the fixture room's owner arrive in the
+    // viewed room's state, as if learned from the network.
+    set_hook(
+        "appendViewedMessages",
+        Closure::<dyn FnMut(String, String, u32) -> bool>::new(
+            move |kind: String, text: String, count: u32| {
+                let Some(owner_sk) = crate::example_data::fixture_owner_sk(&kind) else {
+                    return false;
+                };
+                let owner_vk = owner_sk.verifying_key();
+                crate::public_room::edit_viewed_state(move |state| {
+                    let now = crate::util::get_current_system_time();
+                    for i in 0..count {
+                        state.recent_messages.messages.push(signed_message(
+                            &owner_vk,
+                            &owner_sk,
+                            RoomMessageBody::public(format!("{text} {i:02}")),
+                            now + std::time::Duration::from_millis(u64::from(i)),
+                        ));
+                    }
+                })
+            },
+        )
+        .into_js_value(),
+    );
+
     // Pin or release the join's solver (see `public_join::HOLD_SOLVER`).
     set_hook(
         "holdSolver",

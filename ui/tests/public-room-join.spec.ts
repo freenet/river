@@ -263,6 +263,37 @@ test("the display name chosen at the first message is the one posted", async ({ 
   expect(panics).toEqual([]);
 });
 
+// The history pane follows new messages only for a reader at its end.
+test("a new message does not move a reader who scrolled up, and is followed at the bottom", async ({ page }) => {
+  const panics = panicsOf(page);
+  await openRoom(page, "open");
+  const pane = page.getByTestId("viewed-room-messages");
+  const metrics = () => pane.evaluate((el) => ({ top: el.scrollTop, gap: el.scrollHeight - el.scrollTop - el.clientHeight }));
+  expect(await callRiverTest(page, "appendViewedMessages", "open", "Filler", 60)).toBe(true);
+  await expect(pane).toContainText("Filler 59");
+  // Overflowing, and at the end: it follows.
+  await expect.poll(async () => (await metrics()).gap, { timeout: 10_000 }).toBeLessThanOrEqual(80);
+  expect((await metrics()).top).toBeGreaterThan(200);
+
+  // Scrolled up to older messages: a new one leaves the position alone.
+  await pane.evaluate((el) => { el.scrollTop = 40; });
+  await expect.poll(async () => (await metrics()).top).toBeLessThan(60);
+  expect(await callRiverTest(page, "appendViewedMessages", "open", "Newer", 1)).toBe(true);
+  await expect(pane).toContainText("Newer 00");
+  await page.waitForTimeout(500);
+  const kept = await metrics();
+  expect(kept.top).toBeLessThan(60);
+  expect(kept.gap).toBeGreaterThan(200);
+
+  // Back at the end, it follows again.
+  await pane.evaluate((el) => { el.scrollTop = el.scrollHeight; });
+  await expect.poll(async () => (await metrics()).gap).toBeLessThanOrEqual(80);
+  expect(await callRiverTest(page, "appendViewedMessages", "open", "Latest", 1)).toBe(true);
+  await expect(pane).toContainText("Latest 00");
+  await expect.poll(async () => (await metrics()).gap, { timeout: 10_000 }).toBeLessThanOrEqual(80);
+  expect(panics).toEqual([]);
+});
+
 test("while the solve is pending the queued message shows the delay, progress, keep-open hint and Cancel, then posts and they go", async ({ page }) => {
   const panics = panicsOf(page);
   await openRoom(page, "open");

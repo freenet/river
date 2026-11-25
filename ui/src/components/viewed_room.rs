@@ -473,8 +473,39 @@ fn PublicRoomView(
     };
     let last_queued = queued.len().saturating_sub(1);
     // Bring the newest row (or the waiting message) into view when the rows
-    // change, as a joined room opens at its newest message.
-    let end_key = format!("end-{}-{}", rows.len(), queued.len());
+    // change, as a joined room opens at its newest message, but leave a reader
+    // who has scrolled up where they are (see `follow_to_end`).
+    let queued_len = queued.len();
+    let history_size = (rows.len(), queued_len);
+    let mut end_el = use_signal(|| None::<std::rc::Rc<MountedData>>);
+    let mut handled = use_signal(|| None::<(usize, usize)>);
+    if *handled.peek() != Some(history_size) {
+        // Measured now, before this render's rows reach the page: the pane
+        // still has the old content, so this says whether the reader was at
+        // its end. (A scroll event would also fire when content is added.)
+        let near = history_is_near_bottom();
+        crate::util::defer(move || {
+            // The pane may have closed since: its signals are then gone.
+            let state = match (handled.try_peek(), end_el.try_peek()) {
+                (Ok(previous), Ok(element)) => Some((*previous, element.clone())),
+                _ => None,
+            };
+            let Some((previous, element)) = state else {
+                return;
+            };
+            if previous == Some(history_size) {
+                return;
+            }
+            handled.set(Some(history_size));
+            if follow_to_end(previous.map(|(_, q)| q), history_size.1, near) {
+                if let Some(element) = element {
+                    crate::util::safe_spawn_local(async move {
+                        let _ = element.scroll_to(ScrollBehavior::Instant).await;
+                    });
+                }
+            }
+        });
+    }
 
     rsx! {
         div { class: "flex-shrink-0 px-3 md:pl-5 md:pr-3 py-3 border-b border-border bg-panel",
@@ -524,6 +555,7 @@ fn PublicRoomView(
         div {
             class: "flex-1 overflow-y-auto min-h-0",
             "data-testid": "viewed-room-messages",
+            id: HISTORY_PANE_ID,
             div { class: "msg-history",
                 if rows.is_empty() && queued.is_empty() {
                     p { class: "px-4 py-3 text-sm text-text-muted", "No messages yet." }
@@ -583,10 +615,11 @@ fn PublicRoomView(
                     }
                 }
                 div {
-                    key: "{end_key}",
                     "aria-hidden": "true",
                     onmounted: move |cx| {
+                        // The pane opens at its newest message.
                         let element = cx.data();
+                        end_el.set(Some(element.clone()));
                         crate::util::safe_spawn_local(async move {
                             let _ = element.scroll_to(ScrollBehavior::Instant).await;
                         });
@@ -783,6 +816,48 @@ fn NicknamePrompt(default: String, on_done: EventHandler<NameAnswer>) -> Element
                 }
             }
         }
+    }
+}
+
+/// How close to the end of the history, in pixels, still counts as reading
+/// the newest messages.
+const NEAR_BOTTOM_PX: f64 = 80.0;
+
+/// The DOM id of the history pane.
+const HISTORY_PANE_ID: &str = "viewed-room-history-pane";
+
+/// Whether the history pane, as it is on the page now, is scrolled to its end.
+/// True when it is not on the page yet.
+fn history_is_near_bottom() -> bool {
+    web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id(HISTORY_PANE_ID))
+        .map(|el| {
+            is_near_bottom(
+                el.scroll_top() as f64,
+                el.scroll_height() as f64,
+                el.client_height() as f64,
+            )
+        })
+        .unwrap_or(true)
+}
+
+/// Whether the history pane is scrolled to (or within [`NEAR_BOTTOM_PX`] of)
+/// its end.
+fn is_near_bottom(scroll_top: f64, scroll_height: f64, client_height: f64) -> bool {
+    scroll_height - scroll_top - client_height <= NEAR_BOTTOM_PX
+}
+
+/// Whether a change to the history should scroll to its end. Always on first
+/// render (the pane opens at the newest message); when the visitor's own
+/// waiting message has just appeared; otherwise only if the reader is already
+/// at the end, so someone reading older messages is not moved by a new one.
+/// `previous_queued` is the waiting-message count at the last change, `None`
+/// before the first.
+fn follow_to_end(previous_queued: Option<usize>, queued: usize, near_bottom: bool) -> bool {
+    match previous_queued {
+        None => true,
+        Some(before) => queued > before || near_bottom,
     }
 }
 
@@ -1064,6 +1139,35 @@ pub(crate) fn JoinComposer(
 #[cfg(test)]
 mod view_tests {
     use super::*;
+
+    #[test]
+    fn a_reader_scrolled_up_is_not_moved_by_a_new_message() {
+        assert!(
+            follow_to_end(None, 0, false),
+            "the first render opens at the newest"
+        );
+        assert!(!follow_to_end(Some(0), 0, false));
+        assert!(follow_to_end(Some(0), 0, true), "at the bottom it follows");
+        assert!(
+            follow_to_end(Some(0), 1, false),
+            "the visitor's own waiting message is brought into view"
+        );
+        assert!(
+            !follow_to_end(Some(1), 0, false),
+            "a message leaving the queue does not move a reader"
+        );
+    }
+
+    #[test]
+    fn near_the_bottom_means_within_the_threshold() {
+        assert!(is_near_bottom(900.0, 1500.0, 600.0));
+        assert!(is_near_bottom(900.0 - NEAR_BOTTOM_PX, 1500.0, 600.0));
+        assert!(!is_near_bottom(0.0, 1500.0, 600.0));
+        assert!(
+            is_near_bottom(0.0, 500.0, 600.0),
+            "a short history is at its end"
+        );
+    }
 
     #[test]
     fn the_default_or_nothing_is_no_choice() {
