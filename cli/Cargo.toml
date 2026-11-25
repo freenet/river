@@ -82,7 +82,7 @@ x25519-dalek.workspace = true
 rand = "0.8.5"
 base64 = "0.22.1"
 bs58 = "0.5.1"
-redb = "3.1"
+redb = "4.4"
 
 # Futures
 futures = "0.3"
