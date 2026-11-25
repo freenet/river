@@ -1150,23 +1150,18 @@ impl ChatRoomStateV1 {
                 }
             } else {
                 let mut taken = 0;
-                let mut provisional_taken = 0;
-                let mut scan_pool: HashSet<MemberId> = HashSet::new();
+                let mut scan = crate::room_state::provisional::ProvisionalScan::new(&plan);
                 let mut keep = vec![false; messages.len()];
                 for (i, m) in messages.iter().enumerate().rev() {
                     if taken >= cap {
                         break;
                     }
                     let author = m.message.author;
-                    if pool.contains(&author) && !current_member_ids.contains(&author) {
-                        if provisional_taken < plan.quota
-                            && (scan_pool.contains(&author) || scan_pool.len() < plan.pool_cap)
-                        {
-                            scan_pool.insert(author);
-                            provisional_taken += 1;
-                        } else {
-                            continue;
-                        }
+                    if pool.contains(&author)
+                        && !current_member_ids.contains(&author)
+                        && !scan.take(author)
+                    {
+                        continue;
                     }
                     keep[i] = true;
                     taken += 1;
@@ -1177,7 +1172,7 @@ impl ChatRoomStateV1 {
                     keep[i - 1]
                 });
                 debug_assert!(
-                    scan_pool == pool,
+                    scan.pool() == pool,
                     "step 5b took a different provisional pool than the member loop (P6)"
                 );
             }
@@ -1344,18 +1339,19 @@ impl ChatRoomStateV1 {
         // from the order for good.
         //
         // A provisional author's message (P6) is taken only while fewer than
-        // `plan.quota` provisional messages are taken and, if its author is
-        // not yet in the pool, the pool is under `plan.pool_cap`; an author
-        // joins the pool when one of its messages is taken; a message not
-        // taken is neither kept nor counted against the window. Which
+        // `plan.quota` provisional messages are taken, its author holds fewer
+        // than `PROVISIONAL_MESSAGES_PER_AUTHOR` taken, and, if its author is
+        // not yet in the pool, the pool is under `plan.pool_cap` (all three in
+        // `ProvisionalScan`); an author joins the pool when one of its
+        // messages is taken; a message not taken is neither kept nor
+        // counted against the window. Which
         // provisional messages are taken does not depend on the members (it
         // reads only the provisional messages, newest first), so one that is
         // not taken stays so in every later pass and is dropped from the
         // order for good, like a message that is not live.
         let window = self.configuration.configuration.max_recent_messages;
         let mut message_authors: HashSet<MemberId> = HashSet::new();
-        let mut pool: HashSet<MemberId> = HashSet::new();
-        let mut provisional_taken = 0;
+        let mut scan = crate::room_state::provisional::ProvisionalScan::new(plan);
         let mut taken = 0;
         let mut scanned = 0;
         let mut order = Vec::with_capacity(lp.newest_first.len());
@@ -1365,12 +1361,7 @@ impl ChatRoomStateV1 {
                 message_authors.insert(author);
                 taken += 1;
                 order.push(author);
-            } else if plan.ids.contains(&author)
-                && provisional_taken < plan.quota
-                && (pool.contains(&author) || pool.len() < plan.pool_cap)
-            {
-                pool.insert(author);
-                provisional_taken += 1;
+            } else if plan.ids.contains(&author) && scan.take(author) {
                 taken += 1;
                 order.push(author);
             }
@@ -1379,7 +1370,7 @@ impl ChatRoomStateV1 {
         let rest = lp.newest_first.split_off(scanned);
         order.extend(rest);
         lp.newest_first = order;
-        lp.pool = pool;
+        lp.pool = scan.pool();
 
         let held = &lp.held;
         let dm_participants = lp.dms.participants(
@@ -1552,7 +1543,7 @@ impl ChatRoomStateV1 {
     ) -> (HashSet<MemberId>, HashSet<MemberId>) {
         let members_now: HashSet<MemberId> =
             self.members.members.iter().map(|m| m.member.id()).collect();
-        let mut pool: HashSet<MemberId> = HashSet::new();
+        let mut scan = crate::room_state::provisional::ProvisionalScan::new(plan);
         let message_authors: HashSet<MemberId> = {
             let mut ordered: Vec<&crate::room_state::message::AuthorizedMessageV1> =
                 self.recent_messages.messages.iter().collect();
@@ -1560,7 +1551,6 @@ impl ChatRoomStateV1 {
             let window = self.configuration.configuration.max_recent_messages;
             let mut authors = HashSet::new();
             let mut taken = 0;
-            let mut provisional_taken = 0;
             for m in ordered {
                 if taken >= window {
                     break;
@@ -1571,12 +1561,7 @@ impl ChatRoomStateV1 {
                 {
                     authors.insert(author);
                     taken += 1;
-                } else if plan.ids.contains(&author)
-                    && provisional_taken < plan.quota
-                    && (pool.contains(&author) || pool.len() < plan.pool_cap)
-                {
-                    pool.insert(author);
-                    provisional_taken += 1;
+                } else if plan.ids.contains(&author) && scan.take(author) {
                     taken += 1;
                 }
             }
@@ -1643,7 +1628,7 @@ impl ChatRoomStateV1 {
             .retain(|m| required_ids.contains(&m.member.id()));
         let max_members = self.configuration.configuration.max_members;
         self.members.remove_excess_members(parameters, max_members);
-        (required_ids, pool)
+        (required_ids, scan.pool())
     }
 }
 

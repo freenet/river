@@ -49,6 +49,20 @@ fn provisional() -> usize {
         .and_then(|v| v.parse().ok())
         .unwrap_or(river_core::room_state::provisional::MAX_PROVISIONAL_CEILING as usize)
 }
+/// Messages each provisional author posts into the fixture (default 1).
+/// Overridable with `BENCH_PROVISIONAL_MESSAGES=<n>`: with more than
+/// `PROVISIONAL_MESSAGES_PER_AUTHOR` the room's cleanup drops the oldest, so
+/// the update it measures runs the per-author cap.
+fn posted_per_author() -> usize {
+    std::env::var("BENCH_PROVISIONAL_MESSAGES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+}
+/// What each provisional author holds once the cap has been applied.
+fn held_per_author() -> usize {
+    posted_per_author().min(river_core::room_state::provisional::PROVISIONAL_MESSAGES_PER_AUTHOR)
+}
 /// Messages per member. Two, so the members' messages plus one per
 /// provisional author fit the window up to a cap of 48 and cleanup never
 /// prunes the fixture's one-message sender (`members[0]`): a pruned sender
@@ -57,7 +71,7 @@ const MEMBER_MESSAGES: usize = 2;
 /// What fills the window beside the members' messages and the provisional
 /// authors' one each.
 fn owner_fill() -> usize {
-    let used = MEMBERS as usize * MEMBER_MESSAGES + provisional();
+    let used = MEMBERS as usize * MEMBER_MESSAGES + provisional() * held_per_author();
     assert!(
         used <= WINDOW,
         "fixture overflows the {WINDOW}-message window"
@@ -72,6 +86,9 @@ fn sk(n: u32) -> SigningKey {
     SigningKey::from_bytes(&b)
 }
 
+fn authors_len() -> u64 {
+    provisional() as u64
+}
 fn msg(owner_id: MemberId, k: &SigningKey, t: u64) -> AuthorizedMessageV1 {
     AuthorizedMessageV1::new(
         MessageV1 {
@@ -195,10 +212,12 @@ fn build(
             })
             .collect();
         t += 1;
+        let n = posted_per_author() as u64;
         let msgs: Vec<AuthorizedMessageV1> = authors
             .iter()
             .enumerate()
-            .map(|(i, k)| msg(owner_id, k, t + i as u64))
+            .flat_map(|(i, k)| (0..n).map(move |j| (k, t + i as u64 + j * authors_len())))
+            .map(|(k, at)| msg(owner_id, k, at))
             .collect();
         apply(
             &mut state,

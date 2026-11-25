@@ -18,7 +18,7 @@ use river_core::room_state::privacy::PrivacyMode;
 use river_core::room_state::provisional::{
     leading_zero_bits, pow_hash, AdmissionError, AdmissionEvidence, AuthorizedProvisionalBan,
     AuthorizedProvisionalMember, PowPolicy, ProvisionalBan, ProvisionalDelta, ProvisionalMember,
-    PublicRoomPolicy,
+    PublicRoomPolicy, PROVISIONAL_MESSAGES_PER_AUTHOR,
 };
 use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1, ChatRoomStateV1Delta};
 use std::time::{Duration, SystemTime};
@@ -545,6 +545,125 @@ fn a_full_pool_ages_out_the_author_with_the_oldest_newest_message() {
     assert_eq!(room.state.provisional.entries.len(), 24);
 }
 
+/// One provisional author can no longer fill the newcomer message quota: it
+/// holds its newest `PROVISIONAL_MESSAGES_PER_AUTHOR` messages, and the
+/// honest newcomers' older messages stay.
+#[test]
+fn one_provisional_author_cannot_fill_the_quota() {
+    let mut p = policy(0, 1);
+    p.max_provisional = 10;
+    p.max_provisional_messages = 20;
+    let mut room = Room::new(40, 10, Some(p)); // quota min(20, 20) = 20
+    let honest: Vec<SigningKey> = (1..=5u8).map(sk).collect();
+    for (i, k) in honest.iter().enumerate() {
+        room.apply(room.join_delta(k, 10 + i as u64, "hi")).unwrap();
+    }
+    let hog = sk(100);
+    room.apply(room.join_delta(&hog, 1000, "m0")).unwrap();
+    for t in 1001..=1019u64 {
+        room.apply(room.msg_delta(vec![room.msg(&hog, t, "m")]))
+            .unwrap();
+    }
+    let times_of = |room: &Room, k: &SigningKey| -> Vec<u64> {
+        room.state
+            .recent_messages
+            .messages
+            .iter()
+            .filter(|m| m.message.author == id_of(k))
+            .map(|m| m.message.time.secs() - 1_800_000_000)
+            .collect()
+    };
+    let mut hogs = times_of(&room, &hog);
+    hogs.sort();
+    assert_eq!(hogs, vec![1018, 1019], "the author's newest two are kept");
+    for k in &honest {
+        assert!(
+            room.has_entry(k) && room.has_msg_by(k),
+            "honest newcomer kept"
+        );
+    }
+}
+
+/// The pool is a function of the set of messages held: the same set in any
+/// order, with repeats, gives identical bytes, and cleanup is idempotent.
+mod pool_is_a_function_of_the_set {
+    use super::*;
+    use proptest::prelude::*;
+    use std::sync::OnceLock;
+
+    const AUTHORS: usize = 6;
+    const TIMES: usize = 24;
+
+    struct Fixture {
+        room: Room,
+        msgs: Vec<AuthorizedMessageV1>, // [author * TIMES + t]
+    }
+
+    fn fixture() -> &'static Fixture {
+        static F: OnceLock<Fixture> = OnceLock::new();
+        F.get_or_init(|| {
+            let mut p = policy(0, 1);
+            p.max_provisional = 3;
+            p.max_provisional_messages = 6;
+            let mut room = Room::new(12, 10, Some(p)); // quota min(6, 6) = 6
+            let mut msgs = Vec::new();
+            for a in 0..AUTHORS {
+                let k = sk(a as u8 + 1);
+                room.state.provisional.entries.push(room.entry(&k));
+                for t in 0..TIMES {
+                    msgs.push(room.msg(&k, t as u64, "m"));
+                }
+            }
+            Fixture { room, msgs }
+        })
+    }
+
+    /// Deliver `picks` as one messages delta (repeats included) to the
+    /// room holding the entries, then clean up as the contract does.
+    fn run(picks: &[usize]) -> (Vec<u8>, ChatRoomStateV1) {
+        let f = fixture();
+        let mut s = f.room.state.clone();
+        let delta = ChatRoomStateV1Delta {
+            recent_messages: Some(picks.iter().map(|&i| f.msgs[i].clone()).collect()),
+            ..Default::default()
+        };
+        s.apply_delta(&f.room.state.clone(), &f.room.params, &Some(delta))
+            .unwrap();
+        (ser(&s), s)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+        #[test]
+        fn same_set_same_pool(
+            set in proptest::collection::btree_set(0..AUTHORS * TIMES, 0..60),
+            seed in any::<u64>(),
+            dups in 0usize..20,
+        ) {
+            use rand::seq::SliceRandom;
+            use rand::SeedableRng;
+            let base: Vec<usize> = set.iter().copied().collect();
+            let (reference, state) = run(&base);
+            // At most the cap per provisional author.
+            let mut per: std::collections::HashMap<MemberId, usize> = Default::default();
+            for m in &state.recent_messages.messages {
+                *per.entry(m.message.author).or_default() += 1;
+            }
+            prop_assert!(per.values().all(|&n| n <= PROVISIONAL_MESSAGES_PER_AUTHOR));
+            // Reordered, with repeats.
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let mut shuffled = base.clone();
+            shuffled.extend(base.iter().take(dups));
+            shuffled.shuffle(&mut rng);
+            prop_assert_eq!(&run(&shuffled).0, &reference);
+            // Idempotent.
+            let mut again = state.clone();
+            again.post_apply_cleanup(&fixture().room.params).unwrap();
+            prop_assert_eq!(ser(&again), reference);
+        }
+    }
+}
+
 #[test]
 fn provisional_messages_fill_at_most_the_quota_and_members_keep_the_rest() {
     // window 6 => quota min(500, 3) = 3 (max_provisional_messages 500).
@@ -571,7 +690,22 @@ fn provisional_messages_fill_at_most_the_quota_and_members_keep_the_rest() {
             .filter(|m| m.message.author == id_of(k))
             .count()
     };
-    assert_eq!(by(&room, &a), 3, "provisional share is the quota");
+    // One author holds at most PROVISIONAL_MESSAGES_PER_AUTHOR of the quota.
+    assert_eq!(by(&room, &a), PROVISIONAL_MESSAGES_PER_AUTHOR);
+    assert_eq!(
+        by(&room, &owner),
+        4,
+        "the owner keeps the rest of the window"
+    );
+    // Three authors fill the quota (3), two each would be 6: the newest three.
+    let (b, c) = (sk(2), sk(3));
+    for (k, t) in [(&b, 200u64), (&c, 300u64)] {
+        room.apply(room.join_delta(k, t, "x")).unwrap();
+        room.apply(room.msg_delta(vec![room.msg(k, t + 1, "y")]))
+            .unwrap();
+    }
+    let provisional: usize = [&a, &b, &c].iter().map(|k| by(&room, k)).sum();
+    assert_eq!(provisional, 3, "provisional share is the quota");
     assert_eq!(by(&room, &owner), 3, "the owner keeps window - quota slots");
 }
 
@@ -2749,4 +2883,349 @@ fn provisional_bans_at_the_time_extremes_rank_newest_first() {
         !kept.iter().any(|b| b.ban.target == target_of(9, 0)),
         "the epoch ban is the one cut"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Per-author cap (PROVISIONAL_MESSAGES_PER_AUTHOR): edge cases
+// ---------------------------------------------------------------------------
+
+fn times_of(room: &Room, k: &SigningKey) -> Vec<u64> {
+    let mut v: Vec<u64> = room
+        .state
+        .recent_messages
+        .messages
+        .iter()
+        .filter(|m| m.message.author == id_of(k))
+        .map(|m| m.message.time.secs() - 1_800_000_000)
+        .collect();
+    v.sort();
+    v
+}
+
+fn open_room(window: usize, pool: u32, msgs: u32) -> Room {
+    let mut p = policy(0, 1);
+    p.max_provisional = pool;
+    p.max_provisional_messages = msgs;
+    Room::new(window, 10, Some(p))
+}
+
+#[test]
+fn an_author_at_exactly_the_cap_keeps_both_messages() {
+    let mut room = open_room(40, 10, 20);
+    let a = sk(1);
+    room.apply(room.join_delta(&a, 5, "a")).unwrap();
+    room.apply(room.msg_delta(vec![room.msg(&a, 6, "b")]))
+        .unwrap();
+    assert_eq!(times_of(&room, &a), vec![5, 6]);
+}
+
+#[test]
+fn a_third_message_keeps_the_newest_two_whatever_its_age() {
+    let mut room = open_room(40, 10, 20);
+    let a = sk(1);
+    room.apply(room.join_delta(&a, 10, "a")).unwrap();
+    room.apply(room.msg_delta(vec![room.msg(&a, 20, "b")]))
+        .unwrap();
+    // Older than both kept: it is the one dropped.
+    room.apply(room.msg_delta(vec![room.msg(&a, 1, "old")]))
+        .unwrap();
+    assert_eq!(times_of(&room, &a), vec![10, 20]);
+    // Newer than both: the oldest kept one is dropped.
+    room.apply(room.msg_delta(vec![room.msg(&a, 30, "new")]))
+        .unwrap();
+    assert_eq!(times_of(&room, &a), vec![20, 30]);
+    // Between the two kept: the oldest of the three goes.
+    room.apply(room.msg_delta(vec![room.msg(&a, 25, "mid")]))
+        .unwrap();
+    assert_eq!(times_of(&room, &a), vec![25, 30]);
+}
+
+/// A reaction is a message by the provisional key and uses a slot: post,
+/// react, post leaves the reaction and the newest message, not the original.
+/// Exempting reactions would let one key fill the quota with them.
+#[test]
+fn reactions_count_toward_the_per_author_cap() {
+    let mut room = open_room(40, 10, 20);
+    let a = sk(1);
+    let first = room.msg(&a, 1, "hello");
+    room.apply(ChatRoomStateV1Delta {
+        recent_messages: Some(vec![first.clone()]),
+        ..room.join_delta(&a, 1, "hello")
+    })
+    .unwrap();
+    let react = AuthorizedMessageV1::new(
+        MessageV1 {
+            room_owner: room.owner_id(),
+            author: id_of(&a),
+            time: (SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_002)).into(),
+            content: RoomMessageBody::reaction(first.id(), "+1".to_string()),
+        },
+        &a,
+    );
+    room.apply(room.msg_delta(vec![react.clone()])).unwrap();
+    room.apply(room.msg_delta(vec![room.msg(&a, 3, "again")]))
+        .unwrap();
+    assert_eq!(times_of(&room, &a), vec![2, 3], "the original is dropped");
+    assert!(room
+        .state
+        .recent_messages
+        .messages
+        .iter()
+        .any(|m| m.id() == react.id()));
+}
+
+#[test]
+fn banning_a_capped_author_removes_it_and_leaves_the_others() {
+    let mut room = open_room(40, 10, 20);
+    let (hog, honest) = (sk(100), sk(1));
+    room.apply(room.join_delta(&honest, 5, "hi")).unwrap();
+    room.apply(room.join_delta(&hog, 100, "m")).unwrap();
+    for t in 101..=103u64 {
+        room.apply(room.msg_delta(vec![room.msg(&hog, t, "m")]))
+            .unwrap();
+    }
+    assert_eq!(times_of(&room, &hog), vec![102, 103]);
+    room.apply(prov_ban_delta(room.prov_ban(None, id_of(&hog), 200)))
+        .unwrap();
+    assert!(!room.has_entry(&hog) && !room.has_msg_by(&hog));
+    assert!(room.has_entry(&honest) && room.has_msg_by(&honest));
+}
+
+#[test]
+fn a_member_is_not_limited_after_crossing_from_provisional() {
+    let mut room = open_room(40, 10, 20);
+    let a = sk(1);
+    room.apply(room.join_delta(&a, 1, "a")).unwrap();
+    for t in 2..=4u64 {
+        room.apply(room.msg_delta(vec![room.msg(&a, t, "m")]))
+            .unwrap();
+    }
+    assert_eq!(times_of(&room, &a), vec![3, 4], "capped while provisional");
+    let invite = room.invite(None, &a.verifying_key());
+    room.apply(room.members_delta(vec![invite])).unwrap();
+    assert!(room.is_member(&a) && !room.has_entry(&a));
+    for t in 5..=9u64 {
+        room.apply(room.msg_delta(vec![room.msg(&a, t, "m")]))
+            .unwrap();
+    }
+    assert_eq!(
+        times_of(&room, &a),
+        vec![3, 4, 5, 6, 7, 8, 9],
+        "no per-author limit on a member"
+    );
+}
+
+/// Window 6 gives a quota of 3 (odd): the newest message of the quota goes to
+/// the author with the newest message, the rest follow newest first.
+#[test]
+fn an_odd_quota_is_filled_newest_first() {
+    let mut room = open_room(6, 10, 500);
+    let (a, b) = (sk(1), sk(2));
+    room.apply(room.join_delta(&a, 10, "a")).unwrap();
+    room.apply(room.msg_delta(vec![room.msg(&a, 11, "a")]))
+        .unwrap();
+    room.apply(room.join_delta(&b, 20, "b")).unwrap();
+    room.apply(room.msg_delta(vec![room.msg(&b, 21, "b")]))
+        .unwrap();
+    assert_eq!(times_of(&room, &b), vec![20, 21]);
+    assert_eq!(times_of(&room, &a), vec![11], "a keeps only its newest");
+}
+
+/// Two authors with the same newest time at the quota boundary: the id breaks
+/// the tie, the same way in every arrival order.
+#[test]
+fn authors_tied_on_the_newest_time_at_the_quota_boundary_resolve_by_id() {
+    let base = open_room(4, 10, 500); // quota 2
+    let (a, b) = (sk(1), sk(2));
+    let da = base.join_delta(&a, 50, "a");
+    let db = base.join_delta(&b, 50, "b");
+    let ab = replay(&base, &[&da, &db]);
+    let ba = replay(&base, &[&db, &da]);
+    assert_eq!(ser(&ab), ser(&ba));
+    let held = ab.recent_messages.messages.len();
+    assert_eq!(held, 2, "both fit the quota of 2");
+    // A third author at the same time cannot enlarge the quota, and which of
+    // the three is dropped does not depend on arrival.
+    let c = sk(3);
+    let dc = base.join_delta(&c, 50, "c");
+    let s1 = replay(&base, &[&da, &db, &dc]);
+    let s2 = replay(&base, &[&dc, &db, &da]);
+    let s3 = replay(&base, &[&db, &dc, &da]);
+    assert_eq!(s1.recent_messages.messages.len(), 2);
+    assert_eq!(ser(&s1), ser(&s2));
+    assert_eq!(ser(&s1), ser(&s3));
+}
+
+/// Cleanup that runs before an invite arrives drops a newcomer's oldest
+/// message; a peer that got the invite first keeps it. The two peers converge
+/// on merge, to the state the peer that saw the invite first holds.
+#[test]
+fn promotion_before_or_after_cleanup_converges_on_merge() {
+    let base = open_room(40, 10, 20);
+    let a = sk(1);
+    let join = base.join_delta(&a, 1, "m1");
+    let more = base.msg_delta(vec![base.msg(&a, 2, "m2"), base.msg(&a, 3, "m3")]);
+    let mut invite = base.members_delta(vec![base.invite(None, &a.verifying_key())]);
+    invite.recent_messages = Some(vec![base.msg(&a, 1, "m1")]);
+    // X cleans up with three messages before the invite; Y sees the invite
+    // first.
+    let x = replay(&base, &[&join, &more, &invite]);
+    let y = replay(&base, &[&invite, &join, &more]);
+    let (xy, yx) = merge2(&x, &y, &base.params);
+    assert_eq!(ser(&xy), ser(&yx));
+    let mut ms: Vec<u64> = xy
+        .recent_messages
+        .messages
+        .iter()
+        .map(|m| m.message.time.secs() - 1_800_000_000)
+        .collect();
+    ms.sort();
+    assert_eq!(ms, vec![1, 2, 3], "the member keeps everything after merge");
+}
+
+/// Messages split over several deltas that arrive in any order, with member
+/// and owner messages, a promotion and a ban between them, leave every peer
+/// at one state once they have gossiped.
+mod cross_delta {
+    use super::*;
+    use proptest::prelude::*;
+    use rand::seq::SliceRandom;
+    use rand::SeedableRng;
+    use std::sync::OnceLock;
+
+    const PROV: usize = 4; // P0..P3 hold entries
+    const TIMES: usize = 8;
+
+    struct Fx {
+        base: Room,
+        /// Provisional messages [author * TIMES + t], then member (index
+        /// PROV) messages, then owner messages.
+        msgs: Vec<AuthorizedMessageV1>,
+        /// The entry of provisional author `a`: it travels with its messages,
+        /// as a client sends it (an entry holding no message is dropped).
+        entries: Vec<AuthorizedProvisionalMember>,
+        promote: ChatRoomStateV1Delta, // invite P0
+        ban: ChatRoomStateV1Delta,     // owner bans P1
+    }
+
+    fn fx() -> &'static Fx {
+        static F: OnceLock<Fx> = OnceLock::new();
+        F.get_or_init(|| {
+            let mut p = policy(0, 1);
+            p.max_provisional = 3;
+            p.max_provisional_messages = 6;
+            let mut base = Room::new(14, 10, Some(p)); // quota 6
+            let mut msgs = Vec::new();
+            // A member (invited by the owner) first: applying a delta runs
+            // cleanup, which drops entries that hold no message.
+            let m0 = sk(60);
+            let inv0 = base.invite(None, &m0.verifying_key());
+            let mut first = base.members_delta(vec![inv0]);
+            // A bare invite is pruned for inactivity until it has a message.
+            first.recent_messages = Some(vec![base.msg(&m0, 1, "m")]);
+            base.apply(first).unwrap();
+            let mut entries = Vec::new();
+            for a in 0..PROV {
+                let k = sk(a as u8 + 1);
+                entries.push(base.entry(&k));
+                for t in 0..TIMES {
+                    msgs.push(base.msg(&k, (t * 2 + a) as u64, "p"));
+                }
+            }
+            // A member (invited by the owner) and the owner.
+            let m = m0;
+            for t in 0..TIMES {
+                msgs.push(base.msg(&m, (t * 2) as u64 + 1, "m"));
+            }
+            let owner = base.owner.clone();
+            for t in 0..TIMES {
+                msgs.push(base.msg(&owner, (t * 2) as u64, "o"));
+            }
+            let a0 = sk(1);
+            let mut promote = base.members_delta(vec![base.invite(None, &a0.verifying_key())]);
+            promote.recent_messages = Some(vec![msgs[0].clone()]);
+            let ban = user_ban_delta(base.user_ban(None, id_of(&sk(2)), 500));
+            Fx {
+                base,
+                msgs,
+                entries,
+                promote,
+                ban,
+            }
+        })
+    }
+
+    fn apply_in_order(deltas: &[&ChatRoomStateV1Delta]) -> ChatRoomStateV1 {
+        let f = fx();
+        let mut s = f.base.state.clone();
+        for d in deltas {
+            let mut next = s.clone();
+            if next
+                .apply_delta(&s, &f.base.params, &Some((*d).clone()))
+                .is_ok()
+            {
+                s = next;
+            }
+        }
+        s
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+        #[test]
+        fn every_arrival_order_converges(
+            picks in proptest::collection::btree_set(0usize..PROV * TIMES + 2 * TIMES, 0..50),
+            nchunks in 1usize..6,
+            with_promotion in any::<bool>(),
+            with_ban in any::<bool>(),
+            seed in any::<u64>(),
+        ) {
+            let f = fx();
+            let picks: Vec<usize> = picks.into_iter().collect();
+            let mut deltas: Vec<ChatRoomStateV1Delta> = Vec::new();
+            let per = picks.len().div_ceil(nchunks).max(1);
+            for chunk in picks.chunks(per) {
+                let mut entries: Vec<AuthorizedProvisionalMember> = Vec::new();
+                for &i in chunk {
+                    if i < PROV * TIMES && !entries.contains(&f.entries[i / TIMES]) {
+                        entries.push(f.entries[i / TIMES].clone());
+                    }
+                }
+                deltas.push(ChatRoomStateV1Delta {
+                    provisional: Some(ProvisionalDelta { entries, bans: vec![] }),
+                    recent_messages: Some(chunk.iter().map(|&i| f.msgs[i].clone()).collect()),
+                    ..Default::default()
+                });
+            }
+            if with_promotion { deltas.push(f.promote.clone()); }
+            if with_ban { deltas.push(f.ban.clone()); }
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let order = |rng: &mut rand::rngs::StdRng| {
+                let mut r: Vec<&ChatRoomStateV1Delta> = deltas.iter().collect();
+                r.shuffle(rng);
+                r
+            };
+            let s1 = apply_in_order(&order(&mut rng));
+            let s2 = apply_in_order(&order(&mut rng));
+            // Applying deltas one at a time is history dependent (a message
+            // a full pool or quota dropped is not restored by a later
+            // delta), with or without the per-author cap; the peers agree
+            // once they gossip.
+            // After gossip the peers agree, whatever they went through.
+            let mut ab = s1.clone();
+            ab.merge_from(&f.base.params, &s2).unwrap();
+            let mut ba = s2.clone();
+            ba.merge_from(&f.base.params, &s1).unwrap();
+            prop_assert_eq!(ser(&ab), ser(&ba));
+            validate(&ab, &f.base.params).unwrap();
+            // Still at most the cap per provisional author.
+            let mut per: std::collections::HashMap<MemberId, usize> = Default::default();
+            for m in &ab.recent_messages.messages {
+                if ab.provisional.entries.iter().any(|e| MemberId::from(&e.provisional.member_vk) == m.message.author) {
+                    *per.entry(m.message.author).or_default() += 1;
+                }
+            }
+            prop_assert!(per.values().all(|&n| n <= PROVISIONAL_MESSAGES_PER_AUTHOR));
+        }
+    }
 }
