@@ -155,7 +155,7 @@ for (const forget of [false, true]) {
     expect(await callRiverTest(page, "pruneJoiner", forget)).toBe(true);
     expect(await callRiverTest(page, "roomMessageCount", "Joined")).toBe(0);
     await expect(page.getByTestId("send-message-button")).toHaveCount(0);
-    await expect(page.getByTestId("viewed-room-join-idle")).toContainText("removed you for being quiet");
+    await expect(page.getByTestId("viewed-room-join-idle")).toContainText("newer arrivals took yours");
 
     await page.getByTestId("viewed-room-composer").fill("Back again");
     await page.getByTestId("viewed-room-send").click();
@@ -263,7 +263,7 @@ test("a draft typed while a re-admission solves is in the member composer afterw
   await page.getByTestId("viewed-room-send").click();
   await expect(page.getByTestId("viewed-room")).toHaveCount(0, { timeout: 30_000 });
   expect(await callRiverTest(page, "pruneJoiner", true)).toBe(true);
-  await expect(page.getByTestId("viewed-room-join-idle")).toContainText("removed you for being quiet");
+  await expect(page.getByTestId("viewed-room-join-idle")).toContainText("newer arrivals took yours");
 
   await callRiverTest(page, "holdSolver", true);
   const composer = page.getByTestId("viewed-room-composer");
