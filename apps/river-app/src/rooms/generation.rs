@@ -388,11 +388,13 @@ impl PointerSource for NodePointers {
         wait: Duration,
         deliver: &dyn Fn(ContractInstanceId, Fetch),
     ) {
+        // Counted from before the connect, so `wait` bounds the connect too (which itself gives
+        // up after its own few seconds).
+        let deadline = Instant::now() + wait;
         // This connection only reads, so its gate never needs closing.
         let Ok(mut socket) = NodeSocket::connect(authority, token, &WriteGate::default()) else {
             return;
         };
-        let deadline = Instant::now() + wait;
         for id in ids {
             let get = ContractRequest::Get {
                 key: *id,

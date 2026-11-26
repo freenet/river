@@ -48,7 +48,7 @@ pub struct Probation {
 /// The layout of the file this build writes. A file from a newer build (after a downgrade or a
 /// rollback) is read for what this build understands and never written back, so it is not
 /// damaged by being read and the newer build finds it as it left it.
-pub const SCHEMA: u32 = 1;
+pub const SCHEMA: u32 = 2;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -62,6 +62,9 @@ pub struct State {
     pub last_checked: Option<u64>,
     /// What an automatic rollback wants the user to be told, once.
     pub notice: Option<String>,
+    /// The update-key record this install last accepted, as hex of its 100 raw bytes (see
+    /// [`super::keyrecord`]). Judged again on every load, never trusted for having been saved.
+    pub key_record: Option<String>,
 }
 
 impl State {
