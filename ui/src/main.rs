@@ -20,6 +20,7 @@ mod pending_invites;
 mod pow_worker;
 mod public_join;
 mod public_room;
+mod short_handle;
 mod room_data;
 pub mod signing;
 #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
