@@ -1415,7 +1415,6 @@ mod key_record {
             let err = u.check(&fetched).unwrap_err();
             assert!(err.contains("withdrawn"), "{err}");
         }
-        assert!(u.download(&mut |_, _| {}).is_err());
         release_signed_by(&server, 6);
         offered(check(&u, record(2, key_of(6))));
     }
@@ -1439,7 +1438,7 @@ mod key_record {
     }
 
     #[test]
-    fn a_state_file_someone_else_wrote_does_not_change_the_key() {
+    fn a_damaged_kept_record_refuses_updates_until_a_served_one_replaces_it() {
         use crate::update::keyrecord::tests::{APP_ID, record_for};
         let ports = Ports::lock();
         let server = ports.serve(vec![]);
@@ -1451,13 +1450,15 @@ mod key_record {
         for kept in [forged, hex::encode(flipped), "zz".to_string()] {
             state::modify(rig.data.path(), |st| st.key_record = Some(kept)).unwrap();
             let u = rotating(&rig, &server);
-            release_signed_by(&server, 2);
-            assert!(
-                u.check(&KeyRecord::Unavailable).is_err(),
-                "key 2 not trusted"
-            );
-            release_signed_by(&server, 1);
-            offered(u.check(&KeyRecord::Unavailable));
+            // Neither the compiled key nor the one the file names: nothing is trusted.
+            for signer in [1, 2] {
+                release_signed_by(&server, signer);
+                let err = u.check(&KeyRecord::Unavailable).unwrap_err();
+                assert!(err.contains("damaged"), "{err}");
+            }
+            // A verified record from the node puts it right.
+            release_signed_by(&server, 3);
+            offered(check(&u, record(1, key_of(3))));
         }
     }
 
@@ -1519,5 +1520,116 @@ mod key_record {
         let old: state::State =
             serde_json::from_str(r#"{"schema":1,"highest_sequence":3}"#).unwrap();
         assert_eq!(old.key_record, None);
+    }
+
+    #[test]
+    fn an_offer_checked_before_a_rotation_stages_nothing() {
+        let ports = Ports::lock();
+        let server = ports.serve(vec![]);
+        let rig = Rig::new();
+        let u = rotating(&rig, &server);
+        release_signed_by(&server, 1);
+        offered(u.check(&KeyRecord::Unavailable));
+        // The record now names key 2 (this check fails: the server still offers key 1's build).
+        assert!(check(&u, record(1, key_of(2))).is_err());
+        assert!(
+            u.download(&mut |_, _| {}).is_err(),
+            "refused under the new key"
+        );
+        assert!(state::load(rig.data.path()).staged.is_none());
+        assert!(
+            !rig.data.path().join("update/staged").exists(),
+            "nothing staged"
+        );
+    }
+
+    #[test]
+    fn download_is_refused_by_a_withdrawal_another_run_kept() {
+        let ports = Ports::lock();
+        let server = ports.serve(vec![]);
+        let rig = Rig::new();
+        release_signed_by(&server, 1);
+        let u = rotating(&rig, &server);
+        offered(u.check(&KeyRecord::Unavailable));
+        // Another River sees the tombstone; this one still holds its offer.
+        assert!(check(&rotating(&rig, &server), record(1, [0; 32])).is_err());
+        let err = u.download(&mut |_, _| {}).unwrap_err();
+        assert!(err.contains("withdrawn"), "{err}");
+        assert!(state::load(rig.data.path()).staged.is_none());
+    }
+
+    #[test]
+    fn a_staged_build_is_not_reused_after_a_rotation() {
+        let ports = Ports::lock();
+        let server = ports.serve(vec![]);
+        let rig = Rig::new();
+        let u = rotating(&rig, &server);
+        release_signed_by(&server, 1);
+        offered(u.check(&KeyRecord::Unavailable));
+        u.download(&mut |_, _| {}).unwrap();
+        // Key 2 signs the same release (same sequence and artifact) and the record names it.
+        release_signed_by(&server, 2);
+        offered(check(&u, record(1, key_of(2))));
+        u.download(&mut |_, _| {}).unwrap();
+        let staged = state::load(rig.data.path()).staged.unwrap();
+        let (manifest, sig) = (
+            fs::read(&staged.manifest).unwrap(),
+            fs::read(&staged.signature).unwrap(),
+        );
+        assert!(
+            manifest::verify_and_parse(&manifest, &sig, &pubkey(2)).is_ok(),
+            "the staged build was replaced by the one the new key signed"
+        );
+    }
+
+    #[test]
+    fn saved_state_is_newer_than_a_build_without_the_key_record() {
+        let ports = Ports::lock();
+        let server = ports.serve(vec![]);
+        let rig = Rig::new();
+        release_signed_by(&server, 2);
+        offered(check(&rotating(&rig, &server), record(1, key_of(2))));
+        let raw: serde_json::Value =
+            serde_json::from_slice(&fs::read(state::path(rig.data.path())).unwrap()).unwrap();
+        // A build from before the record wrote schema 1 and treats anything higher as written
+        // by a newer build: it reads it and never saves over it (`modify`), so `key_record` stays.
+        assert!(raw["schema"].as_u64().unwrap() > 1, "{raw}");
+        assert!(raw["key_record"].is_string());
+    }
+
+    #[test]
+    fn the_shipped_authority_is_what_the_running_app_reads() {
+        // `DesktopUpdate::new` is what main uses: no hand-set key authority.
+        let u = host::DesktopUpdate::new().expect("a data directory");
+        let shipped = crate::update::keyrecord::Authority::shipped().unwrap();
+        assert_eq!(
+            river_app::UpdateHost::key_record_id(&*u),
+            Some(shipped.pointer_id())
+        );
+    }
+
+    #[test]
+    fn self_update_reads_the_record_before_it_checks() {
+        struct Serves(KeyRecord);
+        impl river_app::KeyRecordSource for Serves {
+            fn fetch(&self, id: [u8; 32], _: Duration) -> KeyRecord {
+                assert_eq!(id, authority().pointer_id());
+                self.0.clone()
+            }
+        }
+        let ports = Ports::lock();
+        let server = ports.serve(vec![]);
+        let rig = Rig::new();
+        release_signed_by(&server, 1);
+        let u = host::DesktopUpdate::with_parts(rotating(&rig, &server), pubkey(1));
+        // The node says the key was withdrawn: the CLI path refuses, with no GUI check first.
+        let src: Arc<dyn river_app::KeyRecordSource> =
+            Arc::new(Serves(KeyRecord::State(record(1, [0; 32]))));
+        let err = host::cli_check(&u, Some(src)).unwrap_err();
+        assert!(err.contains("withdrawn"), "{err}");
+        // And run_cli goes through that function, with the app's source.
+        let text = include_str!("host.rs");
+        let body = &text[text.find("pub fn run_cli").unwrap()..];
+        assert!(body.contains("cli_check(&u, cli_record_source())"));
     }
 }

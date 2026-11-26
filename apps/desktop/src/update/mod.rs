@@ -297,6 +297,7 @@ impl Updater {
     fn key(&self, st: &state::State) -> Result<[u8; 32], String> {
         match keyrecord::effective(self.cfg.key_authority.as_ref(), st.key_record.as_deref()) {
             keyrecord::Effective::Withdrawn => Err(keyrecord::WITHDRAWN.into()),
+            keyrecord::Effective::Damaged => Err(keyrecord::DAMAGED.into()),
             keyrecord::Effective::Key(key) => Ok(key),
             keyrecord::Effective::Compiled if is_placeholder(&self.cfg.pubkey) => {
                 Err("this build of River has no update key, so it cannot update itself".into())
@@ -535,11 +536,17 @@ impl Updater {
         // files out from under that swap.
         let _lock = Lock::take(&self.dir().join("apply.lock"))?;
         let st = state::try_load(&self.cfg.data_dir)?;
-        self.key(&st)?;
+        let key = self.key(&st)?;
         self.sweep();
         let (offer, manifest_bytes, signature, sequence) = {
-            let checked = self.checked.lock().unwrap();
+            let mut checked = self.checked.lock().unwrap();
             let c = checked.as_ref().ok_or("check for updates first")?;
+            // The offer was verified by a check that may have run under another key: judge it
+            // under the key trusted now, so one checked before a rotation stages nothing.
+            if let Err(refusal) = manifest::verify_and_parse(&c.manifest, &c.signature, &key) {
+                *checked = None;
+                return Err(refusal.to_string());
+            }
             (
                 c.offer.clone(),
                 c.manifest.clone(),

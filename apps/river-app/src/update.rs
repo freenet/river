@@ -96,6 +96,28 @@ pub trait KeyRecordSource: Send + Sync + 'static {
 
 /// How long a check waits for the update-key record before going on without it.
 const KEY_RECORD_WAIT: Duration = Duration::from_secs(5);
+/// How long past the fetch's own wait a check lets it run before giving up on it.
+const KEY_RECORD_GRACE: Duration = Duration::from_secs(2);
+
+/// The update-key record for `host`, fetched through `source`, within `wait` plus `grace`. A
+/// host with no record, a missing source, a source that panics and one that does not answer in
+/// time are all [`KeyRecord::Unavailable`]: the check goes on without it. The fetch runs on a
+/// thread of its own, so a source stuck in a connect cannot hold the caller past the limit.
+pub fn fetch_key_record(
+    host: &dyn UpdateHost,
+    source: Option<Arc<dyn KeyRecordSource>>,
+    wait: Duration,
+    grace: Duration,
+) -> KeyRecord {
+    let (Some(id), Some(source)) = (host.key_record_id(), source) else {
+        return KeyRecord::Unavailable;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || drop(tx.send(source.fetch(id, wait))));
+    // A panic drops the sender, which ends the wait at once.
+    rx.recv_timeout(wait + grace)
+        .unwrap_or(KeyRecord::Unavailable)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UpdateCheck {
@@ -193,6 +215,7 @@ pub struct UpdateController {
     busy: Arc<AtomicBool>,
     auto: Arc<AtomicBool>,
     records: Arc<Mutex<Option<Arc<dyn KeyRecordSource>>>>,
+    record_wait: (Duration, Duration),
 }
 
 impl UpdateController {
@@ -207,7 +230,15 @@ impl UpdateController {
             busy: Arc::new(AtomicBool::new(false)),
             auto: Arc::new(AtomicBool::new(auto)),
             records: Arc::new(Mutex::new(None)),
+            record_wait: (KEY_RECORD_WAIT, KEY_RECORD_GRACE),
         }
+    }
+
+    /// For tests: how long the record fetch may take.
+    #[cfg(test)]
+    fn with_record_wait(mut self, wait: Duration, grace: Duration) -> Self {
+        self.record_wait = (wait, grace);
+        self
     }
 
     /// Where to read the update-key record before each check. Without one every check goes
@@ -220,24 +251,16 @@ impl UpdateController {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(source);
     }
 
-    /// The update-key record, right now, within [`KEY_RECORD_WAIT`]: a node that is slow or
-    /// not there must not delay the check.
+    /// The update-key record, right now, within the record wait: a node that is slow or not
+    /// there must not delay the check.
     fn key_record(&self) -> KeyRecord {
-        let Some(id) = self.host.key_record_id() else {
-            return KeyRecord::Unavailable;
-        };
-        let Some(source) = self
+        let source = self
             .records
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-        else {
-            return KeyRecord::Unavailable;
-        };
-        let (tx, rx) = std::sync::mpsc::channel();
-        thread::spawn(move || drop(tx.send(source.fetch(id, KEY_RECORD_WAIT))));
-        rx.recv_timeout(KEY_RECORD_WAIT + Duration::from_secs(2))
-            .unwrap_or(KeyRecord::Unavailable)
+            .clone();
+        let (wait, grace) = self.record_wait;
+        fetch_key_record(&*self.host, source, wait, grace)
     }
 
     pub fn host(&self) -> &Arc<dyn UpdateHost> {
@@ -489,15 +512,30 @@ impl UpdateUi {
     }
 }
 
-/// Reads the update-key record from the node the rooms link follows, with the grant it holds:
-/// a GET without code or subscription, as the generation watch reads its records.
+/// Reads the update-key record from a node with the app's saved grant: a GET without code or
+/// subscription, as the generation watch reads its records.
 pub struct NodeRecordSource {
-    link: crate::rooms::Link,
+    access: Box<dyn Fn() -> Option<(String, crate::rooms::grant::GrantToken)> + Send + Sync>,
 }
 
 impl NodeRecordSource {
+    /// The node the rooms link follows now, and the grant saved for it.
     pub fn new(link: crate::rooms::Link) -> Self {
-        NodeRecordSource { link }
+        NodeRecordSource {
+            access: Box::new(move || link.node_access()),
+        }
+    }
+
+    /// `authority` (`host:port`), with the grant saved in `config_dir` for it (`explicit`: the
+    /// person chose this node, see `rooms::token::node_dir`). For `river --self-update`, which
+    /// has no link.
+    pub fn saved(config_dir: std::path::PathBuf, authority: String, explicit: bool) -> Self {
+        NodeRecordSource {
+            access: Box::new(move || {
+                crate::rooms::saved_grant(&config_dir, &authority, explicit)
+                    .map(|token| (authority.clone(), token))
+            }),
+        }
     }
 }
 
@@ -505,7 +543,7 @@ impl KeyRecordSource for NodeRecordSource {
     fn fetch(&self, id: [u8; 32], wait: Duration) -> KeyRecord {
         use crate::rooms::generation::{Fetch, NodePointers, PointerSource};
         // No saved grant yet (first run, not approved): nothing to ask with.
-        let Some((authority, token)) = self.link.node_access() else {
+        let Some((authority, token)) = (self.access)() else {
             return KeyRecord::Unavailable;
         };
         let id = freenet_stdlib::prelude::ContractInstanceId::new(id);
@@ -1352,5 +1390,81 @@ mod tests {
         ctl.check_now();
         settle(&ctl, &rx);
         assert_eq!(*plain.records.lock().unwrap(), [KeyRecord::Unavailable]);
+    }
+
+    fn assert_unavailable_fast(source: Option<Arc<dyn KeyRecordSource>>, why: &str) {
+        let mut host = FakeHost::new(UpdateSupport::Automatic, vec![]);
+        host.record_id = Some([7; 32]);
+        let began = std::time::Instant::now();
+        let got = fetch_key_record(
+            &host,
+            source,
+            Duration::from_millis(1),
+            Duration::from_millis(20),
+        );
+        assert_eq!(got, KeyRecord::Unavailable, "{why}");
+        assert!(began.elapsed() < Duration::from_secs(5), "{why}: waited");
+    }
+
+    #[test]
+    fn a_source_that_never_answers_or_panics_does_not_hold_the_check() {
+        // Blocks until the test lets it go: no sleeping on the clock.
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = Mutex::new(held);
+        let stuck = FakeSource(Box::new(move || {
+            drop(held.lock().unwrap().recv());
+            KeyRecord::Absent
+        }));
+        assert_unavailable_fast(Some(Arc::new(stuck)), "stuck");
+        drop(release);
+        assert_unavailable_fast(
+            Some(Arc::new(FakeSource(Box::new(|| panic!("a broken source"))))),
+            "panicking",
+        );
+        assert_unavailable_fast(None, "no source");
+    }
+
+    #[test]
+    fn a_slow_source_does_not_delay_the_controller_past_its_wait() {
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = Mutex::new(held);
+        let mut host = FakeHost::new(UpdateSupport::Automatic, vec![Ok(UpdateCheck::UpToDate)]);
+        host.record_id = Some([7; 32]);
+        let host = Arc::new(host);
+        let (ctl, rx) = controller(host.clone(), false);
+        let ctl = ctl.with_record_wait(Duration::from_millis(1), Duration::from_millis(20));
+        ctl.set_record_source(Arc::new(FakeSource(Box::new(move || {
+            drop(held.lock().unwrap().recv());
+            KeyRecord::Absent
+        }))));
+        ctl.check_now();
+        settle(&ctl, &rx);
+        drop(release);
+        assert_eq!(*host.records.lock().unwrap(), [KeyRecord::Unavailable]);
+    }
+
+    #[test]
+    fn the_node_source_without_a_grant_or_a_node_is_unavailable() {
+        let dir = std::env::temp_dir().join(format!("river-record-src-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 127.0.0.1:9 (discard) refuses connections: nothing listens.
+        let authority = "127.0.0.1:9".to_string();
+        let src = NodeRecordSource::saved(dir.clone(), authority.clone(), true);
+        // No saved grant: nothing is asked.
+        assert_eq!(
+            src.fetch([7; 32], Duration::from_secs(1)),
+            KeyRecord::Unavailable
+        );
+        // A grant, but no node.
+        let node_dir = crate::rooms::token::node_dir(&dir, &authority, true);
+        crate::rooms::token::TokenStore::in_dir(&node_dir)
+            .save(&crate::rooms::grant::GrantToken::new("abc123".into()))
+            .unwrap();
+        assert_eq!(
+            src.fetch([7; 32], Duration::from_secs(1)),
+            KeyRecord::Unavailable
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

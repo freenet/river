@@ -266,6 +266,33 @@ impl UpdateHost for DesktopUpdate {
     }
 }
 
+/// What `--self-update` reads the update-key record with: the grant the app saved for the node
+/// it would use. `None` without a config directory; a grant that was never saved makes the
+/// source answer `Unavailable`, and the check then goes on with the record an earlier run kept.
+fn cli_record_source() -> Option<Arc<dyn river_app::KeyRecordSource>> {
+    let dir = crate::host::config_local_dir()?;
+    let startup = river_app::address::NodeChoice::startup(std::env::args_os(), Some(&dir));
+    Some(Arc::new(river_app::update::NodeRecordSource::saved(
+        dir,
+        startup.choice.address.authority(),
+        startup.choice.is_existing_node(),
+    )))
+}
+
+/// Check for an update the way the app does: read the update-key record from the node first.
+pub(crate) fn cli_check(
+    u: &DesktopUpdate,
+    source: Option<Arc<dyn river_app::KeyRecordSource>>,
+) -> Result<UpdateCheck, String> {
+    let record = river_app::update::fetch_key_record(
+        u,
+        source,
+        Duration::from_secs(5),
+        Duration::from_secs(2),
+    );
+    u.check(record)
+}
+
 /// `river --self-update`: check, download, verify, install and start the new version, once,
 /// with no window. Exits 0 when the new version started (this process exits as it does),
 /// 10 when already current, 11 when this copy is not River's to replace, 1 on any refusal
@@ -277,8 +304,7 @@ pub fn run_cli() -> i32 {
         return 1;
     };
     println!("river {}: checking for an update", u.version());
-    // No node connection here: a record seen by an earlier run still applies.
-    match u.check(KeyRecord::Unavailable) {
+    match cli_check(&u, cli_record_source()) {
         Err(e) => {
             river_app::diag!("river: update refused: {e}");
             1
