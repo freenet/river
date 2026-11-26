@@ -1,7 +1,7 @@
 #!/bin/bash
 # Sign River's update-key record (apps/desktop/update-authority.toml) and print what to publish.
 #
-# Offline: it needs the authority (author) key, not the network. Publishing is separate, see
+# Offline: it needs the authority key, not the network. Publishing is separate, see
 # the header of apps/desktop/update-authority.toml for the exact fdev commands.
 #
 # Usage:
@@ -37,12 +37,22 @@ if [ "$WITHDRAW" = 1 ]; then
 else
     [[ "$NEW_KEY" =~ ^[0-9a-fA-F]{64}$ ]] || die "--key must be the new update-signing PUBLIC key, 64 hex digits (see apps/desktop/update-pubkey.hex)"
     [[ ! "$NEW_KEY" =~ ^0+$ ]] || die "an all-zero key is the withdrawal: use --withdraw"
+    # A canonical point that is not weak: what the app itself requires of a key in a record.
+    # RIVER_UPDATE_TOOL may name a prebuilt update_tool; otherwise it is built from apps/.
+    if [ -n "${RIVER_UPDATE_TOOL:-}" ]; then
+        "$RIVER_UPDATE_TOOL" check-key "$NEW_KEY" || die "--key is not an acceptable update-signing public key"
+    else
+        cargo run -q --manifest-path apps/Cargo.toml -p river-desktop --example update_tool -- check-key "$NEW_KEY" \
+            || die "--key is not an acceptable update-signing public key (or update_tool did not build)"
+    fi
 fi
 
 command -v pointer-record >/dev/null 2>&1 || die "pointer-record not found (see scripts/check-pointer-freshness.sh for the install line)"
 if [ -n "$KEY_FILE" ]; then
     [ -f "$KEY_FILE" ] || die "key file not found: $KEY_FILE"
-    case "$(stat -c '%a' "$KEY_FILE")" in
+    # GNU stat, else BSD/macOS stat.
+    MODE="$(stat -c '%a' "$KEY_FILE" 2>/dev/null || stat -f '%Lp' "$KEY_FILE")"
+    case "$MODE" in
         600|400) ;;
         *) die "$KEY_FILE must be mode 600" ;;
     esac
@@ -54,6 +64,12 @@ fi
 [ -f "$TOML_PATH" ] || die "$TOML_PATH not found"
 
 field() { sed -n "s/^$1 *= *\"\(.*\)\"/\1/p" "$TOML_PATH" | head -n1; }
+PINNED="$(field pinned_record)"
+if [ -n "$PINNED" ]; then
+    # The first four bytes of a record are its big-endian version.
+    PINNED_VERSION=$((16#${PINNED:0:8}))
+    [ "$VERSION" -gt "$PINNED_VERSION" ] || die "--version $VERSION is not above the pinned record's version $PINNED_VERSION: builds ignore it"
+fi
 AUTHOR_VK="$(field authority_verifying_key)"
 APP_ID="$(field app_id)"
 [ -n "$AUTHOR_VK" ] && [ -n "$APP_ID" ] || die "could not read authority_verifying_key and app_id from $TOML_PATH"

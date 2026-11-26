@@ -55,8 +55,10 @@
 # <N> --withdraw`. Every build that sees it refuses all updates and tells the person to
 # download a new build. A withdrawal is lifted only by a record with a HIGHER version, signed
 # by the authority key. If the authority key itself is compromised, whoever holds it can
-# withdraw updates for every install that sees the record, and nothing lifts that but a
-# reinstall of a build with a new authority key.
+# withdraw updates for every install that sees the record. Only a release carrying a new
+# authority key (and its own `pinned_record`) lifts that: the kept record then no longer
+# verifies, and the build falls back to its pin. Reinstalling the same build does not, because
+# River's update-state.json stays; deleting that file resets a build to its pin.
 #
 # WHAT IT CANNOT DO. It cannot remove an update that is already installed. It acts only on a
 # build that can reach its node at check time. A fresh install that has never seen the record

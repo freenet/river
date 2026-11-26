@@ -1632,4 +1632,29 @@ mod key_record {
         let body = &text[text.find("pub fn run_cli").unwrap()..];
         assert!(body.contains("cli_check(&u, cli_record_source())"));
     }
+
+    #[test]
+    fn a_rotation_kept_during_the_fetch_stops_the_floors_moving() {
+        let ports = Ports::lock();
+        let server = ports.serve(vec![]);
+        let rig = Rig::new();
+        let u = rotating(&rig, &server);
+        release_signed_by(&server, 1);
+        // Another River keeps a rotation (to key 2) after this one fetched the key-1 manifest,
+        // before it saves.
+        let data = rig.data.path().to_path_buf();
+        let other_data = data.clone();
+        *u.after_fetch.lock().unwrap() = Some(Box::new(move || {
+            state::modify(&other_data, |st| {
+                st.key_record = Some(hex::encode(record(1, key_of(2))));
+            })
+            .unwrap();
+        }));
+        let err = u.check(&KeyRecord::Unavailable).unwrap_err();
+        assert!(err.contains("signature"), "{err}");
+        let st = state::load(&data);
+        assert_eq!(st.highest_sequence, 0, "the floor did not move");
+        assert_eq!(st.highest_version, None);
+        assert_eq!(st.last_checked, None);
+    }
 }

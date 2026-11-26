@@ -17,7 +17,8 @@ const AUTHOR_VK_PREFIX: &str = "river:v1:vk:";
 
 /// What a damaged kept record says.
 pub const DAMAGED: &str = "River's note of its update key is damaged, so River will not update \
-     itself. Download a new build from https://github.com/freenet/river/releases";
+     itself until it can read the current key record from your Freenet node. If this stays, \
+     delete update-state.json in River's data folder (reinstalling does not remove it)";
 
 /// What a withdrawn key says.
 pub const WITHDRAWN: &str = "River's update key was withdrawn, so River will not update itself. \
@@ -132,9 +133,11 @@ pub enum Effective {
     Key([u8; 32]),
     /// The record withdrew the key: nobody is trusted.
     Withdrawn,
-    /// A record is kept but does not verify: nobody is trusted until a served record replaces
-    /// it. Falling back to the compiled-in key here would let a damaged or edited file bring a
-    /// revoked key back.
+    /// A record is kept but does not verify, and this build pins no record to fall back on:
+    /// nobody is trusted until a served record replaces it. Falling back to the compiled-in
+    /// key here would let a damaged or edited file bring a revoked key back. (A build with a
+    /// pin falls back to the pin: deleting the file resets to it anyway, and refusing would
+    /// stop every install the day the authority or app id changes.)
     Damaged,
 }
 
@@ -154,13 +157,21 @@ fn base(authority: &Authority, kept: Option<&str>) -> Base {
         return pinned.map_or(Base::Nothing, Base::Floor);
     };
     let Some(kept) = floor_of(authority, kept) else {
-        return Base::Damaged;
+        // Not a floor. With a pin the build has its own: the same place deleting the file
+        // would leave it. Without one, refuse.
+        return pinned.map_or(Base::Damaged, Base::Floor);
     };
     match pinned {
         // The build knows a newer record than the one kept (the kept one came from an older
-        // build's state): the pinned one stands. Equal versions: the kept one, which only ever
-        // got there by winning the tiebreak.
-        Some(pinned) if pinned.version() > kept.version() => Base::Floor(pinned),
+        // build's state): the pinned one stands. At one version the resolver's tiebreak
+        // decides, as on the network: the lower key wins, a tombstone (all zero) lowest.
+        Some(pinned)
+            if pinned.version() > kept.version()
+                || (pinned.version() == kept.version()
+                    && pinned.code_hash() < kept.code_hash()) =>
+        {
+            Base::Floor(pinned)
+        }
         _ => Base::Floor(kept),
     }
 }
@@ -189,7 +200,8 @@ pub fn judge(authority: &Authority, kept: Option<&str>, fetched: &KeyRecord) -> 
     let KeyRecord::State(bytes) = fetched else {
         return None;
     };
-    // A damaged kept record is not a floor, and a served record above the pinned one repairs it.
+    // A damaged kept record is not a floor (the pin is, when there is one), and with no pin any
+    // genuine served record replaces it.
     let floor = match base(authority, kept) {
         Base::Floor(floor) => floor,
         Base::Nothing | Base::Damaged => PointerFloor::never_resolved(),
@@ -485,5 +497,70 @@ pub(crate) mod tests {
     fn file_key() -> [u8; 32] {
         let hex = include_str!("../../update-pubkey.hex").trim();
         <[u8; 32]>::try_from(hex::decode(hex).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_pin_and_a_kept_record_at_one_version_follow_the_tiebreak() {
+        let (lo, hi) = if key_of(3) < key_of(4) {
+            (3, 4)
+        } else {
+            (4, 3)
+        };
+        let pinned_hi = authority()
+            .with_pinned(&hex::encode(record(2, key_of(hi))))
+            .unwrap();
+        // The kept record is the lower key at the same version: it wins.
+        let kept_lo = hex::encode(record(2, key_of(lo)));
+        assert_eq!(
+            effective(Some(&pinned_hi), Some(&kept_lo)),
+            Effective::Key(key_of(lo))
+        );
+        let pinned_lo = authority()
+            .with_pinned(&hex::encode(record(2, key_of(lo))))
+            .unwrap();
+        // The kept record is the higher key: the pin wins.
+        let kept_hi = hex::encode(record(2, key_of(hi)));
+        assert_eq!(
+            effective(Some(&pinned_lo), Some(&kept_hi)),
+            Effective::Key(key_of(lo))
+        );
+        // A tombstone orders lowest: a kept withdrawal beats a pinned key at its version, and a
+        // pinned withdrawal beats a kept key.
+        let kept_w = hex::encode(record(2, [0; 32]));
+        assert_eq!(
+            effective(Some(&pinned_lo), Some(&kept_w)),
+            Effective::Withdrawn
+        );
+        let pinned_w = authority()
+            .with_pinned(&hex::encode(record(2, [0; 32])))
+            .unwrap();
+        assert_eq!(
+            effective(Some(&pinned_w), Some(&kept_lo)),
+            Effective::Withdrawn
+        );
+    }
+
+    #[test]
+    fn a_damaged_kept_record_falls_back_to_the_pin_when_there_is_one() {
+        let pinned = authority()
+            .with_pinned(&hex::encode(record(2, key_of(3))))
+            .unwrap();
+        for damaged in ["zz", "", &hex::encode([0u8; 100])] {
+            assert_eq!(
+                effective(Some(&pinned), Some(damaged)),
+                Effective::Key(key_of(3))
+            );
+        }
+        // No pin: refuse.
+        assert_eq!(
+            effective(Some(&authority()), Some("zz")),
+            Effective::Damaged
+        );
+        // A newer served record still moves a pinned build off a damaged file.
+        let v3 = judge(&pinned, Some("zz"), &state(record(3, key_of(5)))).unwrap();
+        assert_eq!(
+            effective(Some(&pinned), Some(&v3)),
+            Effective::Key(key_of(5))
+        );
     }
 }

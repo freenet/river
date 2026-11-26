@@ -48,20 +48,23 @@
 //! | Competing record at the kept version | The lower key wins, as on the network; the higher is ignored. |
 //! | Record signed by another key, for another app id, malformed, or naming a weak, non-canonical or all-zero key | Ignored. All zero is the tombstone encoding, so it withdraws; it is never adopted as a key. |
 //! | Absent, unreachable, no grant yet, or no answer within a few seconds | Ignored: the check goes on with the key the kept (or pinned) record names, or the compiled-in key if there is none. |
-//! | Kept record that no longer verifies (file damaged or edited) | Nobody is trusted ([`keyrecord::DAMAGED`]), neither the compiled-in key nor the file's, until a served record above the pin replaces it. |
+//! | Kept record that no longer verifies (file damaged or edited) | A build that pins a record falls back to the pin (deleting the file would do the same, and refusing would stop every install if the authority or app id ever changed). A build with no pin trusts nobody ([`keyrecord::DAMAGED`]), neither the compiled-in key nor the file's, until any genuine served record replaces it. |
 //!
 //! What it cannot do:
 //! - Undo an update that is already installed.
 //! - Act on a build that has never seen the record and cannot reach its node: a fresh install
 //!   offline trusts its compiled-in key (the newest one, if its release pinned the record).
 //!   This is the behaviour #927 chose.
-//! - Survive deleting `update-state.json`. The damaged-file message tells a person to remove
-//!   the file, and removing it (or any deletion of it) forgets every kept record, the highest
-//!   manifest sequence and version too; the build then starts again from its compiled-in key
-//!   and pin, and learns the record at its next check if it can reach the node.
+//! - Survive deleting `update-state.json` (in River's data folder; reinstalling or updating
+//!   River does NOT remove it, only deleting it by hand or removing the data folder does). That
+//!   forgets every kept record, and the highest manifest sequence and version too; the build
+//!   then starts again from its pin (or compiled-in key) and learns the record at its next
+//!   check if it can reach the node. The damaged-file message names this as the last resort.
 //! - Help if the authority key itself leaks (that needs a release carrying a new
 //!   `update-authority.toml`), and a withdrawal published by a stolen authority key stops every
-//!   install that sees it until reinstall, since only a higher record lifts it.
+//!   install that sees it: only a record with a higher version lifts it, or a build carrying a
+//!   new authority (its pin replaces the kept record, which no longer verifies). Reinstalling
+//!   the same build does not lift it, because the state file stays.
 //! - Stop a second River from keeping a withdrawal between this one's load of the state and its
 //!   swap: that window is milliseconds and the next check sees it.
 //!
@@ -238,6 +241,9 @@ pub struct Updater {
     checked: Mutex<Option<Checked>>,
     /// The SHA-256 of the installed binary as this River first saw it.
     install_sha: Arc<Mutex<Option<String>>>,
+    /// Test hook: runs between the manifest fetch and the state update of a check.
+    #[cfg(test)]
+    after_fetch: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 fn remember(slot: &Mutex<Option<String>>, installer: &dyn Installer) {
@@ -264,6 +270,8 @@ impl Updater {
             installer,
             checked: Mutex::new(None),
             install_sha: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            after_fetch: Mutex::new(None),
         }
     }
 
@@ -443,7 +451,16 @@ impl Updater {
         let (manifest, signature, parsed) = self.fetch_verified(&key)?;
         let platform = self.platform()?;
         let now = self.now();
+        #[cfg(test)]
+        if let Some(hook) = self.after_fetch.lock().unwrap().as_ref() {
+            hook();
+        }
         let verdict = state::modify(&self.cfg.data_dir, |st| {
+            // Under the state lock the key in force may no longer be the one the manifest was
+            // fetched under (another River kept a rotation or a withdrawal during a slow
+            // fetch): verify it again before any floor moves.
+            manifest::verify_and_parse(&manifest, &signature, &self.key(st)?)
+                .map_err(|r| r.to_string())?;
             let trust = self.trust(st);
             let verdict = manifest::evaluate(
                 &parsed,
