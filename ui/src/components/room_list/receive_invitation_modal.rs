@@ -800,12 +800,13 @@ fn render_error_state(
                     // mobile RefCell re-entrancy crash path).
                     onclick: move |_| {
                         crate::util::defer(move || {
-                            // Reset to PendingSubscription so the synchronizer retries
-                            PENDING_INVITES.with_mut(|pending| {
-                                if let Some(join) = pending.map.get_mut(&room_key) {
-                                    join.status = PendingRoomStatus::PendingSubscription;
-                                }
-                            });
+                            // Re-queue with a fresh GET budget and request
+                            // one synchronizer pass, which sends the GET.
+                            let tx = crate::components::app::SYNCHRONIZER
+                                .read()
+                                .get_message_sender();
+                            PENDING_INVITES
+                                .with_mut(|pending| pending.retry_from_error(&room_key, &tx));
                         });
                     },
                     "Retry"
@@ -1287,6 +1288,7 @@ pub(crate) fn accept_invitation(inv: Invitation, nickname: String) {
                 subscribing_since: None,
                 retry_count: 0,
                 room_secrets: room_secrets.clone(),
+                get_budget: Default::default(),
             },
         );
     });
@@ -1427,6 +1429,7 @@ mod tests {
                         subscribing_since: None,
                         retry_count: 0,
                         room_secrets: vec![],
+                        get_budget: Default::default(),
                     },
                 )
             });
@@ -1549,6 +1552,7 @@ mod tests {
                 subscribing_since: None,
                 retry_count: 0,
                 room_secrets: vec![],
+                get_budget: Default::default(),
             },
         );
         let mut refusals = std::collections::HashMap::new();

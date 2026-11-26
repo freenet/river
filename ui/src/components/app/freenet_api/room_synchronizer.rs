@@ -646,6 +646,31 @@ pub(crate) fn fresh_rekey_merge(
     owed_rekey_merge(room).filter(|_| room.rekey_merge.owed.contains(old_contract_key))
 }
 
+/// Run `ProcessRooms` once `INVITATION_TIMEOUT_MS` has passed since an
+/// invitation's GET went out, so the stuck-invite reset in `process_rooms`
+/// actually gets evaluated. That reset is only checked when something runs
+/// `process_rooms`, and on a fresh profile with one pending invite nothing
+/// else does: a GET that never answers left the invite `Subscribing` for the
+/// rest of the session. One check per GET sent, so it is bounded.
+fn schedule_invite_timeout_check() {
+    crate::util::safe_spawn_local(async move {
+        crate::util::sleep(std::time::Duration::from_millis(
+            INVITATION_TIMEOUT_MS + 1000,
+        ))
+        .await;
+        crate::util::defer(|| {
+            let tx = crate::components::app::SYNCHRONIZER
+                .read()
+                .get_message_sender();
+            if let Err(e) =
+                tx.unbounded_send(super::freenet_synchronizer::SynchronizerMessage::ProcessRooms)
+            {
+                error!("Failed to schedule invitation timeout check: {}", e);
+            }
+        });
+    });
+}
+
 /// The code-free subscribe for a room the network should already hold
 /// (freenet/river#757).
 ///
@@ -682,49 +707,29 @@ impl RoomSynchronizer {
 
         // Reset stuck invitations that have been in Subscribing state too long
         if web_api_available {
-            let stuck_invites: Vec<VerifyingKey> = {
-                let pending = PENDING_INVITES.read();
-                let now = now_ms();
-                pending
-                    .map
-                    .iter()
-                    .filter(|(_, join)| {
-                        matches!(join.status, PendingRoomStatus::Subscribing)
-                            && join
-                                .subscribing_since
-                                .is_none_or(|since| now - since > INVITATION_TIMEOUT_MS as f64)
-                    })
-                    .map(|(vk, _)| *vk)
-                    .collect()
-            };
-            for vk in stuck_invites {
-                warn!(
-                    "Invitation for {:?} stuck in Subscribing, resetting for retry",
-                    MemberId::from(vk)
-                );
-                PENDING_INVITES.with_mut(|pending| {
-                    if let Some(join) = pending.map.get_mut(&vk) {
-                        join.status = PendingRoomStatus::PendingSubscription;
-                        join.subscribing_since = None;
-                        join.retry_count += 1;
-                    }
-                });
-                SYNC_INFO
-                    .write()
-                    .update_sync_status(&vk, RoomSyncStatus::Disconnected);
+            let stuck = PENDING_INVITES.with_mut(|pending| pending.reset_stuck(now_ms()));
+            for (vk, requeued) in stuck {
+                if requeued {
+                    warn!(
+                        "Invitation for {:?} stuck in Subscribing, resetting for retry",
+                        MemberId::from(vk)
+                    );
+                    SYNC_INFO
+                        .write()
+                        .update_sync_status(&vk, RoomSyncStatus::Disconnected);
+                } else {
+                    warn!(
+                        "Invitation for {:?} out of retries, showing an error",
+                        MemberId::from(vk)
+                    );
+                }
             }
         }
 
         // First, check for pending invitations that need subscription
         // Collect keys that need subscription without holding the read lock
         let invites_to_subscribe: Vec<VerifyingKey> = if web_api_available {
-            let pending_invites = PENDING_INVITES.read();
-            pending_invites
-                .map
-                .iter()
-                .filter(|(_, join)| matches!(join.status, PendingRoomStatus::PendingSubscription))
-                .map(|(key, _)| *key)
-                .collect()
+            PENDING_INVITES.read().awaiting_get()
         } else {
             // WebAPI not available, skip invitation processing until connection established
             Vec::new()
@@ -753,22 +758,23 @@ impl RoomSynchronizer {
                     contract_key.id()
                 );
 
+                // Update pending invite status to prevent re-processing on concurrent calls
+                // and read the retry count. A refused invitation (budget spent) sends
+                // nothing and is not marked Subscribing in SYNC_INFO.
+                let Some(retry_count) =
+                    PENDING_INVITES.with_mut(|pending| pending.begin_get(&owner_vk, now_ms()))
+                else {
+                    warn!(
+                        "Invitation for {:?} out of retries, showing an error",
+                        MemberId::from(owner_vk)
+                    );
+                    continue;
+                };
+
                 // Use with_mut to scope the borrow properly and avoid AlreadyBorrowed errors
                 SYNC_INFO.with_mut(|sync_info| {
                     sync_info.register_new_room(owner_vk);
                     sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Subscribing);
-                });
-
-                // Update pending invite status to prevent re-processing on concurrent calls
-                // and read the retry count to decide whether to request contract code
-                let retry_count = PENDING_INVITES.with_mut(|pending| {
-                    if let Some(join) = pending.map.get_mut(&owner_vk) {
-                        join.status = PendingRoomStatus::Subscribing;
-                        join.subscribing_since = Some(now_ms());
-                        join.retry_count
-                    } else {
-                        0
-                    }
                 });
 
                 // Always request contract code so the node caches the WASM locally.
@@ -793,6 +799,7 @@ impl RoomSynchronizer {
                     match web_api.send(client_request).await {
                         Ok(_) => {
                             info!("Sent GetRequest for room {:?}", MemberId::from(owner_vk));
+                            schedule_invite_timeout_check();
                         }
                         Err(e) => {
                             error!(
@@ -2565,6 +2572,59 @@ mod tests {
         assert!(
             put > route + get_arm.len(),
             "the seed PUT must be the fallthrough after the GET arm"
+        );
+    }
+
+    #[test]
+    fn an_invitation_get_arms_its_own_timeout_check() {
+        // Fresh-profile invite stall: the stuck-invite reset only runs inside
+        // `process_rooms`, so sending the invite's GET must schedule the
+        // `ProcessRooms` that evaluates it.
+        let body = process_rooms_source();
+        assert!(
+            body.contains(
+                "Ok(_)=>{info!(\"SentGetRequestforroom{:?}\",MemberId::from(owner_vk));schedule_invite_timeout_check();}"
+            ),
+            "a sent invitation GET must arm the invitation timeout check"
+        );
+        // The invite pass runs through the `PendingInvites` methods the
+        // budget tests drive, so those tests cover this code path.
+        for call in [
+            "PENDING_INVITES.with_mut(|pending|pending.reset_stuck(now_ms()))",
+            "PENDING_INVITES.read().awaiting_get()",
+        ] {
+            assert!(body.contains(call), "process_rooms must call {call}");
+        }
+        // A refused GET (budget spent) is skipped, and only an accepted one
+        // marks the room Subscribing in SYNC_INFO.
+        let gate = body
+            .find("letSome(retry_count)=PENDING_INVITES.with_mut(|pending|pending.begin_get(&owner_vk,now_ms()))else{")
+            .expect("process_rooms must gate the invite GET on begin_get");
+        let after = &body[gate..];
+        let else_end = after.find("};").expect("the else block ends");
+        assert!(
+            after[..else_end].contains("continue;"),
+            "a refused invite GET must be skipped"
+        );
+        let register = body
+            .find("sync_info.register_new_room(owner_vk);sync_info.update_sync_status(&owner_vk,RoomSyncStatus::Subscribing);")
+            .expect("process_rooms registers the invited room");
+        assert!(
+            gate < register,
+            "SYNC_INFO is set only after begin_get accepts"
+        );
+        let src: String = crate::util::strip_comments(include_str!("room_synchronizer.rs"))
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let helper = &src[src
+            .find("fnschedule_invite_timeout_check(){")
+            .expect("helper exists")..];
+        let helper = &helper[..helper.find("pub(crate)fnsubscribe_get_request(").unwrap()];
+        assert!(
+            helper.contains("from_millis(INVITATION_TIMEOUT_MS+1000")
+                && helper.contains("SynchronizerMessage::ProcessRooms"),
+            "the check runs ProcessRooms after INVITATION_TIMEOUT_MS"
         );
     }
 
