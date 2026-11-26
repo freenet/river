@@ -21,17 +21,17 @@ use crate::components::room_list::create_room_modal::CreateRoomModal;
 use crate::components::room_list::edit_room_modal::EditRoomModal;
 use crate::components::room_list::notification_modal::NotificationModal;
 use crate::components::room_list::receive_invitation_modal::{
-    accept_invitation, adopt_and_purge_legacy_persisted_invitation_once,
+    accept_invitation, adopt_and_purge_legacy_persisted_invitation_once, classify_invitation_code,
     clear_invitation_from_storage, decide_recovered_invitation, is_invitation_processed,
     load_invitation_from_storage, load_invitation_nickname_from_storage,
-    save_invitation_to_storage, take_resume_once, ReceiveInvitationModal,
-    RecoveredInvitationAction, PRESENT_INVITATION_REQUEST,
+    save_invitation_to_storage, take_resume_once, DamagedInvitationModal, InvitationCode,
+    ReceiveInvitationModal, RecoveredInvitationAction, PRESENT_INVITATION_REQUEST,
 };
 use crate::invites::PendingInvites;
 use crate::room_data::{CurrentRoom, Rooms};
 use crate::util::BUILD_TIMESTAMP_ISO;
 use dioxus::document::{Link, Stylesheet};
-use dioxus::logger::tracing::{debug, error, info, warn};
+use dioxus::logger::tracing::{debug, error, info};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::client_api::WebApi;
@@ -276,6 +276,10 @@ pub fn App() -> Element {
     // `dm_thread_modal.rs`.
     let invitation_resume_fired = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(false)));
 
+    // Holds an invitation link's code while it could not be decoded (typically
+    // a link cut short when copied), which opens `DamagedInvitationModal`.
+    let mut damaged_invitation = use_signal(|| None::<String>);
+
     // Bridge the click interceptor's `INTERCEPTED_INVITATION_CODE` global
     // into the local `receive_invitation` signal that drives
     // `ReceiveInvitationModal`. Same gate as the URL-bar flow below: we
@@ -319,8 +323,8 @@ pub fn App() -> Element {
         // triggered by `receive_invitation.set(...)` below doesn't
         // observe the same Some value and re-fire this effect.
         *crate::components::invite_click_interceptor::INTERCEPTED_INVITATION_CODE.write() = None;
-        match Invitation::from_encoded_string(&code) {
-            Ok(invitation) => {
+        match classify_invitation_code(&code) {
+            InvitationCode::Valid(invitation) => {
                 let fingerprint = invitation.to_encoded_string();
                 if is_invitation_processed(&fingerprint) {
                     debug!("Intercepted invite click already processed; ignoring");
@@ -330,12 +334,10 @@ pub fn App() -> Element {
                     receive_invitation.set(Some(invitation));
                 }
             }
-            Err(e) => {
-                warn!(
-                    "Intercepted invite click had unparseable code: {} (len {})",
-                    e,
-                    code.len()
-                );
+            InvitationCode::Damaged => {
+                // A click is a fresh request, so show it even if this link
+                // was dismissed before.
+                damaged_invitation.set(Some(code));
             }
         }
     });
@@ -389,16 +391,32 @@ pub fn App() -> Element {
         if let Ok(search) = window.location().search() {
             if let Ok(params) = web_sys::UrlSearchParams::new_with_str(&search) {
                 if let Some(invitation_code) = params.get("invitation") {
-                    if let Ok(invitation) = Invitation::from_encoded_string(&invitation_code) {
-                        if is_invitation_processed(&invitation.to_encoded_string()) {
-                            debug!(
-                                "Skipping invitation in URL: already accepted or dismissed in this browser"
-                            );
-                        } else {
-                            info!("Received invitation from URL: {:?}", invitation);
-                            save_invitation_to_storage(&invitation);
-                            receive_invitation.set(Some(invitation));
-                            found_invitation = true;
+                    match classify_invitation_code(&invitation_code) {
+                        InvitationCode::Valid(invitation) => {
+                            if is_invitation_processed(&invitation.to_encoded_string()) {
+                                debug!(
+                                    "Skipping invitation in URL: already accepted or dismissed in this browser"
+                                );
+                            } else {
+                                info!("Received invitation from URL: {:?}", invitation);
+                                save_invitation_to_storage(&invitation);
+                                receive_invitation.set(Some(invitation));
+                                found_invitation = true;
+                            }
+                        }
+                        InvitationCode::Damaged => {
+                            // This block runs on every render and the sandboxed
+                            // iframe cannot strip `?invitation=`, so skip a code
+                            // the user already dismissed (in this session or,
+                            // via the processed hash, before a reload). Never
+                            // replace a message already showing (it may be a
+                            // clicked link's), so Dismiss marks the code the
+                            // user actually saw.
+                            if !is_invitation_processed(&invitation_code)
+                                && damaged_invitation.peek().is_none()
+                            {
+                                damaged_invitation.set(Some(invitation_code.clone()));
+                            }
                         }
                     }
 
@@ -770,6 +788,7 @@ pub fn App() -> Element {
         ReceiveInvitationModal {
             invitation: receive_invitation
         }
+        DamagedInvitationModal { code: damaged_invitation }
         DocumentTitleUpdater {}
         update_banner::UpdateBanner {}
         // Last, so it paints above the ordinary modals and the banner.
