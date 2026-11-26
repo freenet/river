@@ -223,6 +223,13 @@ jobs:
             test -s "snapshots/$scene.png"
           done
 
+          # The same app on a light system: a few screens that cover the chat
+          # screen, a dialog, a warning and a setup card, for review.
+          for scene in chat chat-settings-appearance chat-settings-about chat-similar-name not-installed-node-warning; do
+            ./target/debug/river --snap "snapshots/light-$scene.png" --scene "$scene" --scale 2 --theme light
+            test -s "snapshots/light-$scene.png"
+          done
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
