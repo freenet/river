@@ -225,6 +225,21 @@ impl Link {
         }
     }
 
+    /// The node's authority and the grant saved for it, if there is one: what a read of the
+    /// node outside the session (the update-key record) connects with.
+    pub fn node_access(&self) -> Option<(String, grant::GrantToken)> {
+        let dir = self.inner.config_dir.as_deref()?;
+        let authority = self
+            .inner
+            .authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let dir = token::node_dir(dir, &authority, self.inner.explicit.load(Ordering::Acquire));
+        let token = token::TokenStore::in_dir(&dir).load()?;
+        Some((authority, token))
+    }
+
     /// The number of the node in use: it grows with every [`set_node`](Link::set_node), and
     /// every update is delivered with the number it was read under.
     pub fn generation(&self) -> u64 {

@@ -1,0 +1,53 @@
+# Who may name River's trusted update-signing key, and where that is published.
+#
+# River's self-update trusts one ed25519 update-signing key (apps/desktop/update-pubkey.hex,
+# compiled into each build). If that key leaks, builds signed with it must stop being
+# accepted, and a replacement must be nameable, without every user reinstalling by hand
+# (freenet/river#927). This file is the trust anchor for that.
+#
+# THE RECORD. A Freenet "pointer record" (freenet-migrate) lives at the fixed contract
+# address `pointer_key` below. It is a 100-byte state: a version that only rises, a 32-byte
+# payload, and a signature by `authority_verifying_key` over (authority key, app_id, version,
+# payload). Here the payload IS the trusted update-signing public key. All-zero payload is the
+# tombstone: "no update key is trusted" (every update is refused).
+#
+# Before each update check, a build that can reach the Freenet node reads the record. The
+# effective key is the one named by the highest-version verified record this install has ever
+# seen (kept in its update state file); with none seen yet, the compiled-in key. Check,
+# download and the re-check at restart all use the effective key. A node serving an older or
+# a competing record cannot roll the key back. See apps/desktop/src/update/mod.rs, `# Trust`.
+#
+# THE AUTHORITY KEY must never be the update-signing key: if it were, a leak of the signing
+# key would let the attacker publish their own record. It is River's author key (the one in
+# pointer-records.toml), which signs the web container and the pointer records and is NOT
+# available to the release workflow. This file is compiled into every build, so changing
+# `authority_verifying_key` is itself a new release that old builds never see.
+#
+# PUBLISHING A ROTATION (the record's version must be higher than every earlier one; start
+# at 1). With the author key file on stdin, as scripts/sign-pointer-records.sh does:
+#
+#   pointer-record sign --author-vk <authority_verifying_key> \
+#       --app-id river-desktop-update-key --version <N> \
+#       --code-hash <NEW update-signing public key, 64 hex digits> < ~/.config/river/web-container-keys.toml
+#
+# then publish the printed `state=` to the printed `key=` address the way
+# scripts/publish-pointer-records.sh publishes the other records. Check it with
+# `pointer-record verify --author-vk ... --app-id river-desktop-update-key --state <state>`.
+# Also commit the new key to apps/desktop/update-pubkey.hex and cut a release signed by it,
+# so fresh installs start on it.
+#
+# WITHDRAWING (a leak with no replacement yet): the same command with
+# `--code-hash 0000000000000000000000000000000000000000000000000000000000000000`. Every build
+# that sees it refuses all updates and tells the person to download a new build. Publish a
+# higher-version record naming a new key to re-enable updates.
+#
+# WHAT IT CANNOT DO. It cannot remove an update that is already installed. It acts only on a
+# build that can reach its node at check time, and not at all on a build that has never seen
+# the record and cannot reach the node (a fresh install offline trusts its compiled-in key).
+# It is independent of freenet.org: serving files from the update address does not let anyone
+# change or silence it.
+authority_verifying_key = "river:v1:vk:9Ebskq4y7NvJpTQTrF1FAxU8g6bR4Rhe4TRikXba55EJ"
+app_id = "river-desktop-update-key"
+# The fixed address the record is published at: derived from the pointer contract's frozen
+# code hash and (authority_verifying_key || app_id). Recorded for humans; a test recomputes it.
+pointer_key = "3xAggxNaYb7YSMVDJrWgmoZLE1aPUuZSbqm5dTULL57R"

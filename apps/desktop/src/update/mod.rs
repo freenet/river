@@ -51,6 +51,7 @@
 //! copy of the old binary is in `previous/` for a manual restore.
 
 pub mod host;
+pub mod keyrecord;
 #[cfg(target_os = "linux")]
 mod linux;
 pub mod manifest;
@@ -74,6 +75,8 @@ use manifest::{Offer, Refusal, Trust, Verdict};
 pub use manifest::{PLACEHOLDER_PUBKEY, is_placeholder};
 pub use platform::{Installer, Support};
 use state::{Probation, Staged};
+
+use river_app::KeyRecord;
 
 /// Where the manifest lives (the signature is at the same address plus `.sig`). The freenet/web
 /// repository serves `hugo-site/static/river/update/stable/` there through GitHub Pages: HTTPS,
@@ -135,6 +138,8 @@ pub struct Config {
     /// How long to wait before fetching the manifest again when its signature does not verify
     /// (a CDN can serve a new manifest beside an old signature for a moment).
     pub retry_delay: Duration,
+    /// Who may name a replacement update key, and where; `None` keeps `pubkey` for good.
+    pub key_authority: Option<keyrecord::Authority>,
 }
 
 impl Config {
@@ -248,11 +253,42 @@ impl Updater {
             .ok_or_else(|| "River has no update for this platform".to_string())
     }
 
-    fn require_key(&self) -> Result<(), String> {
-        if is_placeholder(&self.cfg.pubkey) {
-            return Err("this build of River has no update key, so it cannot update itself".into());
+    /// The key manifests must verify against under `st`: the one the highest-version update-key
+    /// record this install has accepted names, else the compiled-in one. Every verification
+    /// (check, download, and the second look at apply time) asks here, so a build staged under
+    /// a key revoked since is refused. Errs when the record withdrew the key, and when there
+    /// is no record and the compiled-in key is the placeholder.
+    fn key(&self, st: &state::State) -> Result<[u8; 32], String> {
+        match keyrecord::effective(self.cfg.key_authority.as_ref(), st.key_record.as_deref()) {
+            keyrecord::Effective::Withdrawn => Err(keyrecord::WITHDRAWN.into()),
+            keyrecord::Effective::Key(key) => Ok(key),
+            keyrecord::Effective::Compiled if is_placeholder(&self.cfg.pubkey) => {
+                Err("this build of River has no update key, so it cannot update itself".into())
+            }
+            keyrecord::Effective::Compiled => Ok(self.cfg.pubkey),
         }
-        Ok(())
+    }
+
+    /// Where the update-key record is, for the node fetch that comes before each check.
+    pub fn key_record_id(&self) -> Option<[u8; 32]> {
+        self.cfg.key_authority.as_ref().map(|a| a.pointer_id())
+    }
+
+    /// Keep `record` if it is a verified record above the one kept.
+    fn take_key_record(&self, record: &KeyRecord) -> Result<(), String> {
+        let Some(authority) = &self.cfg.key_authority else {
+            return Ok(());
+        };
+        let st = state::try_load(&self.cfg.data_dir)?;
+        if keyrecord::judge(authority, st.key_record.as_deref(), record).is_none() {
+            return Ok(());
+        }
+        // Judged again under the state lock: another River may have kept a newer one meanwhile.
+        state::modify(&self.cfg.data_dir, |st| {
+            if let Some(new) = keyrecord::judge(authority, st.key_record.as_deref(), record) {
+                st.key_record = Some(new);
+            }
+        })
     }
 
     /// Remember what the installed binary is, the first time. It is compared at swap time, and
@@ -317,7 +353,10 @@ impl Updater {
         }
     }
 
-    fn fetch_verified(&self) -> Result<(Vec<u8>, Vec<u8>, manifest::Manifest), String> {
+    fn fetch_verified(
+        &self,
+        key: &[u8; 32],
+    ) -> Result<(Vec<u8>, Vec<u8>, manifest::Manifest), String> {
         let url = &self.cfg.manifest_url;
         let fetch = || -> Result<(Vec<u8>, Vec<u8>), String> {
             let manifest = self.net.get_small(url, manifest::MAX_MANIFEST_BYTES)?;
@@ -327,25 +366,28 @@ impl Updater {
             Ok((manifest, signature))
         };
         let (mut manifest, mut signature) = fetch()?;
-        let mut verified = manifest::verify_and_parse(&manifest, &signature, &self.cfg.pubkey);
+        let mut verified = manifest::verify_and_parse(&manifest, &signature, key);
         if verified == Err(Refusal::BadSignature) {
             // A CDN can serve the new manifest next to the old signature for a short while:
             // fetch both once more before calling it bad.
             std::thread::sleep(self.cfg.retry_delay);
             (manifest, signature) = fetch()?;
-            verified = manifest::verify_and_parse(&manifest, &signature, &self.cfg.pubkey);
+            verified = manifest::verify_and_parse(&manifest, &signature, key);
         }
         let parsed = verified.map_err(|r| r.to_string())?;
         Ok((manifest, signature, parsed))
     }
 
-    /// Fetch and verify the manifest and say whether it offers something newer.
-    pub fn check(&self) -> Result<CheckResult, String> {
-        self.require_key()?;
+    /// Fetch and verify the manifest and say whether it offers something newer. `record` is
+    /// what the node said about the update-key record just now.
+    pub fn check(&self, record: &KeyRecord) -> Result<CheckResult, String> {
         state::try_load(&self.cfg.data_dir)?;
+        self.take_key_record(record)?;
+        let key = self.key(&state::try_load(&self.cfg.data_dir)?);
+        let key = key.inspect_err(|_| *self.checked.lock().unwrap() = None)?;
         self.sweep();
         self.remember_install();
-        let (manifest, signature, parsed) = self.fetch_verified()?;
+        let (manifest, signature, parsed) = self.fetch_verified(&key)?;
         let platform = self.platform()?;
         let now = self.now();
         let verdict = state::modify(&self.cfg.data_dir, |st| {
@@ -408,7 +450,10 @@ impl Updater {
         else {
             return false;
         };
-        let Ok(parsed) = manifest::verify_and_parse(&manifest, &signature, &self.cfg.pubkey) else {
+        let Ok(key) = self.key(st) else {
+            return false;
+        };
+        let Ok(parsed) = manifest::verify_and_parse(&manifest, &signature, &key) else {
             return false;
         };
         let Ok(platform) = self.platform() else {
@@ -430,7 +475,7 @@ impl Updater {
         let parsed = {
             let manifest = fs::read(&staged.manifest).ok()?;
             let signature = fs::read(&staged.signature).ok()?;
-            manifest::verify_and_parse(&manifest, &signature, &self.cfg.pubkey).ok()?
+            manifest::verify_and_parse(&manifest, &signature, &self.key(&st).ok()?).ok()?
         };
         let verdict = manifest::evaluate(
             &parsed,
@@ -449,12 +494,12 @@ impl Updater {
     /// Download the artifact the last [`check`](Updater::check) offered. On success it is on
     /// disk, its size and SHA-256 matching the signed manifest.
     pub fn download(&self, progress: &mut dyn FnMut(u64, u64)) -> Result<Version, String> {
-        self.require_key()?;
         self.require_replaceable()?;
         // Not while another River is applying what is staged: discarding it would pull the
         // files out from under that swap.
         let _lock = Lock::take(&self.dir().join("apply.lock"))?;
         let st = state::try_load(&self.cfg.data_dir)?;
+        self.key(&st)?;
         self.sweep();
         let (offer, manifest_bytes, signature, sequence) = {
             let checked = self.checked.lock().unwrap();
@@ -527,7 +572,6 @@ impl Updater {
     /// binary is installed and the old one keeps running until [`launch`](Updater::launch).
     /// A staged update that fails any check is discarded, so the next check starts clean.
     pub fn apply(&self) -> Result<Applied, String> {
-        self.require_key()?;
         let install_path = self.require_replaceable()?;
         let lock = Lock::take(&self.dir().join("apply.lock"))?;
         let mut st = state::try_load(&self.cfg.data_dir)?;
@@ -569,7 +613,8 @@ impl Updater {
         let read = |p: &Path| fs::read(p).map_err(|e| io("couldn't read the downloaded update", e));
         let manifest_bytes = read(&staged.manifest)?;
         let signature = read(&staged.signature)?;
-        let parsed = manifest::verify_and_parse(&manifest_bytes, &signature, &self.cfg.pubkey)
+        // Judged under the key trusted NOW, not the one that signed it when it was downloaded.
+        let parsed = manifest::verify_and_parse(&manifest_bytes, &signature, &self.key(st)?)
             .map_err(|r| r.to_string())?;
         let verdict = manifest::evaluate(
             &parsed,

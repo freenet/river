@@ -37,7 +37,8 @@ pub use node::{InstallStep, MANUAL_INSTALL_URL, NodeHost, NodeProbe};
 pub use rooms::{Access, RoomsUpdate};
 pub use setup::{Controller, Setup};
 pub use update::{
-    UpdateCheck, UpdateController, UpdateEvent, UpdateHost, UpdateInfo, UpdateStatus, UpdateSupport,
+    KeyRecord, KeyRecordSource, UpdateCheck, UpdateController, UpdateEvent, UpdateHost, UpdateInfo,
+    UpdateStatus, UpdateSupport,
 };
 
 pub struct RiverApp {
@@ -305,6 +306,11 @@ impl RiverApp {
         self.chat.update.support = host.support();
         self.chat.update.auto = auto;
         updates.set_auto(auto);
+        if let Some(link) = &self.link {
+            updates.set_record_source(std::sync::Arc::new(update::NodeRecordSource::new(
+                link.clone(),
+            )));
+        }
         updates.startup();
         updates.start_schedule();
         self.updates = Some(updates);

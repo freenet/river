@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use river_app::{UpdateCheck, UpdateHost, UpdateInfo, UpdateSupport};
+use river_app::{KeyRecord, UpdateCheck, UpdateHost, UpdateInfo, UpdateSupport};
 
+use super::keyrecord;
 use super::manifest::Offer;
 use super::platform::Installer;
 #[cfg(not(target_os = "linux"))]
@@ -57,6 +58,15 @@ fn manifest_override() -> Option<String> {
     None
 }
 
+/// The shipped trust anchor for the update-key record. A file that does not parse is a build
+/// error caught by a test; if it ever happens anyway, no record is read and the compiled-in key
+/// stands, which is what a build without this feature does.
+fn keyrecord_authority() -> Option<keyrecord::Authority> {
+    keyrecord::Authority::shipped()
+        .inspect_err(|e| river_app::diag!("River: not reading the update-key record: {e}"))
+        .ok()
+}
+
 impl DesktopUpdate {
     /// The updater for the running app, or `None` when there is nowhere to keep its state.
     pub fn new() -> Option<Arc<DesktopUpdate>> {
@@ -77,6 +87,7 @@ impl DesktopUpdate {
             handshake_timeout: HANDSHAKE_TIMEOUT,
             floor: super::build_floor(),
             retry_delay: Duration::from_secs(30),
+            key_authority: keyrecord_authority(),
         };
         let updater = Updater::new(cfg, installer());
         // So the swap guard knows what is installed however early an update is applied.
@@ -235,11 +246,12 @@ impl UpdateHost for DesktopUpdate {
         self.updater.take_notice()
     }
 
-    fn check(&self) -> Result<UpdateCheck, String> {
-        if super::is_placeholder(&self.key) {
-            return Err("this build has no update key".into());
-        }
-        Ok(match self.updater.check()? {
+    fn key_record_id(&self) -> Option<[u8; 32]> {
+        self.updater.key_record_id()
+    }
+
+    fn check(&self, record: KeyRecord) -> Result<UpdateCheck, String> {
+        Ok(match self.updater.check(&record)? {
             CheckResult::UpToDate => UpdateCheck::UpToDate,
             CheckResult::Available(offer) => UpdateCheck::Available(info(&offer)),
         })
@@ -265,7 +277,8 @@ pub fn run_cli() -> i32 {
         return 1;
     };
     println!("river {}: checking for an update", u.version());
-    match u.check() {
+    // No node connection here: a record seen by an earlier run still applies.
+    match u.check(KeyRecord::Unavailable) {
         Err(e) => {
             river_app::diag!("river: update refused: {e}");
             1

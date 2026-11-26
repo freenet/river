@@ -31,8 +31,8 @@
 //! The check runs shortly after start and then every 6 to 12 hours (a random delay, so every
 //! install does not ask in the same minute).
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -58,6 +58,28 @@ pub struct UpdateInfo {
     pub required: bool,
 }
 
+/// What the node said about River's update-key record (see the desktop shell's
+/// `update/keyrecord.rs`) when the host asked for it. The bytes are the raw record: this
+/// crate never judges them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeyRecord {
+    /// The state the node served.
+    State(Vec<u8>),
+    /// The node answered that it has no such contract.
+    Absent,
+    /// No node to ask (no grant yet), no answer in time, or an error.
+    Unavailable,
+}
+
+/// Fetches the update-key record from the node.
+pub trait KeyRecordSource: Send + Sync + 'static {
+    /// The state at contract `id`, waiting at most `wait`.
+    fn fetch(&self, id: [u8; 32], wait: Duration) -> KeyRecord;
+}
+
+/// How long a check waits for the update-key record before going on without it.
+const KEY_RECORD_WAIT: Duration = Duration::from_secs(5);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UpdateCheck {
     UpToDate,
@@ -81,8 +103,13 @@ pub trait UpdateHost: Send + Sync + 'static {
     fn take_notice(&self) -> Option<String> {
         None
     }
-    /// Fetch and verify the signed manifest.
-    fn check(&self) -> Result<UpdateCheck, String>;
+    /// The contract id of the update-key record, or `None` when this host has none. The
+    /// controller fetches it from the node and passes what it found to [`Self::check`].
+    fn key_record_id(&self) -> Option<[u8; 32]> {
+        None
+    }
+    /// Fetch and verify the signed manifest, under the update key `record` leaves trusted.
+    fn check(&self, record: KeyRecord) -> Result<UpdateCheck, String>;
     /// Download and verify what the last check offered, reporting `(received, total)`.
     /// Returns the version now ready.
     fn download(&self, progress: &mut dyn FnMut(u64, u64)) -> Result<String, String>;
@@ -148,6 +175,7 @@ pub struct UpdateController {
     report: Arc<dyn Fn(UpdateEvent) + Send + Sync>,
     busy: Arc<AtomicBool>,
     auto: Arc<AtomicBool>,
+    records: Arc<Mutex<Option<Arc<dyn KeyRecordSource>>>>,
 }
 
 impl UpdateController {
@@ -161,7 +189,38 @@ impl UpdateController {
             report: Arc::new(report),
             busy: Arc::new(AtomicBool::new(false)),
             auto: Arc::new(AtomicBool::new(auto)),
+            records: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Where to read the update-key record before each check. Without one every check goes
+    /// ahead on what the host already knows (the record seen by an earlier check, else its
+    /// compiled-in key).
+    pub fn set_record_source(&self, source: Arc<dyn KeyRecordSource>) {
+        *self
+            .records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(source);
+    }
+
+    /// The update-key record, right now, within [`KEY_RECORD_WAIT`]: a node that is slow or
+    /// not there must not delay the check.
+    fn key_record(&self) -> KeyRecord {
+        let Some(id) = self.host.key_record_id() else {
+            return KeyRecord::Unavailable;
+        };
+        let Some(source) = self
+            .records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        else {
+            return KeyRecord::Unavailable;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || drop(tx.send(source.fetch(id, KEY_RECORD_WAIT))));
+        rx.recv_timeout(KEY_RECORD_WAIT + Duration::from_secs(2))
+            .unwrap_or(KeyRecord::Unavailable)
     }
 
     pub fn host(&self) -> &Arc<dyn UpdateHost> {
@@ -243,7 +302,7 @@ impl UpdateController {
 
     fn check_and_fetch(&self) {
         self.status(UpdateStatus::Checking);
-        match self.host.check() {
+        match self.host.check(self.key_record()) {
             Ok(UpdateCheck::UpToDate) => self.status(UpdateStatus::UpToDate),
             Ok(UpdateCheck::Available(info)) => {
                 let fetch = self.auto.load(Ordering::SeqCst)
@@ -473,7 +532,7 @@ mod tests {
         fn confirm_started(&self) {
             self.confirms.fetch_add(1, Ordering::SeqCst);
         }
-        fn check(&self) -> Result<UpdateCheck, String> {
+        fn check(&self, _: KeyRecord) -> Result<UpdateCheck, String> {
             self.check_calls.fetch_add(1, Ordering::SeqCst);
             self.checks
                 .lock()
@@ -1189,5 +1248,41 @@ mod tests {
             version: "0.2.161".into(),
         });
         assert_eq!(host.confirms.load(Ordering::SeqCst), 1);
+    }
+}
+
+/// Reads the update-key record from the node the rooms link follows, with the grant it holds:
+/// a GET without code or subscription, as the generation watch reads its records.
+pub struct NodeRecordSource {
+    link: crate::rooms::Link,
+}
+
+impl NodeRecordSource {
+    pub fn new(link: crate::rooms::Link) -> Self {
+        NodeRecordSource { link }
+    }
+}
+
+impl KeyRecordSource for NodeRecordSource {
+    fn fetch(&self, id: [u8; 32], wait: Duration) -> KeyRecord {
+        use crate::rooms::generation::{Fetch, NodePointers, PointerSource};
+        // No saved grant yet (first run, not approved): nothing to ask with.
+        let Some((authority, token)) = self.link.node_access() else {
+            return KeyRecord::Unavailable;
+        };
+        let id = freenet_stdlib::prelude::ContractInstanceId::new(id);
+        let answer = Mutex::new(KeyRecord::Unavailable);
+        NodePointers.fetch(&authority, &token, &[id], wait, &|_, fetch| {
+            *answer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = match fetch {
+                Fetch::State(bytes) => KeyRecord::State(bytes),
+                Fetch::Absent => KeyRecord::Absent,
+                Fetch::Unreachable => KeyRecord::Unavailable,
+            };
+        });
+        answer
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
