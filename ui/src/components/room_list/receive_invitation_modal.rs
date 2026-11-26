@@ -688,6 +688,72 @@ fn dismiss_invitation_persistently(inv: &Invitation, mut invitation: Signal<Opti
     invitation.set(None);
 }
 
+/// Shown when an `?invitation=` code does not decode, usually because the link
+/// was cut short when it was copied or sent.
+pub(crate) const DAMAGED_INVITATION_MESSAGE: &str = "This invitation link looks incomplete or \
+     damaged. Ask the person who sent it for a new one.";
+
+/// What an invitation code taken from a link (the address bar or a clicked
+/// link) turned out to hold.
+pub(crate) enum InvitationCode {
+    Valid(Invitation),
+    /// The code does not decode. The user must be told: ignoring it leaves
+    /// them looking at an empty room list with no idea why.
+    Damaged,
+}
+
+pub(crate) fn classify_invitation_code(code: &str) -> InvitationCode {
+    match Invitation::from_encoded_string(code) {
+        Ok(invitation) => InvitationCode::Valid(invitation),
+        Err(e) => {
+            warn!(
+                "Invitation code does not decode: {} (len {})",
+                e,
+                code.len()
+            );
+            InvitationCode::Damaged
+        }
+    }
+}
+
+/// Tells the user an invitation link could not be read. Same layout and
+/// error styling as the "Failed to retrieve room" state of
+/// [`ReceiveInvitationModal`].
+#[component]
+pub fn DamagedInvitationModal(open: Signal<bool>) -> Element {
+    if !*open.read() {
+        return rsx! {};
+    }
+
+    rsx! {
+        div {
+            class: "fixed inset-0 z-50 flex items-center justify-center",
+            div { class: "absolute inset-0 bg-black/50" }
+            div {
+                "data-testid": "damaged-invitation-modal",
+                class: "relative z-10 w-full max-w-md mx-4 bg-panel rounded-xl shadow-xl border border-border",
+                div {
+                    class: "p-6",
+                    h1 { class: "text-[16px] font-semibold text-text mb-4", "Invitation Received" }
+                    div {
+                        class: "bg-error-bg border-l-[3px] border-danger rounded-lg p-4",
+                        p { class: "mb-4 text-text", "{DAMAGED_INVITATION_MESSAGE}" }
+                        button {
+                            "data-testid": "damaged-invitation-dismiss-button",
+                            class: "px-4 py-2 bg-surface hover:bg-surface-hover border border-border-hover text-text font-medium rounded-lg transition-colors",
+                            // Deferred per the signal-safety rules for event handlers.
+                            onclick: move |_| {
+                                crate::util::defer(move || open.set(false));
+                            },
+                            "Dismiss"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Main component for the invitation modal
 #[component]
 pub fn ReceiveInvitationModal(invitation: Signal<Option<Invitation>>) -> Element {
@@ -1639,6 +1705,44 @@ mod tests {
             invitee: owner_invited_member(&owner_sk, invitee_sk.verifying_key()),
             room_secrets: vec![(0u32, [9u8; 32])],
         }
+    }
+
+    /// A link whose `?invitation=` code does not decode must produce a
+    /// user-visible "damaged link" outcome, never silence. The truncated case
+    /// is the field report: a phone opened a link cut to 298 of 478
+    /// characters, and the UI showed only an empty room list.
+    #[test]
+    fn a_damaged_invitation_code_is_reported_not_ignored() {
+        let code = an_invitation(7).to_encoded_string();
+        assert!(matches!(
+            classify_invitation_code(&code),
+            InvitationCode::Valid(_)
+        ));
+
+        let truncated = &code[..code.len() * 298 / 478];
+        for damaged in [truncated, "not-an-invitation!", "0OIl", "", "   "] {
+            assert!(
+                matches!(classify_invitation_code(damaged), InvitationCode::Damaged),
+                "code {damaged:?} must be reported as damaged"
+            );
+        }
+    }
+
+    /// Both entry points (the address bar and an in-app link click) must turn
+    /// an undecodable code into the damaged-link message. Neither can run
+    /// under a host unit test (they read `window`), so pin the wiring.
+    #[test]
+    fn both_invitation_entry_points_report_a_damaged_code() {
+        let app = include_str!("../app.rs");
+        assert!(
+            app.matches("InvitationCode::Damaged").count() >= 2,
+            "app.rs must handle InvitationCode::Damaged for both the URL and \
+             the intercepted-click invitation paths"
+        );
+        assert!(
+            app.contains("DamagedInvitationModal"),
+            "app.rs must mount DamagedInvitationModal"
+        );
     }
 
     /// THE property the startup adopt hook exists for, driven end to end.
