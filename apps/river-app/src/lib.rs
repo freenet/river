@@ -2036,6 +2036,39 @@ pub const SCENES: &[Scene] = &[
     // top, and a member whose inviter left, listed last), then searched: with matches, and
     // with none.
     ("chat-members-tree", |s| members_scene(s, None)),
+    // A member whose name imitates the owner's (a Cyrillic "а"), with a message: the warning
+    // beside their name in the list and on their author line.
+    ("chat-similar-name", |s| {
+        use chat::model::{Member, Message, Role};
+        connect(s);
+        s.chat.edit_rooms(|rooms| {
+            let room = &mut rooms[0];
+            let owner = room
+                .members
+                .iter()
+                .find(|m| m.role == Role::Owner)
+                .map(|m| m.id);
+            let mut m = Member::new(70, "M\u{0430}ya Chen", Role::Member);
+            m.invited_by = owner;
+            room.members.push(m);
+            let last = room.messages.last();
+            let (id, time) = (last.map_or(0, |m| m.id) + 1, last.map_or(0, |m| m.time));
+            room.messages.push(Message {
+                id,
+                key: format!("similar-{id}"),
+                author: 70,
+                time,
+                text: "Hi all, I just joined.".into(),
+                source: String::new(),
+                md: String::new(),
+                reply_to: None,
+                reply_gone: false,
+                reactions: Vec::new(),
+                edited: false,
+                pending: None,
+            });
+        });
+    }),
     ("chat-members-search", |s| members_scene(s, Some("an"))),
     ("chat-members-search-none", |s| {
         members_scene(s, Some("zzz"))
