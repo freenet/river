@@ -689,21 +689,40 @@ fn viewed_for_owner(owner_vk: VerifyingKey) -> ViewedRoom {
     }
 }
 
+/// Whether the viewer still shows the short link `handle`: `Err` when the
+/// signal is busy, so the caller tries again instead of dropping the update.
+fn still_viewing_handle(handle: crate::short_handle::ShortHandle) -> Result<bool, ()> {
+    VIEWED_ROOM
+        .try_read()
+        .map(|v| v.as_ref().and_then(|r| r.handle) == Some(handle))
+        .map_err(|_| ())
+}
+
+/// Run `apply` in a deferred context if the viewer still shows `handle`. A busy
+/// signal re-defers (a few times) rather than losing an answer: the resolver
+/// mirror is already settled, so nothing else would re-arm it.
+fn apply_if_viewing_handle(
+    handle: crate::short_handle::ShortHandle,
+    attempts: u8,
+    apply: impl FnOnce() + 'static,
+) {
+    crate::util::defer(move || match still_viewing_handle(handle) {
+        Ok(true) => apply(),
+        Ok(false) => {}
+        Err(()) if attempts > 0 => apply_if_viewing_handle(handle, attempts - 1, apply),
+        Err(()) => {}
+    });
+}
+
 /// Show a status for the short link being resolved. Called by
 /// [`crate::short_resolve`] after it has recorded the status itself.
 pub fn show_handle_status(handle: crate::short_handle::ShortHandle, status: ViewedRoomStatus) {
-    crate::util::defer(move || {
-        let still_viewed = VIEWED_ROOM
-            .try_read()
-            .ok()
-            .is_some_and(|v| v.as_ref().and_then(|r| r.handle) == Some(handle));
-        if still_viewed {
-            *VIEWED_ROOM.write() = Some(ViewedRoom {
-                owner_vk: None,
-                handle: Some(handle),
-                status,
-            });
-        }
+    apply_if_viewing_handle(handle, 20, move || {
+        *VIEWED_ROOM.write() = Some(ViewedRoom {
+            owner_vk: None,
+            handle: Some(handle),
+            status,
+        });
     });
 }
 
@@ -711,15 +730,9 @@ pub fn show_handle_status(handle: crate::short_handle::ShortHandle, status: View
 /// as if it had been opened on `?room=<key>`, so the room lookup, held answers,
 /// the user's-own-room redirect and subscription are all the existing ones.
 pub fn open_resolved(handle: crate::short_handle::ShortHandle, owner_vk: VerifyingKey) {
-    crate::util::defer(move || {
-        let still_viewed = VIEWED_ROOM
-            .try_read()
-            .ok()
-            .is_some_and(|v| v.as_ref().and_then(|r| r.handle) == Some(handle));
-        if still_viewed {
-            let viewed = viewed_for_owner(owner_vk);
-            *VIEWED_ROOM.write() = Some(viewed);
-        }
+    apply_if_viewing_handle(handle, 20, move || {
+        let viewed = viewed_for_owner(owner_vk);
+        *VIEWED_ROOM.write() = Some(viewed);
     });
 }
 

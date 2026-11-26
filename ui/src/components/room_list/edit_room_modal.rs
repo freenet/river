@@ -976,13 +976,14 @@ pub(super) fn ConfigError(error: Option<String>) -> Element {
 }
 
 /// "Copy short link" (freenet/river#973), a secondary action under the full
-/// public link. It appears only once a bounded lookup (one GET, no retry, 15 s)
-/// has found the room's resolver entry and verified it; otherwise nothing is
+/// public link. It appears only once a bounded lookup (one GET, no retry)
+/// has found the room's resolver entry and verified it (a late answer still counts); otherwise nothing is
 /// shown. The full link above stays the default share link.
 #[component]
 fn ShortLinkCopy(owner_vk: VerifyingKey) -> Element {
     // Once per mount, off the render path: the request is spawned.
     use_hook(move || crate::short_resolve::request_check(owner_vk));
+    crate::util::signal_guard::anchor();
     let published = match crate::short_resolve::PUBLISHED.try_read() {
         Ok(p) => p.contains(&owner_vk),
         Err(_) => {

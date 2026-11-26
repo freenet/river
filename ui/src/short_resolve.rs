@@ -35,8 +35,6 @@ use std::time::Duration;
 /// Same rules as the room lookup: one retry after 7 s, give up after 20 s.
 const RESOLVE_RETRY_AFTER: Duration = Duration::from_secs(7);
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(20);
-/// The share-link existence check sends one GET and waits this long.
-const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 /// A check that found nothing is repeated after this long, when the share
 /// dialog is opened again.
 const CHECK_RECHECK_AFTER_MS: f64 = 60_000.0;
@@ -91,7 +89,7 @@ pub fn end() {
     GEN.fetch_add(1, Ordering::SeqCst);
 }
 
-/// Resolver GETs sent by this page, for the "a full link sends no extra
+/// Resolver lookups this page started (each `request` and `request_check`), for the "a full link sends no extra
 /// lookup" pin.
 static LOOKUPS_SENT: AtomicU32 = AtomicU32::new(0);
 
@@ -337,7 +335,6 @@ pub fn deliver_error(error_text: &str) {
 fn send_get(id: ContractInstanceId) {
     use crate::components::app::WEB_API;
     use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
-    LOOKUPS_SENT.fetch_add(1, Ordering::SeqCst);
     crate::util::safe_spawn_local(async move {
         let request = ClientRequest::ContractOp(ContractRequest::Get {
             key: id,
@@ -357,7 +354,6 @@ fn send_get(id: ContractInstanceId) {
 /// enough for the loading state to be seen.
 #[cfg(feature = "no-sync")]
 fn send_get(id: ContractInstanceId) {
-    LOOKUPS_SENT.fetch_add(1, Ordering::SeqCst);
     #[cfg(all(target_arch = "wasm32", feature = "example-data"))]
     crate::util::safe_spawn_local(async move {
         crate::util::sleep(Duration::from_millis(1200)).await;
@@ -379,6 +375,7 @@ fn send_get(id: ContractInstanceId) {
 /// answered after [`RESOLVE_RETRY_AFTER`], and time out after
 /// [`RESOLVE_TIMEOUT`] (the same rules as the room lookup).
 pub fn request(handle: ShortHandle) {
+    LOOKUPS_SENT.fetch_add(1, Ordering::SeqCst);
     let Some(id) = with_mirror(|m| {
         m.requested = true;
         m.id
@@ -448,6 +445,7 @@ pub fn is_published(owner: &VerifyingKey) -> bool {
 /// published only if it exists and verifies. Anything else (not found, error,
 /// timeout) leaves the short link unoffered. Safe to call on every render.
 pub fn request_check(owner: VerifyingKey) {
+    LOOKUPS_SENT.fetch_add(1, Ordering::SeqCst);
     let now = crate::public_room::now_ms_pub();
     {
         let mut at = CHECKED_AT.lock().unwrap_or_else(|e| e.into_inner());
@@ -467,13 +465,11 @@ pub fn request_check(owner: VerifyingKey) {
         .unwrap_or_else(|e| e.into_inner())
         .get_or_insert_with(HashMap::new)
         .insert(id, Pending { owner, handle });
+    // The entry stays pending until answered, on purpose: a late answer is
+    // still verified and still enables the link, and it must not fall through
+    // to the room handlers as an unknown contract. Pending ids are bounded by
+    // the number of rooms checked.
     send_get(id);
-    crate::util::safe_spawn_local(async move {
-        crate::util::sleep(CHECK_TIMEOUT).await;
-        if let Some(map) = PENDING.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-            map.remove(&id);
-        }
-    });
 }
 
 fn take_pending(id: &ContractInstanceId) -> Option<Pending> {
@@ -696,6 +692,54 @@ mod tests {
             &minimal_state(vk_of(5).as_bytes())
         ));
         assert!(!check_proves_entry(&h, &owner, b"junk"));
+    }
+
+    /// The three call sites that feed real network answers in. The fixture
+    /// answers call `deliver_*` directly, so nothing else would notice one
+    /// being deleted or moved behind the room handlers (which would treat a
+    /// resolver's answer as an unknown contract).
+    #[test]
+    fn the_response_handlers_offer_answers_to_the_resolver_first() {
+        use crate::util::strip_comments;
+        let get = strip_comments(include_str!(
+            "components/app/freenet_api/response_handler/get_response.rs"
+        ));
+        for (ours, theirs) in [
+            (
+                "short_resolve::deliver_state(",
+                "public_room::deliver_state(",
+            ),
+            (
+                "short_resolve::deliver_not_found(",
+                "public_room::deliver_not_found(",
+            ),
+        ] {
+            let a = get
+                .find(ours)
+                .unwrap_or_else(|| panic!("{ours} is not called"));
+            let b = get
+                .find(theirs)
+                .unwrap_or_else(|| panic!("{theirs} is not called"));
+            assert!(a < b, "{ours} must come before {theirs}");
+        }
+        let sync = strip_comments(include_str!(
+            "components/app/freenet_api/freenet_synchronizer.rs"
+        ));
+        assert!(
+            sync.contains("short_resolve::deliver_error("),
+            "node errors must reach the resolver"
+        );
+    }
+
+    /// An entry proved by a different key must not enable the short link: the
+    /// check's delivery has to go through `check_proves_entry`.
+    #[test]
+    fn the_check_delivery_verifies_before_it_publishes() {
+        let src = crate::util::strip_comments(include_str!("short_resolve.rs"));
+        let body = &src[src.find("fn check_deliver").unwrap()..];
+        let verify = body.find("check_proves_entry(").unwrap();
+        let publish = body.find("PUBLISHED.write()").unwrap();
+        assert!(verify < publish);
     }
 
     #[test]

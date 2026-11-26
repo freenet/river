@@ -43,6 +43,15 @@ test("a short link nobody registered says so", async ({ page }) => {
   );
   await expect(page.getByTestId("viewed-room-retry")).toBeVisible();
   await expect(page.getByTestId("viewed-room-message")).toHaveCount(0);
+  expect(await callRiverTest(page, "resolverLookups")).toBe(1);
+
+  // Try again asks again: once the entry exists, the same page opens the room.
+  const owner = await callRiverTest(page, "viewableRoomKey", "missing");
+  expect(await callRiverTest(page, "publishShortEntry", owner)).toBe(true);
+  await page.getByTestId("viewed-room-retry").click();
+  await expect(page.getByTestId("viewed-room-resolving")).toBeVisible();
+  expect(await callRiverTest(page, "resolverLookups")).toBe(2);
+  await expect(page.getByTestId("viewed-room-not-found")).toBeVisible();
   expect(panics).toEqual([]);
 });
 
