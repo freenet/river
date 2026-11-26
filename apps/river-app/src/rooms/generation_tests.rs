@@ -329,6 +329,10 @@ pub(crate) struct FakePointers {
     /// Pointers that never answer: the fetch waits out its whole `wait` for them.
     pub silent: Mutex<Vec<ContractInstanceId>>,
     pub fetches: AtomicUsize,
+    /// Fetches entered, and fetches returned. `deliver` runs inside a fetch, so once a fetch
+    /// has returned, everything its answers caused (the kept record) has happened.
+    pub started: AtomicUsize,
+    pub finished: AtomicUsize,
 }
 
 impl PointerSource for FakePointers {
@@ -340,6 +344,7 @@ impl PointerSource for FakePointers {
         wait: Duration,
         deliver: &dyn Fn(ContractInstanceId, Fetch),
     ) {
+        self.started.fetch_add(1, Ordering::SeqCst);
         let delay = *self.delay.lock().unwrap();
         std::thread::sleep(delay);
         self.fetches.fetch_add(1, Ordering::SeqCst);
@@ -357,6 +362,27 @@ impl PointerSource for FakePointers {
         if !silent.is_empty() {
             std::thread::sleep(wait);
         }
+        self.finished.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Wait until every fetch that has started has returned. `settle` can return as soon as the
+/// gate closes, which `judge_one` does before it keeps the record; the keep runs inside the
+/// fetch, so a test that reads the kept file must wait for the fetch to finish. Fails the
+/// test, rather than hanging, if a fetch has not returned in 10 seconds.
+fn wait_for_fetches(source: &FakePointers) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let started = source.started.load(Ordering::SeqCst);
+        if source.finished.load(Ordering::SeqCst) >= started {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{started} fetch(es) started but {} returned within 10s",
+            source.finished.load(Ordering::SeqCst)
+        );
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -422,6 +448,7 @@ fn a_newer_delegate_closes_the_gate_and_is_kept() {
     assert!(watch.is_stale());
     assert!(watch.gate().is_closed());
     assert!(!watch.writes_allowed(&pace()));
+    wait_for_fetches(&source);
     assert_eq!(
         std::fs::read(dir.join("newer-river.river.chat-delegate")).unwrap(),
         delegate_state(2)
