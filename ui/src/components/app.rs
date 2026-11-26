@@ -1,6 +1,7 @@
 pub mod chat_delegate;
 pub mod document_title;
 pub mod freenet_api;
+pub mod legacy_sweep_marker;
 pub mod notifications;
 pub mod receive_times;
 pub mod sync_info;

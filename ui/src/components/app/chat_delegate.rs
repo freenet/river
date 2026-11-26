@@ -11528,7 +11528,11 @@ pub(crate) fn on_load_worker_settled() {
         match settle_terminal(room_count_zero, saw) {
             Some(state) => write_load_state_now(state),
             None if room_count_zero => schedule_idle_resolution(armed_gen, armed_attempt),
-            None => {} // rooms present → List renders, leave the state
+            None => {
+                // Rooms present → List renders, leave the state. A user with
+                // rooms is not a "swept, found nothing" user.
+                super::legacy_sweep_marker::clear_marker_now();
+            }
         }
     });
 }
@@ -11553,7 +11557,16 @@ fn schedule_idle_resolution(armed_gen: u32, armed_attempt: u32) {
             let resolved = if SAW_FETCH_FAILURE.load(Ordering::Relaxed) {
                 RoomsLoadState::LoadFailed
             } else {
-                RoomsLoadState::Loaded // genuine Empty after quiescence
+                // Genuine Empty after quiescence. If the legacy sweep that ran
+                // proved every generation empty, remember it so later loads
+                // skip the sweep (freenet/river#972).
+                super::legacy_sweep_marker::write_marker_if_sweep_proved_empty(
+                    SWEEP_EPOCH.load(Ordering::Relaxed),
+                    cur_attempt,
+                    false,
+                    true,
+                );
+                RoomsLoadState::Loaded
             };
             write_load_state_now(resolved);
         });
@@ -11685,6 +11698,8 @@ pub(crate) fn retry_rooms_load() {
     // starting over it; both capped by `MAX_SWEEP_REARMS`). Set
     // BEFORE the re-setup so `fire_legacy_migration_request` sees it cleared.
     LEGACY_MIGRATION_ATTEMPTED.store(false, Ordering::Relaxed);
+    // A user retrying wants a real sweep, whatever an earlier one concluded.
+    super::legacy_sweep_marker::clear_marker_now();
     crate::util::safe_spawn_local(async {
         // set_up_chat_delegate_registering begins the fresh attempt AND
         // re-registers up front (freenet/river#757: a normal setup lists first
@@ -11879,6 +11894,8 @@ pub(crate) fn arm_legacy_migration_recovery() -> bool {
         return false;
     }
     LEGACY_MIGRATION_ATTEMPTED.store(false, Ordering::Relaxed);
+    // An interrupted migration means data exists: the marker is wrong.
+    super::legacy_sweep_marker::clear_marker_now();
     true
 }
 
@@ -11901,6 +11918,15 @@ pub(crate) fn arm_legacy_migration_recovery() -> bool {
 /// (probes fired — a migration might still arrive) or resolve to `Loaded`
 /// (nothing more is coming) — see [`load_state_after_probe_legacy`].
 pub(crate) async fn fire_legacy_migration_request() -> bool {
+    // A previous sweep of exactly this node and generation set proved every
+    // generation empty (freenet/river#972): nothing to find, so resolve as a
+    // sweep that found nothing. Checked before the per-session guard so a
+    // matching marker never consumes it. Any storage trouble reads as "no
+    // marker" and the sweep runs.
+    if super::legacy_sweep_marker::marker_matches_now() {
+        info!("Legacy sweep already found nothing for this node and delegate set, skipping");
+        return false;
+    }
     // Only attempt migration once per session to avoid error spam on reconnect.
     // If the legacy delegates aren't installed, retrying won't help. The one
     // exception: a sweep still pacing its waves for an EARLIER load attempt
@@ -11927,6 +11953,7 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
     // Marked before the first send, so an attempt that begins meanwhile sees
     // this sweep as an earlier attempt's and starts its own.
     SWEEP_RUNNING_FOR.store(attempt.wrapping_add(1), Ordering::Relaxed);
+    super::legacy_sweep_marker::begin_sweep(epoch, attempt);
 
     info!(
         "Attempting to migrate data from {} legacy delegate(s)",
@@ -11995,6 +12022,9 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
     }
 
     let rest: Vec<Vec<usize>> = waves.collect();
+    if rest.is_empty() && load_attempt_is_current(attempt) {
+        super::legacy_sweep_marker::note_all_waves_sent(epoch);
+    }
     if rest.is_empty() || !load_attempt_is_current(attempt) {
         // Done; or a reconnect began a new attempt during the first wave, so
         // that attempt sweeps instead (no task: its worker would hold the NEW
@@ -12009,6 +12039,8 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
     crate::util::safe_spawn_local(async move {
         let _worker = worker;
         let mut wave = wave;
+        // Set when this sweep stops sending before its last wave is out.
+        let mut cut_short = false;
         for generations in rest {
             await_sweep_wave(wave).await;
             disarm_sweep_wave(wave);
@@ -12039,6 +12071,7 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
                     // Superseded, or the attempt changed, mid-wave: send no
                     // more of it (the stop after the loop or at the next
                     // wave decides the rest).
+                    cut_short = true;
                     break;
                 }
                 failed |= send_sweep_generation(i, attempt, wave).await.failed;
@@ -12056,6 +12089,9 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
         // while it was out (its replies may have gone down with the socket).
         await_sweep_wave(wave).await;
         disarm_sweep_wave(wave);
+        if !cut_short && load_attempt_is_current(attempt) {
+            super::legacy_sweep_marker::note_all_waves_sent(epoch);
+        }
         stop_sweep(epoch, !load_attempt_is_current(attempt));
     });
 

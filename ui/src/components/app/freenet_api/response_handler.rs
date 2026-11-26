@@ -165,6 +165,9 @@ impl ResponseHandler {
                         // Core 0.2.136 and earlier answer a delegate it does
                         // not have with an empty reply: still an answer.
                         crate::components::app::chat_delegate::note_sweep_answer(key.bytes());
+                        crate::components::app::legacy_sweep_marker::note_legacy_absent(
+                            key.bytes(),
+                        );
                     }
                 }
 
@@ -219,6 +222,12 @@ impl ResponseHandler {
                                 {
                                     crate::components::app::chat_delegate::note_sweep_answer(
                                         responding_delegate.bytes(),
+                                    );
+                                }
+                                if is_legacy_delegate {
+                                    crate::components::app::legacy_sweep_marker::note_legacy_reply(
+                                        responding_delegate.bytes(),
+                                        &response,
                                     );
                                 }
                                 // Summary, NOT the full Debug. This single call site was
