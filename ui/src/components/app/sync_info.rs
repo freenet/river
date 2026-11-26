@@ -8,6 +8,7 @@ use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::prelude::tracing::info;
 use freenet_stdlib::prelude::ContractInstanceId;
 use river_core::room_state::member::MemberId;
+use river_core::room_state::message::MessageId;
 use river_core::ChatRoomStateV1;
 use std::collections::{HashMap, HashSet};
 
@@ -115,6 +116,31 @@ pub struct RoomSyncInfo {
     /// again. An extra request costs nothing, since a pass compares against
     /// the last synced state.
     pub update_held: bool,
+    /// This client sent a request that registers a subscription for the room
+    /// (a PUT or GET with `subscribe: true`) during its current `Subscribing`
+    /// spell. The node delivers an `UpdateNotification` only to a client it
+    /// holds a subscription for, so the first notification for the room's
+    /// own key, with this set, proves the subscription before any reply
+    /// arrives ([`SyncInfo::notification_proves_subscription`]). Cleared by
+    /// every status change, so it never outlives the spell it was set in.
+    pub subscribe_requested: bool,
+    /// A synced room whose subscription went unanswered is retried with a
+    /// growing pause, so a node that never replies is not sent the whole room
+    /// every `REPUT_DELAY_MS` for ever. Retries wait until this time (ms);
+    /// cleared when the room reaches `Subscribed` and on a reconnect.
+    pub retry_not_before: Option<f64>,
+}
+
+/// The longest pause between retries of an unanswered subscription (10 min).
+pub const MAX_RETRY_PAUSE_MS: f64 = 600_000.0;
+
+/// The pause before retrying a room whose `failures`-th subscription attempt
+/// went unanswered: none after the first, then 20 s, 60 s, 140 s... doubling
+/// the whole period (timeout plus pause) up to [`MAX_RETRY_PAUSE_MS`].
+pub fn retry_pause_ms(failures: u32) -> f64 {
+    let doublings = failures.saturating_sub(1).min(20);
+    let period = REPUT_DELAY_MS as f64 * (1u64 << doublings) as f64;
+    (period - REPUT_DELAY_MS as f64).min(MAX_RETRY_PAUSE_MS - REPUT_DELAY_MS as f64)
 }
 
 impl SyncInfo {
@@ -145,6 +171,8 @@ impl SyncInfo {
                 subscribe_get_in_flight: false,
                 needs_seed_put: false,
                 update_held: false,
+                subscribe_requested: false,
+                retry_not_before: None,
             });
 
             self.instances.insert(*contract_id, owner_key);
@@ -163,6 +191,9 @@ impl SyncInfo {
 
     pub fn update_sync_status(&mut self, owner_key: &VerifyingKey, status: RoomSyncStatus) {
         if let Some(sync_info) = self.map.get_mut(owner_key) {
+            // A request belongs to one Subscribing spell; the caller notes the
+            // new one after the status is set (`note_subscribe_requested`).
+            sync_info.subscribe_requested = false;
             // Track when subscription starts for timeout detection
             if status == RoomSyncStatus::Subscribing {
                 sync_info.subscribing_since = Some(now_ms());
@@ -179,10 +210,97 @@ impl SyncInfo {
                 // the upload (freenet/river#757).
                 sync_info.subscribe_get_in_flight = false;
                 sync_info.needs_seed_put = false;
+                sync_info.retry_not_before = None;
                 self.known_on_network.insert(*owner_key);
             }
             sync_info.sync_status = status;
         }
+    }
+
+    /// Record a skipped local change, as a pass does (`room_needs_update`).
+    /// For the test hooks, which set up a held room without a pass.
+    #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+    pub(crate) fn hold_update_for_test(&mut self, owner_key: &VerifyingKey) {
+        if let Some(info) = self.map.get_mut(owner_key) {
+            info.update_held = true;
+        }
+    }
+
+    /// Record that a request registering a subscription for `owner_key`'s
+    /// room was sent in its current `Subscribing` spell. Call after the
+    /// status is set to `Subscribing`.
+    pub fn note_subscribe_requested(&mut self, owner_key: &VerifyingKey) {
+        if let Some(sync_info) = self.map.get_mut(owner_key) {
+            sync_info.subscribe_requested = true;
+        }
+    }
+
+    /// Whether an `UpdateNotification` for this room's own contract key proves
+    /// the subscription: the room is `Subscribing` and we sent our own
+    /// subscribing request for it. A room we never asked to subscribe to is
+    /// never proven this way.
+    pub fn notification_proves_subscription(&self, owner_key: &VerifyingKey) -> bool {
+        self.map.get(owner_key).is_some_and(|info| {
+            // An outstanding subscribe GET must be answered by its own reply:
+            // that reply sets the baseline and pushes what the network lacks
+            // (`complete_subscribe_get`, freenet/river#757).
+            info.sync_status == RoomSyncStatus::Subscribing
+                && info.subscribe_requested
+                && !info.subscribe_get_in_flight
+        })
+    }
+
+    /// Whether the room has been `Subscribing` for at least `REPUT_DELAY_MS`
+    /// at `now` (ms), so the pass that evaluates it must count a failed attempt.
+    pub(crate) fn subscribing_timed_out(&self, owner_key: &VerifyingKey, now: f64) -> bool {
+        self.map.get(owner_key).is_some_and(|info| {
+            info.sync_status == RoomSyncStatus::Subscribing
+                && info
+                    .subscribing_since
+                    .is_some_and(|started_at| now - started_at >= REPUT_DELAY_MS as f64)
+        })
+    }
+
+    /// Whether a sync pass skipped a local change of the room that is still unsent.
+    pub fn has_held_update(&self, owner_key: &VerifyingKey) -> bool {
+        self.map.get(owner_key).is_some_and(|info| info.update_held)
+    }
+
+    /// The user's own chat messages in `state` that have not been sent: a
+    /// sync pass skipped them (`update_held`) and the last synced state lacks
+    /// them. Joins and other events do not count. The flag is true when the
+    /// room is in `Error`, where they will not go out by themselves. Empty
+    /// when nothing is held or the room has no baseline (an invited room gets
+    /// one when its PUT is sent: [`invite_put_sent`]).
+    pub fn held_messages(
+        &self,
+        owner_key: &VerifyingKey,
+        state: &ChatRoomStateV1,
+        author: MemberId,
+    ) -> (HashSet<MessageId>, bool) {
+        let Some(info) = self.map.get(owner_key) else {
+            return Default::default();
+        };
+        let (true, Some(baseline)) = (info.update_held, info.last_synced_state.as_ref()) else {
+            return Default::default();
+        };
+        let sent: HashSet<_> = baseline
+            .recent_messages
+            .messages
+            .iter()
+            .map(|m| m.id())
+            .collect();
+        let held = state
+            .recent_messages
+            .display_messages()
+            .filter(|m| {
+                m.message.author == author
+                    && !m.message.content.is_event()
+                    && !sent.contains(&m.id())
+            })
+            .map(|m| m.id())
+            .collect();
+        (held, matches!(info.sync_status, RoomSyncStatus::Error(_)))
     }
 
     /// Mark the room `Subscribed`. Returns whether a local change skipped
@@ -337,6 +455,10 @@ impl SyncInfo {
         for key in &stale {
             self.update_sync_status(key, RoomSyncStatus::Disconnected);
         }
+        // A new connection is a fresh start: no room waits out an old pause.
+        for info in self.map.values_mut() {
+            info.retry_not_before = None;
+        }
         stale.len()
     }
 
@@ -367,11 +489,25 @@ impl SyncInfo {
         owner_key: &VerifyingKey,
         awaiting_initial_sync: bool,
     ) -> bool {
+        self.record_failed_sync_attempt_at(owner_key, awaiting_initial_sync, now_ms())
+    }
+
+    /// [`Self::record_failed_sync_attempt`] at an explicit time (ms). A room
+    /// that keeps retrying (it holds synced state) also waits
+    /// [`retry_pause_ms`] before its next attempt.
+    pub fn record_failed_sync_attempt_at(
+        &mut self,
+        owner_key: &VerifyingKey,
+        awaiting_initial_sync: bool,
+        now: f64,
+    ) -> bool {
         let Some(sync_info) = self.map.get_mut(owner_key) else {
             return false;
         };
         sync_info.failed_sync_attempts = sync_info.failed_sync_attempts.saturating_add(1);
         sync_info.subscribing_since = None;
+        sync_info.subscribe_requested = false;
+        sync_info.retry_not_before = None;
         // A subscribe GET that timed out or errored proves nothing about
         // whether the network has the room, so retry the way that cannot miss:
         // the re-seeding PUT (freenet/river#757).
@@ -397,8 +533,40 @@ impl SyncInfo {
             false
         } else {
             sync_info.sync_status = RoomSyncStatus::Disconnected;
+            if !awaiting_initial_sync {
+                let pause = retry_pause_ms(sync_info.failed_sync_attempts);
+                if pause > 0.0 {
+                    sync_info.retry_not_before = Some(now + pause);
+                }
+            }
             true
         }
+    }
+
+    /// Whether the room may be retried at `now`: its pause, if any, is over.
+    fn retry_due(&self, owner_key: &VerifyingKey, now: f64) -> bool {
+        self.map
+            .get(owner_key)
+            .is_none_or(|info| info.retry_not_before.is_none_or(|t| now >= t))
+    }
+
+    /// How long (ms) until the earliest moment a sync pass is needed to move
+    /// a room on: a `Subscribing` room reaching its timeout, or a paused room
+    /// reaching the end of its pause, plus a second of slack. `None` when no
+    /// room waits. Rooms already past that moment are left out: the pass that
+    /// is running handles them and arms the next one itself.
+    pub fn next_timeout_delay_ms(&self, now: f64) -> Option<u64> {
+        self.map
+            .values()
+            .filter_map(|info| {
+                let at = match info.sync_status {
+                    RoomSyncStatus::Subscribing => info.subscribing_since? + REPUT_DELAY_MS as f64,
+                    RoomSyncStatus::Disconnected => info.retry_not_before?,
+                    _ => return None,
+                };
+                (at > now).then(|| (at - now) as u64 + 1000)
+            })
+            .min()
     }
 
     /// Refresh `subscribing_since` for a room that is still `Subscribing`,
@@ -462,6 +630,14 @@ impl SyncInfo {
     }
 
     pub fn rooms_awaiting_subscription(&mut self) -> HashMap<VerifyingKey, ChatRoomStateV1> {
+        self.rooms_awaiting_subscription_at(now_ms())
+    }
+
+    /// [`Self::rooms_awaiting_subscription`] at an explicit time (ms).
+    pub fn rooms_awaiting_subscription_at(
+        &mut self,
+        current_time: f64,
+    ) -> HashMap<VerifyingKey, ChatRoomStateV1> {
         let mut rooms_awaiting_subscription = HashMap::new();
         // Use try_read() to avoid panic when ROOMS is mutably borrowed.
         // This can happen because Dioxus's write guard Drop notifies subscribers
@@ -472,7 +648,6 @@ impl SyncInfo {
             debug!("ROOMS is currently borrowed, skipping rooms_awaiting_subscription");
             return rooms_awaiting_subscription;
         };
-        let current_time = now_ms();
 
         // Rooms whose `Subscribing` status has timed out. Collected here
         // because we can't mutate `self.map` while iterating it below; the
@@ -489,24 +664,20 @@ impl SyncInfo {
             let sync_info = self.map.get(key).unwrap();
 
             // Add room to awaiting list if it's disconnected
-            if sync_info.sync_status == RoomSyncStatus::Disconnected {
+            if sync_info.sync_status == RoomSyncStatus::Disconnected
+                && self.retry_due(key, current_time)
+            {
                 rooms_awaiting_subscription.insert(*key, room_data.room_state.clone());
             }
 
             // Check for subscription timeout - if subscribing for longer than REPUT_DELAY_MS,
             // count a failed attempt and (unless the retry bound is reached) re-PUT.
-            if sync_info.sync_status == RoomSyncStatus::Subscribing {
-                if let Some(started_at) = sync_info.subscribing_since {
-                    let elapsed_ms = current_time - started_at;
-                    if elapsed_ms >= REPUT_DELAY_MS as f64 {
-                        warn!(
-                            "Subscription timeout for room {:?} after {:.1}s - will retry with a seeding PUT",
-                            MemberId::from(*key),
-                            elapsed_ms / 1000.0
-                        );
-                        timed_out.push(*key);
-                    }
-                }
+            if self.subscribing_timed_out(key, current_time) {
+                warn!(
+                    "Subscription timeout for room {:?} - will retry with a seeding PUT",
+                    MemberId::from(*key)
+                );
+                timed_out.push(*key);
             }
         }
 
@@ -521,8 +692,9 @@ impl SyncInfo {
                 .map
                 .get(&key)
                 .is_some_and(|rd| rd.is_awaiting_initial_sync());
-            let should_retry = self.record_failed_sync_attempt(&key, awaiting_initial_sync);
-            if should_retry {
+            let should_retry =
+                self.record_failed_sync_attempt_at(&key, awaiting_initial_sync, current_time);
+            if should_retry && self.retry_due(&key, current_time) {
                 if let Some(room_data) = rooms.map.get(&key) {
                     rooms_awaiting_subscription.insert(key, room_data.room_state.clone());
                 }
@@ -614,6 +786,75 @@ pub enum RoomSyncStatus {
     Error(ErrorReport),
 }
 
+/// A request that registers a subscription for the room (a PUT or GET with
+/// `subscribe: true`) was sent. Records it, and arms this request's own
+/// timeout pass: without a reply nothing else runs `process_rooms` for the
+/// room, so a change held while it is `Subscribing` would wait for an
+/// unrelated trigger. One pass per request sent; the pass counts a failed
+/// attempt and sends the next request, which arms the next pass. Call after
+/// the status is set to `Subscribing`, from a deferred context.
+pub(crate) fn subscribe_request_sent(owner_vk: VerifyingKey) {
+    SYNC_INFO.with_mut(|sync_info| subscribe_request_sent_in(sync_info, owner_vk));
+}
+
+/// The invitation's PUT+subscribe went out carrying `put_state`. That state is
+/// what the network will hold, so it is the baseline later changes are
+/// compared with: without one a message posted before any reply could not be
+/// told from the state the PUT carried. Then as [`subscribe_request_sent`].
+pub(crate) fn invite_put_sent(owner_vk: VerifyingKey, put_state: ChatRoomStateV1) {
+    SYNC_INFO.with_mut(|sync_info| invite_put_sent_in(sync_info, owner_vk, &put_state));
+}
+
+/// The decision behind [`invite_put_sent`], testable without the Dioxus runtime.
+pub(crate) fn invite_put_sent_in(
+    sync_info: &mut SyncInfo,
+    owner_vk: VerifyingKey,
+    put_state: &ChatRoomStateV1,
+) {
+    sync_info.update_last_synced_state(&owner_vk, put_state);
+    subscribe_request_sent_in(sync_info, owner_vk);
+}
+
+/// The decision behind [`subscribe_request_sent`], testable without the
+/// Dioxus runtime.
+pub(crate) fn subscribe_request_sent_in(sync_info: &mut SyncInfo, owner_vk: VerifyingKey) {
+    sync_info.note_subscribe_requested(&owner_vk);
+    crate::components::app::freenet_api::response_handler::schedule_subscription_timeout_check();
+}
+
+/// An `UpdateNotification` arrived for `owner_vk`'s room key. If we asked for
+/// a subscription and the room is still `Subscribing`, the notification proves
+/// it: mark it `Subscribed` (and request the held pass), without waiting for
+/// a PutResponse or SubscribeResponse that may never come. From a deferred
+/// context. Returns whether it did.
+pub(crate) fn mark_room_subscribed_by_notification(owner_vk: VerifyingKey) -> bool {
+    let mut requested = None;
+    let proven = SYNC_INFO.with_mut(|sync_info| {
+        subscribe_on_notification(sync_info, owner_vk, |vk| requested = Some(vk))
+    });
+    if let Some(vk) = requested {
+        crate::components::app::mark_needs_sync(vk);
+    }
+    proven
+}
+
+/// The decision behind [`mark_room_subscribed_by_notification`].
+pub(crate) fn subscribe_on_notification(
+    sync_info: &mut SyncInfo,
+    owner_vk: VerifyingKey,
+    request_pass: impl FnOnce(VerifyingKey),
+) -> bool {
+    if !sync_info.notification_proves_subscription(&owner_vk) {
+        return false;
+    }
+    info!(
+        "Room {:?}: update notification proves the subscription",
+        MemberId::from(owner_vk)
+    );
+    subscribe_and_request_held_pass(sync_info, owner_vk, request_pass);
+    true
+}
+
 /// Mark `owner_vk`'s room `Subscribed`, and request a sync pass if one skipped
 /// a local change while the room was still subscribing (a message posted
 /// between an invitation's PUT and its PutResponse). Call from a deferred
@@ -672,6 +913,397 @@ mod tests {
             info.update_sync_status(&live, status);
             assert_eq!(info.has_syncing_rooms(&[live]), expected);
         }
+    }
+
+    fn armed_passes() -> Vec<u64> {
+        crate::components::app::freenet_api::response_handler::SCHEDULED_TIMEOUT_PASSES
+            .with(|n| n.borrow().clone())
+    }
+
+    /// Run `f` inside a Dioxus runtime, so the global signals work.
+    fn in_runtime(f: impl FnOnce()) {
+        use dioxus::prelude::*;
+        let dom = VirtualDom::new(|| rsx! {});
+        dom.in_scope(ScopeId::ROOT, f);
+    }
+
+    /// A chat message from `author_sk` in `state`.
+    fn add_chat_message(state: &mut ChatRoomStateV1, author_sk: &SigningKey, text: &str) {
+        use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
+        state
+            .recent_messages
+            .messages
+            .push(AuthorizedMessageV1::new(
+                MessageV1 {
+                    room_owner: MemberId::from(&test_owner(1)),
+                    author: MemberId::from(&author_sk.verifying_key()),
+                    content: RoomMessageBody::public(text.to_string()),
+                    time: std::time::SystemTime::now().into(),
+                },
+                author_sk,
+            ));
+    }
+
+    /// An invited room as the invite path leaves it: in `ROOMS` with a valid
+    /// (owner-signed) state, registered in `SYNC_INFO` with no baseline. Returns
+    /// the room's owner, the user's key and the state the invite's PUT carries.
+    fn invited_room(seed: u8) -> (VerifyingKey, SigningKey, ChatRoomStateV1) {
+        use river_core::room_state::configuration::{AuthorizedConfigurationV1, Configuration};
+        let owner_sk = SigningKey::from_bytes(&[seed; 32]);
+        let owner = owner_sk.verifying_key();
+        let me_sk = SigningKey::from_bytes(&[seed.wrapping_add(100); 32]);
+        let joined = ChatRoomStateV1 {
+            configuration: AuthorizedConfigurationV1::new(
+                Configuration {
+                    owner_member_id: MemberId::from(&owner),
+                    ..Default::default()
+                },
+                &owner_sk,
+            ),
+            ..Default::default()
+        };
+        let mut rd = crate::room_data::test_minimal_room_data(owner);
+        rd.self_sk = Some(me_sk.clone());
+        rd.room_state = joined.clone();
+        ROOMS.with_mut(|rooms| rooms.map.insert(owner, rd));
+        SYNC_INFO.with_mut(|si| {
+            si.register_new_room(owner);
+            si.update_sync_status(&owner, RoomSyncStatus::Subscribing);
+        });
+        (owner, me_sk, joined)
+    }
+
+    /// The user posts: the message is committed to `ROOMS`.
+    fn post(owner: &VerifyingKey, me_sk: &SigningKey, text: &str) {
+        ROOMS.with_mut(|rooms| {
+            let rd = rooms.map.get_mut(owner).unwrap();
+            add_chat_message(&mut rd.room_state, me_sk, text);
+        });
+    }
+
+    /// What a sync pass finds to send for the room now.
+    fn pass_sends(owner: &VerifyingKey) -> bool {
+        SYNC_INFO
+            .with_mut(|si| si.needs_to_send_update())
+            .contains_key(owner)
+    }
+
+    fn held_now(owner: &VerifyingKey, me: &SigningKey) -> (usize, bool) {
+        let rooms = ROOMS.read();
+        let state = &rooms.map[owner].room_state;
+        let (ids, not_sent) =
+            SYNC_INFO
+                .read()
+                .held_messages(owner, state, MemberId::from(&me.verifying_key()));
+        (ids.len(), not_sent)
+    }
+
+    /// The lost-message case, through the real functions: the invitation's PUT
+    /// goes out with no baseline anywhere; the message posted before any reply
+    /// is marked as held (no pre-seeded last-synced state); the PUT armed its
+    /// own timer; when the timer fires the pass counts the failure and the
+    /// room is re-PUT, which arms the next timer; the re-PUT's reply sends the
+    /// held change exactly once.
+    #[test]
+    fn a_held_message_in_an_invited_room_is_marked_then_sent_after_the_timer() {
+        in_runtime(|| {
+            let (owner, me, joined) = invited_room(60);
+            assert!(SYNC_INFO.read().map[&owner].last_synced_state.is_none());
+
+            invite_put_sent(owner, joined);
+            assert_eq!(
+                armed_passes(),
+                vec![REPUT_DELAY_MS + 1000],
+                "the PUT arms a pass"
+            );
+
+            post(&owner, &me, "first message");
+            assert!(!pass_sends(&owner), "held: the room is not subscribed");
+            assert_eq!(
+                held_now(&owner, &me),
+                (1, false),
+                "marked pending, not posted"
+            );
+
+            // No reply. The timer fires; the pass finds the room timed out.
+            let mut passes = 0;
+            crate::components::app::freenet_api::response_handler::fire_timeout_pass_for_test(
+                || passes += 1,
+            );
+            assert_eq!(passes, 1);
+            let started = SYNC_INFO.read().map[&owner].subscribing_since.unwrap();
+            let due = started + REPUT_DELAY_MS as f64 + 1000.0;
+            let awaiting = SYNC_INFO.with_mut(|si| si.rooms_awaiting_subscription_at(due));
+            assert!(awaiting.contains_key(&owner), "re-PUT after the timeout");
+
+            // The re-PUT goes out and arms the next pass.
+            SYNC_INFO.with_mut(|si| {
+                si.update_sync_status(&owner, RoomSyncStatus::Subscribing);
+                subscribe_request_sent_in(si, owner);
+            });
+            assert_eq!(armed_passes().len(), 2, "one pass per PUT sent");
+
+            // Its reply arrives: the held change is requested and sent once.
+            mark_room_subscribed(owner);
+            assert!(crate::components::app::NEEDS_SYNC.peek().contains(&owner));
+            assert!(pass_sends(&owner));
+            SYNC_INFO.with_mut(|si| {
+                si.state_updated(&owner, ROOMS.peek().map[&owner].room_state.clone())
+            });
+            assert_eq!(held_now(&owner, &me).0, 0, "sent: no longer pending");
+            crate::components::app::NEEDS_SYNC.write().clear();
+            mark_room_subscribed(owner);
+            assert!(
+                crate::components::app::NEEDS_SYNC.peek().is_empty(),
+                "a later reply requests nothing"
+            );
+            assert!(!pass_sends(&owner), "and sends nothing");
+        });
+    }
+
+    /// A room in `Error` will not send the message by itself: it is marked
+    /// as not sent, not as on its way.
+    #[test]
+    fn a_held_message_in_an_errored_room_is_marked_not_sent() {
+        in_runtime(|| {
+            let (owner, me, joined) = invited_room(61);
+            invite_put_sent(owner, joined);
+            post(&owner, &me, "stuck");
+            assert!(!pass_sends(&owner));
+            SYNC_INFO.with_mut(|si| {
+                si.update_sync_status(
+                    &owner,
+                    RoomSyncStatus::Error(ErrorReport::new(LABEL_ROOM_NOT_FOUND, "x", "x")),
+                )
+            });
+            assert_eq!(held_now(&owner, &me), (1, true));
+        });
+    }
+
+    /// An `UpdateNotification` delivered through the real handler proves the
+    /// subscription of a PUT we sent: the held change is requested, sent once,
+    /// and the PutResponse that follows requests and sends nothing.
+    #[test]
+    fn a_notification_after_our_put_sends_the_held_message_once() {
+        in_runtime(|| {
+            let (owner, me, joined) = invited_room(62);
+            invite_put_sent(owner, joined);
+            post(&owner, &me, "hello");
+            assert!(!pass_sends(&owner));
+
+            notify(&owner);
+            assert_eq!(
+                SYNC_INFO.read().get_sync_status(&owner),
+                Some(&RoomSyncStatus::Subscribed)
+            );
+            assert!(crate::components::app::NEEDS_SYNC.peek().contains(&owner));
+            assert!(pass_sends(&owner));
+            SYNC_INFO.with_mut(|si| {
+                si.state_updated(&owner, ROOMS.peek().map[&owner].room_state.clone())
+            });
+
+            // Late PutResponse, a second notification: nothing more is sent.
+            crate::components::app::NEEDS_SYNC.write().clear();
+            mark_room_subscribed(owner);
+            notify(&owner);
+            assert!(crate::components::app::NEEDS_SYNC.peek().is_empty());
+            assert!(!pass_sends(&owner));
+        });
+    }
+
+    /// Deliver a notification for the room's own contract key. The body is a
+    /// kind the handler ignores, so only the subscription proof is exercised,
+    /// not the state merge (which would prune a non-member's message).
+    fn notify(owner: &VerifyingKey) {
+        use crate::components::app::freenet_api::response_handler::update_notification::handle_update_notification;
+        use crate::components::app::freenet_api::room_synchronizer::RoomSynchronizer;
+        use freenet_stdlib::prelude::{ContractInstanceId, State, UpdateData};
+        handle_update_notification(
+            &mut RoomSynchronizer::new(),
+            owner_vk_to_contract_key(owner),
+            UpdateData::RelatedState {
+                related_to: ContractInstanceId::new([1; 32]),
+                state: State::from(vec![0u8]),
+            },
+        )
+        .unwrap();
+    }
+
+    /// A notification proves only a subscription we asked for, through the
+    /// real handler: not for a key we never requested, not while a subscribe
+    /// GET is outstanding (its reply sets the baseline), and not for a room a
+    /// read-only public view also subscribed to.
+    #[test]
+    fn a_notification_is_ignored_unless_it_proves_our_own_put() {
+        in_runtime(|| {
+            // Never requested (an invitation GET, the re-key hold).
+            let (never, _, _) = invited_room(63);
+            notify(&never);
+            assert_eq!(
+                SYNC_INFO.read().get_sync_status(&never),
+                Some(&RoomSyncStatus::Subscribing)
+            );
+
+            // A subscribe GET in flight: the GET's reply must complete it.
+            let (get, _, _) = invited_room(64);
+            SYNC_INFO.with_mut(|si| {
+                si.note_subscribe_get_sent(&get);
+                subscribe_request_sent_in(si, get);
+            });
+            notify(&get);
+            assert_eq!(
+                SYNC_INFO.read().get_sync_status(&get),
+                Some(&RoomSyncStatus::Subscribing)
+            );
+            assert!(SYNC_INFO.with_mut(|si| si.take_subscribe_get(&get)));
+
+            // A public read-only view subscribed to the same room.
+            let (viewed, _, joined) = invited_room(65);
+            crate::public_room::note_subscribed_view(viewed);
+            invite_put_sent(viewed, joined);
+            notify(&viewed);
+            assert_eq!(
+                SYNC_INFO.read().get_sync_status(&viewed),
+                Some(&RoomSyncStatus::Subscribing)
+            );
+
+            // The one that passes: an ordinary invited room.
+            let (ok, _, joined) = invited_room(66);
+            invite_put_sent(ok, joined);
+            notify(&ok);
+            assert_eq!(
+                SYNC_INFO.read().get_sync_status(&ok),
+                Some(&RoomSyncStatus::Subscribed)
+            );
+        });
+    }
+
+    /// Any number of rooms share one timer, and a request sent after it was
+    /// armed is still covered: when the pass settles, the next timer is armed
+    /// for the earliest room still waiting.
+    #[test]
+    fn requests_share_one_timer_and_a_later_request_is_still_covered() {
+        in_runtime(|| {
+            let rooms: Vec<_> = (70..75).map(invited_room).collect();
+            for (owner, _, joined) in &rooms {
+                invite_put_sent(*owner, joined.clone());
+            }
+            assert_eq!(armed_passes().len(), 1, "five rooms, one timer");
+
+            // The timer fires; five passes would have run before, one runs now.
+            let mut passes = 0;
+            crate::components::app::freenet_api::response_handler::fire_timeout_pass_for_test(
+                || passes += 1,
+            );
+            assert_eq!(passes, 1);
+            // A room whose request went out later is not due yet: the pass arms
+            // the next timer for it.
+            SYNC_INFO.with_mut(|si| {
+                for (owner, _, _) in &rooms {
+                    si.map.get_mut(owner).unwrap().subscribing_since = Some(now_ms() - 10_000.0);
+                }
+            });
+            crate::components::app::freenet_api::response_handler::arm_next_timeout_pass();
+            let armed = armed_passes();
+            assert_eq!(armed.len(), 2);
+            assert!(
+                (10_000..=12_000).contains(&armed[1]),
+                "armed for the remaining ~11 s, got {}",
+                armed[1]
+            );
+        });
+    }
+
+    /// A room backing off for minutes must not delay a new invite's pass: the
+    /// new PUT's own ~22 s timer is armed even though a much later one is.
+    #[test]
+    fn a_new_request_is_not_held_back_by_a_later_armed_timer() {
+        use crate::components::app::freenet_api::response_handler::arm_next_timeout_pass;
+        in_runtime(|| {
+            // Room A: long in backoff, so the armed timer is minutes away.
+            let (a, _, _) = invited_room(85);
+            SYNC_INFO.with_mut(|si| {
+                si.update_sync_status(&a, RoomSyncStatus::Disconnected);
+                si.map.get_mut(&a).unwrap().retry_not_before = Some(now_ms() + 500_000.0);
+            });
+            arm_next_timeout_pass();
+            let armed = armed_passes();
+            assert_eq!(armed.len(), 1);
+            assert!(armed[0] > 400_000, "A's timer is far off: {armed:?}");
+
+            // Room B: a new invite's PUT goes out.
+            let (b, _, joined) = invited_room(86);
+            invite_put_sent(b, joined);
+            let armed = armed_passes();
+            assert_eq!(armed.len(), 2, "B gets its own timer: {armed:?}");
+            assert_eq!(armed[1], REPUT_DELAY_MS + 1000);
+        });
+    }
+
+    /// A synced room whose node never replies is retried with a growing pause,
+    /// not every ~21 s for ever: at most 10 PUTs in the first hour, then one
+    /// per 10 minutes. A reconnect cancels the pause.
+    #[test]
+    fn an_unanswered_room_is_retried_with_a_capped_backoff() {
+        in_runtime(|| {
+            let (owner, _, _) = invited_room(80);
+            let mut t = 1_000_000.0;
+            let start = t;
+            let mut puts = 0u32;
+            let mut gaps = Vec::new();
+            let mut last_put = t;
+            // The first PUT.
+            SYNC_INFO.with_mut(|si| {
+                si.update_sync_status(&owner, RoomSyncStatus::Subscribing);
+                si.map.get_mut(&owner).unwrap().subscribing_since = Some(t);
+            });
+            puts += 1;
+            while t < start + 3_600_000.0 {
+                // Wake at the earliest moment the sync info says a pass is due.
+                let delay = SYNC_INFO.read().next_timeout_delay_ms(t).expect("a timer");
+                t += delay as f64;
+                let awaiting = SYNC_INFO.with_mut(|si| si.rooms_awaiting_subscription_at(t));
+                if awaiting.contains_key(&owner) {
+                    puts += 1;
+                    gaps.push(t - last_put);
+                    last_put = t;
+                    SYNC_INFO.with_mut(|si| {
+                        si.update_sync_status(&owner, RoomSyncStatus::Subscribing);
+                        si.map.get_mut(&owner).unwrap().subscribing_since = Some(t);
+                    });
+                }
+            }
+            assert!((8..=11).contains(&puts), "PUTs in the first hour: {puts}");
+            assert!(
+                gaps.windows(2).all(|w| w[1] >= w[0]),
+                "pauses only grow: {gaps:?}"
+            );
+            assert!(
+                gaps.iter().all(|g| *g <= MAX_RETRY_PAUSE_MS + 2_000.0),
+                "capped at ~10 minutes: {gaps:?}"
+            );
+
+            // Paused now; a new connection cancels the pause.
+            SYNC_INFO.with_mut(|si| {
+                si.update_sync_status(&owner, RoomSyncStatus::Disconnected);
+                si.map.get_mut(&owner).unwrap().retry_not_before = Some(t + 500_000.0);
+                assert!(!si.rooms_awaiting_subscription_at(t).contains_key(&owner));
+                si.mark_subscribed_rooms_disconnected();
+                assert!(si.rooms_awaiting_subscription_at(t).contains_key(&owner));
+            });
+        });
+    }
+
+    /// A failed attempt ends the spell, request and all.
+    #[test]
+    fn a_failed_attempt_clears_the_request_flag() {
+        let mut si = SyncInfo::new();
+        let room = test_owner(90);
+        si.register_new_room(room);
+        si.update_sync_status(&room, RoomSyncStatus::Subscribing);
+        si.note_subscribe_requested(&room);
+        si.record_failed_sync_attempt(&room, false);
+        assert!(!si.map[&room].subscribe_requested);
     }
 
     #[test]

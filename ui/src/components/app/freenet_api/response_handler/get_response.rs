@@ -842,10 +842,14 @@ pub async fn handle_get_response(
             };
 
             if let Err(report) = put_result {
+                // The state that was to be PUT is the baseline, so a message
+                // posted meanwhile is marked as not sent.
+                let put_state = retrieved_state_for_put.clone();
                 crate::util::defer(move || {
-                    SYNC_INFO
-                        .write()
-                        .update_sync_status(&owner_vk, RoomSyncStatus::Error(report));
+                    SYNC_INFO.with_mut(|sync_info| {
+                        sync_info.update_last_synced_state(&owner_vk, &put_state);
+                        sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Error(report));
+                    });
                 });
                 // Reset invite status so the normal retry flow can pick it up
                 crate::util::defer(move || {
@@ -863,6 +867,19 @@ pub async fn handle_get_response(
                 // Mark initial sync complete for notifications
                 crate::util::defer(move || {
                     mark_initial_sync_complete(&owner_vk);
+                });
+
+                // The PUT subscribes. If neither its PutResponse nor a
+                // SubscribeResponse ever arrives, the room stays Subscribing
+                // and nothing else runs a pass, so a message posted meanwhile
+                // would never be sent: arm this PUT's own timeout pass, as
+                // loaded rooms do. Deferred after the Subscribing write above.
+                // The PUT carried `retrieved_state_for_put`: that is what the
+                // network will hold, and the baseline a message posted before
+                // any reply is told apart from.
+                let put_state = retrieved_state_for_put.clone();
+                crate::util::defer(move || {
+                    crate::components::app::sync_info::invite_put_sent(owner_vk, put_state);
                 });
 
                 // Close the invitation modal by updating PENDING_INVITES directly.
@@ -1260,6 +1277,10 @@ pub async fn handle_get_response(
                                 "Sent PUT+subscribe for imported room {:?}",
                                 MemberId::from(owner_vk)
                             );
+                            // This PUT subscribes: arm its own timeout pass.
+                            crate::util::defer(move || {
+                                crate::components::app::sync_info::subscribe_request_sent(owner_vk);
+                            });
                             true
                         }
                         Err(e) => {
@@ -1889,11 +1910,17 @@ async fn put_state_to_current_key(
 
     if let Some(web_api) = WEB_API.write().as_mut() {
         match web_api.send(ClientRequest::ContractOp(put_request)).await {
-            Ok(_) => info!(
-                "Backward probe: PUT {} state to current contract for room {:?}",
-                label,
-                MemberId::from(owner_vk)
-            ),
+            Ok(_) => {
+                info!(
+                    "Backward probe: PUT {} state to current contract for room {:?}",
+                    label,
+                    MemberId::from(owner_vk)
+                );
+                // This PUT subscribes: arm its own timeout pass.
+                crate::util::defer(move || {
+                    crate::components::app::sync_info::subscribe_request_sent(owner_vk);
+                });
+            }
             Err(e) => error!(
                 "Backward probe: failed to PUT {} state for room {:?}: {}",
                 label,
@@ -3578,5 +3605,35 @@ mod tests {
                 other => panic!("a PUT sends a state that is not the normalized bytes: {other}"),
             }
         }
+    }
+
+    /// The invitation-accept PUT arms its own timeout pass and notes its
+    /// subscribe request, after the `Subscribing` write that precedes it. The
+    /// 90 s invite check armed at the GET fires before a slow GET's PUT has
+    /// been outstanding for `REPUT_DELAY_MS`, so it cannot stand in for this.
+    #[test]
+    fn the_invite_put_arms_its_own_subscription_timeout_pass() {
+        let full = include_str!("get_response.rs");
+        let prod = full.split("#[cfg(test)]").next().unwrap();
+        let start = prod
+            .find("Sent PUT+subscribe for invited room")
+            .expect("invite PUT branch");
+        let end = start
+            + prod[start..]
+                .find("} else if is_existing_room")
+                .expect("end of invite branch");
+        let arm = &prod[start..end];
+        assert!(
+            arm.contains("sync_info::invite_put_sent(owner_vk, put_state)"),
+            "the invite PUT success arm must arm its own pass"
+        );
+        let set_subscribing = prod
+            .find("sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Subscribing);")
+            .expect("Subscribing write");
+        let noted = start
+            + arm
+                .find("sync_info::invite_put_sent(owner_vk, put_state)")
+                .unwrap();
+        assert!(set_subscribing < noted, "noted after Subscribing is set");
     }
 }

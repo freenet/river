@@ -1078,10 +1078,29 @@ pub fn request_fetch(_owner_vk: VerifyingKey) {
     with_mirror(|m| m.requested = true);
 }
 
+thread_local! {
+    /// Rooms this page subscribed to for a read-only view. The node keeps such
+    /// a subscription for the life of the connection, so a notification for one
+    /// of these rooms says nothing about a later, separate subscription of ours.
+    static SUBSCRIBED_VIEWS: std::cell::RefCell<std::collections::HashSet<VerifyingKey>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// Whether a read-only view of this room subscribed to it on this page.
+pub fn has_subscribed_view(owner_vk: &VerifyingKey) -> bool {
+    SUBSCRIBED_VIEWS.with(|views| views.borrow().contains(owner_vk))
+}
+
+/// Record that a read-only view subscribed to this room.
+pub fn note_subscribed_view(owner_vk: VerifyingKey) {
+    SUBSCRIBED_VIEWS.with(|views| views.borrow_mut().insert(owner_vk));
+}
+
 /// Subscribe to a room known to be public, for its updates.
 #[cfg(not(feature = "no-sync"))]
 pub fn request_subscribe(owner_vk: VerifyingKey) {
     use crate::components::app::WEB_API;
+    note_subscribed_view(owner_vk);
     use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
     crate::util::safe_spawn_local(async move {
         let request = ClientRequest::ContractOp(ContractRequest::Subscribe {
