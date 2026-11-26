@@ -1156,6 +1156,16 @@ fn member_row(room: &Room, m: &Member, p: &Palette) -> El {
     if m.nickname == visual_fold::UNNAMED {
         r = r.help(format!("Member ID {}", m.uid));
     }
+    // The web UI's `member-list-impersonation-warning`: the warning sign straight after the
+    // name, before the other marks, its tooltip the full sentence.
+    if let Some(i) = super::member_modal::imitation(room, m) {
+        r = r.child(
+            label("\u{26a0}".to_owned(), st::BODY, p.warning_text)
+                .key(format!("member-impersonation-{}", m.id))
+                .label(i.text)
+                .help(i.text),
+        );
+    }
     if m.id == room.me {
         r = r.child(label("you", st::SMALL, p.text_muted));
     }

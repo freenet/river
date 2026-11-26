@@ -1581,6 +1581,78 @@ fn a_name_that_imitates_the_owner_is_warned_about() {
     assert!(rt.find("member-tag-impersonation").is_none());
 }
 
+/// The web UI's `member-list-impersonation-warning` and `message-author-impersonation-warning`:
+/// the member list row and the author line of a member whose name imitates the owner's.
+#[test]
+fn a_look_alike_name_is_warned_about_in_the_list_and_on_their_messages() {
+    let mut state = connected();
+    let mut impostor = 0;
+    state.chat.edit_rooms(|rooms| {
+        let room = &mut rooms[0];
+        let owner = room
+            .members
+            .iter()
+            .find(|m| m.role == super::model::Role::Owner)
+            .unwrap()
+            .id;
+        // Cyrillic "а" for the first "a".
+        let mut m = super::model::Member::new(91, "M\u{0430}ya Chen", super::model::Role::Member);
+        m.invited_by = Some(owner);
+        impostor = m.id;
+        room.members.push(m);
+        let mid = room.messages.last().map_or(0, |m| m.id) + 1;
+        room.messages.push(super::model::Message {
+            id: mid,
+            key: "impostor-msg".into(),
+            author: impostor,
+            time: room.messages.last().map_or(0, |m| m.time) + 1,
+            text: "hello".into(),
+            source: String::new(),
+            md: String::new(),
+            reply_to: None,
+            reply_gone: false,
+            reactions: Vec::new(),
+            edited: false,
+            pending: None,
+        });
+    });
+    let rt = render(state, WINDOW_SIZE);
+    let help = |rt: &Runtime<RiverApp>, key: &str| {
+        rt.elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some(key))
+            .and_then(|e| e.help)
+    };
+    // The list row and the author line carry the web UI's sentence as their tooltip.
+    for key in [
+        format!("member-impersonation-{impostor}"),
+        "author-impersonation-impostor-msg".to_owned(),
+    ] {
+        let tip = help(&rt, &key).unwrap_or_else(|| panic!("{key} is not drawn"));
+        assert!(tip.starts_with("Impersonation warning: this member is NOT the room owner"));
+    }
+    assert!(shows(&rt, "Similar name"));
+    // Nobody else is accused: not the real owner, not their other members.
+    let room = rt.state.chat.room().unwrap();
+    for m in room.members.iter().filter(|m| m.id != impostor) {
+        assert!(
+            rt.find(&format!("member-impersonation-{}", m.id)).is_none(),
+            "{}",
+            m.nickname
+        );
+    }
+    let warned = rt
+        .elements()
+        .into_iter()
+        .filter(|e| {
+            e.key
+                .as_deref()
+                .is_some_and(|k| k.starts_with("author-impersonation-"))
+        })
+        .count();
+    assert_eq!(warned, 1, "only the impostor's message group");
+}
+
 #[test]
 fn a_member_who_leaves_closes_the_dialog_for_good() {
     let mut rt = render(connected(), WINDOW_SIZE);

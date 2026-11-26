@@ -503,6 +503,29 @@ fn group_el(
     } else if let Some(tooltip) = author.and_then(Member::deputy_tooltip) {
         name_row = name_row.child(deputy_tag(tooltip, p));
     }
+    // The web UI's `message-author-impersonation-warning`: after the role tags (a deputy's name
+    // can collide with another's, so both can show), the sign and "Similar name", the tooltip
+    // the full sentence.
+    if let Some(i) = author.and_then(|m| super::member_modal::imitation(room, m)) {
+        name_row = name_row.child(
+            row()
+                .key(format!("author-impersonation-{}", first.key))
+                .gap(4.0)
+                .center_y()
+                .label(i.text)
+                .help(i.text)
+                .child(label(
+                    "\u{26a0}".to_owned(),
+                    st::SMALL_STRONG,
+                    p.warning_text,
+                ))
+                .child(label(
+                    "Similar name".to_owned(),
+                    st::SMALL_STRONG,
+                    p.warning_text,
+                )),
+        );
+    }
     name_row = name_row.child(
         label(model::clock(first.time), st::SMALL, p.text_muted)
             .key(format!("time-{}", first.key))
