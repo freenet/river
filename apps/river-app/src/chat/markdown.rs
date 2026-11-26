@@ -94,8 +94,13 @@ pub fn strip_with(text: &str, keep_html: bool) -> String {
     if !is_cheap(text) {
         return text.to_owned();
     }
-    // An image is drawn as its words (`images_to_text`); read it the same way.
-    let text = &*images_to_text(text);
+    // An image is drawn as its words (`images_to_text`); read it the same way. The rewrite
+    // can lengthen the text or uncover markup, so it must be cheap too, as in `render`.
+    let words = images_to_text(text);
+    if !is_cheap(&words) {
+        return text.to_owned();
+    }
+    let text = &*words;
     let mut out = String::with_capacity(text.len());
     let gap = |out: &mut String| {
         if !out.is_empty() && !out.ends_with(' ') {
@@ -122,12 +127,16 @@ pub fn strip_with(text: &str, keep_html: bool) -> String {
     out
 }
 
-/// `src` with each markdown image (`![alt](src)`, reference-style, inside a link or a table)
-/// rewritten as plain text: its alt text and, after it in parentheses, its address. Images are
-/// not displayed in messages, as in the web UI: nothing is fetched or drawn for one. The
-/// address is left out when it names a scheme other than http(s) (`data:`, `javascript:`),
-/// as the web UI does. Raw HTML (`<img>`) is never drawn by the widget, so needs nothing here.
-/// The text is escaped, so it reads back as text and cannot start new markup.
+/// `src` with each markdown image (`![alt](src)`, reference-style, inside a table or a link)
+/// rewritten as plain text. Images are not displayed in messages: nothing is fetched or drawn
+/// for one (the web UI does the same, freenet/river#1061). The words are the alt text and,
+/// after it in parentheses, the address, as in the web UI. The address is left out when it
+/// names a scheme other than http(s) (`data:`, `javascript:`) or holds a hidden character,
+/// and inside a link label, where a second host would make `links::prepare` unlink the link.
+/// An image with no words left is `image`. Raw HTML (`<img>`) is never drawn by the widget,
+/// so needs nothing here. The words are escaped, so they read back as text and cannot open
+/// markup. A reference image's definition stays in the text, and `links::prepare` shows any
+/// text with a definition as plain text.
 pub(super) fn images_to_text(src: &str) -> std::borrow::Cow<'_, str> {
     use pulldown_cmark::{Event, Parser, Tag, TagEnd};
     let mut out = String::new();
@@ -135,6 +144,8 @@ pub(super) fn images_to_text(src: &str) -> std::borrow::Cow<'_, str> {
     // The open image's range, address and alt text, and how deep inside it we are.
     let mut open: Option<(std::ops::Range<usize>, String, String)> = None;
     let mut depth = 0usize;
+    // How many links the parser is inside, outside any image.
+    let mut in_link = 0usize;
     for (ev, range) in Parser::new_ext(src, super::links::options()).into_offset_iter() {
         match ev {
             Event::Start(Tag::Image { dest_url, .. }) => {
@@ -155,16 +166,20 @@ pub(super) fn images_to_text(src: &str) -> std::borrow::Cow<'_, str> {
                     out.push_str(&src[copied..range.start]);
                     let alt = alt.split_whitespace().collect::<Vec<_>>().join(" ");
                     let url = url.trim();
-                    let words = match (alt.is_empty(), url.is_empty() || !shown_address(url)) {
+                    let hide_url = in_link > 0 || url.is_empty() || !shown_address(url);
+                    let words = match (alt.is_empty(), hide_url) {
                         (false, false) => format!("{alt} ({url})"),
                         (false, true) => alt,
                         (true, false) => url.to_owned(),
-                        (true, true) => String::new(),
+                        // Never nothing: an empty rewrite could join the markup around it.
+                        (true, true) => "image".to_owned(),
                     };
                     escape_into(&words, &mut out);
                     copied = range.end;
                 }
             }
+            Event::Start(Tag::Link { .. }) if depth == 0 => in_link += 1,
+            Event::End(TagEnd::Link) if depth == 0 => in_link = in_link.saturating_sub(1),
             Event::Text(t) | Event::Code(t) if depth > 0 => {
                 if let Some((_, _, alt)) = open.as_mut() {
                     alt.push_str(&t);
@@ -195,17 +210,17 @@ fn has_image(src: &str) -> bool {
 /// Whether an image's address is shown beside its alt text: one with no scheme (relative)
 /// or an http(s) one, as the web UI's renderer keeps.
 fn shown_address(url: &str) -> bool {
+    if url
+        .chars()
+        .any(|c| c.is_control() || super::visual_fold::is_display_hidden(c))
+    {
+        return false;
+    }
     let scheme = url
         .split_once(':')
         .map(|(s, _)| s)
         .filter(|s| !s.contains(['/', '?', '#']));
-    match scheme {
-        None => !url.chars().any(char::is_control),
-        Some(s) => {
-            (s.eq_ignore_ascii_case("http") || s.eq_ignore_ascii_case("https"))
-                && !url.chars().any(char::is_control)
-        }
-    }
+    scheme.is_none_or(|s| s.eq_ignore_ascii_case("http") || s.eq_ignore_ascii_case("https"))
 }
 
 /// `text` with every ASCII punctuation character backslash-escaped, so markdown reads it back
@@ -426,6 +441,10 @@ pub(super) const IMAGE_VARIANTS: &[&str] = &[
     "*![alt text](https://example.com/a.png)*",
     "| a |\n|---|\n| ![alt text](https://example.com/a.png) |",
     "text\n![alt text](https://example.com/a.png)\nmore",
+    "!![](data:x)[alt text](https://example.com/a.png)",
+    "<![alt text](data:x)>",
+    "![alt text](https://example.com/a.png)\r\n![b](https://example.com/b.png)",
+    "[![alt text](https://cdn.example/a.png)](https://site.example/)",
 ];
 
 #[cfg(test)]
@@ -599,7 +618,8 @@ mod tests {
         assert_eq!(read("![x](/a.png)"), "x (/a.png)");
         assert_eq!(read("![only alt](javascript:alert(1))"), "only alt");
         assert_eq!(read("![only alt](data:image/png;base64,AAAA)"), "only alt");
-        assert_eq!(read("![](data:image/png;base64,AAAA)"), "");
+        assert_eq!(read("![](data:image/png;base64,AAAA)"), "image");
+        assert_eq!(read("![x](https://e.example/\u{202e}gnp.exe)"), "x");
         // Markup in the alt text and the address is shown as written, not as markup.
         assert_eq!(
             read("![*a* [b]](https://e.example/x_y_.png)"),
@@ -610,10 +630,15 @@ mod tests {
             read("![r]\n\n[r]: https://example.com/a.png"),
             "r (https://example.com/a.png)"
         );
-        // A linked image keeps its link, with the image's words as the label.
+        // A linked image is its alt text in the link's label, so the link stays a link
+        // when the image is on another host.
         assert_eq!(
-            images_to_text("[![a](https://e.example/i.png)](https://e.example/p)"),
-            "[a \\(https\\:\\/\\/e\\.example\\/i\\.png\\)](https://e.example/p)"
+            images_to_text("[![logo](https://cdn.example/i.png)](https://site.example/p)"),
+            "[logo](https://site.example/p)"
+        );
+        assert_eq!(
+            images_to_text("[![](https://cdn.example/i.png)](https://site.example/p)"),
+            "[image](https://site.example/p)"
         );
         // Text without an image is returned as it is.
         assert_eq!(
@@ -629,6 +654,15 @@ mod tests {
             "look a cat (https://example.com/cat.png)"
         );
         assert_eq!(strip_with("![x](javascript:y)", false), "x");
+        // The rewrite is checked for cost as well: a reference image used many times
+        // cannot expand the text past what is parsed.
+        let many = format!(
+            "{}\n\n[r]: https://e.example/{}",
+            "![r] ".repeat(90),
+            "a".repeat(3000)
+        );
+        assert!(is_cheap(&many));
+        assert_eq!(strip(&many), many);
     }
 
     #[test]

@@ -1103,6 +1103,20 @@ fn no_image_is_drawn_in_a_message_or_description() {
             .map(|e| e.label)
             .collect();
         assert!(images.is_empty(), "{src:?} drew {images:?}");
+        // The message alone, so its words cannot come from the description: it is on screen,
+        // as words.
+        let rt = node_rooms(|rooms| {
+            let m = rooms[0].messages.last_mut().unwrap();
+            m.text = (*src).to_owned();
+            m.md = (*src).to_owned();
+        });
+        assert!(
+            !rt.elements().iter().any(|e| e.role == "image"),
+            "{src:?} drew an image in the message"
+        );
+        if src.contains("[alt text]") && !src.contains("<![") {
+            assert!(shows(&rt, "alt text"), "{src:?}: {:?}", texts(&rt));
+        }
     }
     let rt = node_rooms(|rooms| {
         let m = rooms[0].messages.last_mut().unwrap();
