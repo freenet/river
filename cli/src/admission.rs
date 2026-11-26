@@ -462,14 +462,28 @@ pub fn require_unattended_ack(
 }
 
 /// Ask on the terminal, defaulting to no.
-pub fn ask_unattended_ack() -> Result<()> {
-    require_unattended_ack(false, atty::is(atty::Stream::Stdin), |text| {
-        eprintln!("{text}");
-        Ok(dialoguer::Confirm::new()
-            .with_prompt("Open this room to newcomers anyway?")
-            .default(false)
-            .interact()?)
-    })
+pub fn confirm_on_terminal(text: &str) -> Result<bool> {
+    eprintln!("{text}");
+    Ok(dialoguer::Confirm::new()
+        .with_prompt("Open this room to newcomers anyway?")
+        .default(false)
+        .interact()?)
+}
+
+/// The gate `room config` applies: an edit that opens admission on a room with
+/// none needs the owner's acknowledgement (flag, or a terminal answer);
+/// anything else passes untouched. Closing is never gated.
+pub fn gate_unattended(
+    edit: &PolicyEdit,
+    config: &river_core::room_state::configuration::Configuration,
+    flag: bool,
+    interactive: bool,
+    ask: impl FnOnce(&str) -> Result<bool>,
+) -> Result<()> {
+    if edit.needs_unattended_ack(config) {
+        require_unattended_ack(flag, interactive, ask)?;
+    }
+    Ok(())
 }
 
 /// Apply `--public-admission` and friends to a configuration copy.
@@ -1198,5 +1212,24 @@ mod tests {
         assert!(!e.needs_unattended_ack(&on), "already open: nothing new");
         e.enable = Some(false);
         assert!(!e.needs_unattended_ack(&on));
+    }
+
+    /// The gate the `config` command applies, end to end: opening needs the
+    /// acknowledgement, closing and tuning an open room do not.
+    #[test]
+    fn gate_unattended_applies_to_opening_only() {
+        use river_core::room_state::configuration::Configuration;
+        let mut open = edit();
+        open.enable = Some(true);
+        let closed = Configuration::default();
+        let refused = gate_unattended(&open, &closed, false, false, |_| panic!("no prompt"));
+        assert!(refused.is_err(), "no flag, no terminal: refused");
+        assert!(gate_unattended(&open, &closed, true, false, |_| panic!("no prompt")).is_ok());
+        assert!(gate_unattended(&open, &closed, false, true, |_| Ok(true)).is_ok());
+        assert!(gate_unattended(&open, &closed, false, true, |_| Ok(false)).is_err());
+
+        let mut close = edit();
+        close.enable = Some(false);
+        assert!(gate_unattended(&close, &closed, false, false, |_| panic!("no prompt")).is_ok());
     }
 }

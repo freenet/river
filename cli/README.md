@@ -311,13 +311,17 @@ A public room can let newcomers in by proof of work instead of an invitation.
   `--max-provisional-messages` (the slots open members share; each holds
   at most its newest 2, so the room holds at most half that many of them),
   `--max-provisional-bans` and
-  `--admission-listed`. A new open room starts at 20 bits, 8 open members,
-  10% of the message window for their messages (at least 1) and 16 bans.
-  Opening one needs an acknowledgement: anyone can post after a few seconds
+  `--admission-listed`. Every time admission is opened (a new room, or a
+  re-open: closing clears the policy, and `listed` goes back to false) it starts
+  at 20 bits, 8 open members, 10% of the message window for their messages and
+  16 bans. A window under 20 messages gets 1 slot, and since the contract caps
+  the slots at half the window, a window of 1 message leaves no usable slot.
+  Opening needs an acknowledgement: anyone can post after a few seconds
   of computing, and if nobody watches the room someone can fill the newcomer
   slots with spam and keep real newcomers out until you turn this off. A
   terminal asks y/N; a script must pass `--unattended-ok`. Explicit flags
-  override every default. `--public-admission false` turns it off and clears
+  win over every default, so pass them again on a re-open to keep earlier
+  settings. `--public-admission false` turns it off and clears
   the room's open members and bans.
 
 ## Command reference

@@ -682,13 +682,13 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
             if !policy_edit.is_empty() {
                 let state = api.get_room(&owner_key, false).await?;
                 policy_edit.check_room(&state.configuration.configuration.privacy_mode)?;
-                if policy_edit.needs_unattended_ack(&state.configuration.configuration) {
-                    if unattended_ok {
-                        crate::admission::require_unattended_ack(true, false, |_| Ok(true))?;
-                    } else {
-                        crate::admission::ask_unattended_ack()?;
-                    }
-                }
+                crate::admission::gate_unattended(
+                    &policy_edit,
+                    &state.configuration.configuration,
+                    unattended_ok,
+                    atty::is(atty::Stream::Stdin),
+                    crate::admission::confirm_on_terminal,
+                )?;
             }
 
             match api
@@ -898,5 +898,21 @@ mod tests {
             _ => panic!("not config"),
         }
         assert!(config_help().contains("--unattended-ok"));
+    }
+
+    /// The `config` command must put an admission-opening edit through the
+    /// acknowledgement gate. The handler needs a live node, so this pins the
+    /// call itself: removing it leaves every other test green.
+    #[test]
+    fn config_command_applies_the_unattended_gate() {
+        let source = include_str!("room.rs");
+        let production = source.split_once("#[cfg(test)]").map(|(p, _)| p).unwrap();
+        let squashed: String = production.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            squashed.contains(
+                "crate::admission::gate_unattended(&policy_edit,&state.configuration.configuration,unattended_ok,"
+            ),
+            "room config must call the unattended-room gate with the --unattended-ok flag"
+        );
     }
 }
