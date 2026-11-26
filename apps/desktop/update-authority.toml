@@ -18,14 +18,17 @@
 # a competing record cannot roll the key back. See apps/desktop/src/update/mod.rs, `# Trust`.
 #
 # THE AUTHORITY KEY must never be the update-signing key: if it were, a leak of the signing
-# key would let the attacker publish their own record. It is River's author key (the one in
-# pointer-records.toml), which signs the web container and the pointer records and is NOT
-# available to the release workflow. This file is compiled into every build, so changing
-# `authority_verifying_key` is itself a new release that old builds never see.
+# key would let the attacker publish their own record. It is a dedicated key used for nothing
+# else, held offline by Ian (password manager), and it is NOT River's author key (the online
+# key in pointer-records.toml that signs the web container and the pointer records): a test
+# keeps the two different. It is not available to the release workflow. This file is compiled
+# into every build, so changing `authority_verifying_key` is itself a new release that old
+# builds never see.
 #
 # PUBLISHING A ROTATION (the record's version must be higher than every earlier one; start
-# at 1). Sign offline with the author key (RIVER_POINTER_KEY_FILE, else
-# ~/.config/river/web-container-keys.toml):
+# at 1). Sign offline with the authority key, from a file named by RIVER_UPDATE_AUTHORITY_KEY_FILE
+# or piped on stdin (an armored block whose lines include `signing_key = "river:v1:sk:..."`;
+# there is no default location, and the script never prints the key):
 #
 #   scripts/sign-update-key-record.sh --version <N> --key <NEW update-signing public key, hex>
 #
@@ -63,11 +66,14 @@
 # from the build's compiled-in key and pin. The record is independent of freenet.org:
 # serving files from the update address does not let anyone change or silence it.
 #
-# Optional. The newest record this build knows (hex of its 100 signed bytes), checked when the
-# build starts; none yet because no record has been published.
-# pinned_record = "<state printed by scripts/sign-update-key-record.sh>"
-authority_verifying_key = "river:v1:vk:9Ebskq4y7NvJpTQTrF1FAxU8g6bR4Rhe4TRikXba55EJ"
+# The newest record this build knows (hex of its 100 signed bytes), verified when the build
+# starts. v1 names the update key in apps/desktop/update-pubkey.hex (a test checks they match,
+# and that RIVER_UPDATE_PUBKEY_HEX does when it is set). It also wins over a different compiled
+# key: it is newer evidence than the build's environment. A build pointed at a local update
+# server (a debug or test-hooks build with a manifest override) reads no record at all.
+pinned_record = "00000001ce19db0789a8e80e1c88a0327e748cda3843102f052e70241cb09dfa77e5dfe274a46838d386b5dedab0ec5e2b73d3a3aaff31dded175894f8efca7f2c06961b539a09415a65c129e684758201b0c45badc1446bab475d2f4f4434bf1d373f0d"
+authority_verifying_key = "river:v1:vk:BjcR2x8vpUEPGLt72vm2L1ytL6JqTitZQvfpSogzMtxV"
 app_id = "river-desktop-update-key"
 # The fixed address the record is published at: derived from the pointer contract's frozen
 # code hash and (authority_verifying_key || app_id). Recorded for humans; a test recomputes it.
-pointer_key = "3xAggxNaYb7YSMVDJrWgmoZLE1aPUuZSbqm5dTULL57R"
+pointer_key = "EZsS4gAUzv22AME7SioNgiTw8ahioNZNkfkvrTjHfasU"

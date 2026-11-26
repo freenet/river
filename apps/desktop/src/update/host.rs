@@ -75,6 +75,7 @@ impl DesktopUpdate {
             .to_owned();
         let running = parse_version(env!("CARGO_PKG_VERSION")).ok()?;
         let over = manifest_override();
+        let allow_override = over.is_some();
         let key = super::pubkey();
         let cfg = Config {
             allow_loopback_http: over.is_some(),
@@ -87,7 +88,13 @@ impl DesktopUpdate {
             handshake_timeout: HANDSHAKE_TIMEOUT,
             floor: super::build_floor(),
             retry_delay: Duration::from_secs(30),
-            key_authority: keyrecord_authority(),
+            // A build pointed at a local update server (debug and test-hooks only) signs with a
+            // throwaway key that has nothing to do with the real record, so it reads none.
+            key_authority: if allow_override {
+                None
+            } else {
+                keyrecord_authority()
+            },
         };
         let updater = Updater::new(cfg, installer());
         // So the swap guard knows what is installed however early an update is applied.

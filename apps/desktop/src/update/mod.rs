@@ -28,7 +28,7 @@
 //!
 //! The record is a freenet-migrate pointer record at a fixed address derived from
 //! `update-authority.toml` (authority key and app id `river-desktop-update-key`): 100 bytes,
-//! signed by the authority key (River's author key, never the update-signing key), carrying a
+//! signed by the authority key (a dedicated offline key, neither River's author key nor the update-signing key), carrying a
 //! version that only rises and, as its payload, the trusted update-signing public key. An
 //! all-zero payload is a tombstone. [`keyrecord`] judges it with [`freenet_migrate::PointerResolver`],
 //! seeded with the higher of two floors: the record the last check kept in the state file

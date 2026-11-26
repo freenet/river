@@ -8,14 +8,15 @@
 #   scripts/sign-update-key-record.sh --version N --key <64 hex digits of the NEW update-signing public key>
 #   scripts/sign-update-key-record.sh --version N --withdraw
 #
-# The key file is $RIVER_POINTER_KEY_FILE, else ~/.config/river/web-container-keys.toml (the
-# same author key scripts/sign-pointer-records.sh uses). It is piped straight into the signer
-# and never lands in a variable, temp file or argv.
+# The authority key is held offline. Give it as a file in $RIVER_UPDATE_AUTHORITY_KEY_FILE, or on
+# stdin (for example from the password manager): an armored block whose lines include
+# `signing_key = "river:v1:sk:..."`. There is no default location. It is piped straight into
+# the signer and never lands in a variable, temp file or argv, and is never printed.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TOML_PATH="apps/desktop/update-authority.toml"
-KEY_FILE="${RIVER_POINTER_KEY_FILE:-$HOME/.config/river/web-container-keys.toml}"
+KEY_FILE="${RIVER_UPDATE_AUTHORITY_KEY_FILE:-}"
 cd "$REPO_ROOT"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -39,11 +40,17 @@ else
 fi
 
 command -v pointer-record >/dev/null 2>&1 || die "pointer-record not found (see scripts/check-pointer-freshness.sh for the install line)"
-[ -f "$KEY_FILE" ] || die "key file not found: $KEY_FILE (set RIVER_POINTER_KEY_FILE)"
-case "$(stat -c '%a' "$KEY_FILE")" in
-    600|400) ;;
-    *) die "$KEY_FILE must be mode 600" ;;
-esac
+if [ -n "$KEY_FILE" ]; then
+    [ -f "$KEY_FILE" ] || die "key file not found: $KEY_FILE"
+    case "$(stat -c '%a' "$KEY_FILE")" in
+        600|400) ;;
+        *) die "$KEY_FILE must be mode 600" ;;
+    esac
+    exec 3< "$KEY_FILE"
+else
+    [ ! -t 0 ] || die "give the authority key on stdin or set RIVER_UPDATE_AUTHORITY_KEY_FILE (no default: it is held offline)"
+    exec 3<&0
+fi
 [ -f "$TOML_PATH" ] || die "$TOML_PATH not found"
 
 field() { sed -n "s/^$1 *= *\"\(.*\)\"/\1/p" "$TOML_PATH" | head -n1; }
@@ -51,9 +58,9 @@ AUTHOR_VK="$(field authority_verifying_key)"
 APP_ID="$(field app_id)"
 [ -n "$AUTHOR_VK" ] && [ -n "$APP_ID" ] || die "could not read authority_verifying_key and app_id from $TOML_PATH"
 
-# --author-vk makes the signer REFUSE a key file that is not the authority named in the toml.
+# --author-vk makes the signer REFUSE a key that is not the authority named in the toml.
 OUT="$(pointer-record sign --author-vk "$AUTHOR_VK" --app-id "$APP_ID" \
-    --version "$VERSION" --code-hash "$NEW_KEY" < "$KEY_FILE")" || die "signing failed"
+    --version "$VERSION" --code-hash "$NEW_KEY" <&3)" || die "signing failed"
 STATE="$(printf '%s\n' "$OUT" | sed -n 's/^state=//p')"
 ADDR="$(printf '%s\n' "$OUT" | sed -n 's/^key=//p')"
 [ -n "$STATE" ] && [ -n "$ADDR" ] || die "the signer produced no state/key"

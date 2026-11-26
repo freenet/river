@@ -264,13 +264,18 @@ pub(crate) mod tests {
         let doc: toml::Table = AUTHORITY_TOML.parse().unwrap();
         let recorded = doc["pointer_key"].as_str().unwrap();
         assert_eq!(bs58::encode(a.pointer_id()).into_string(), recorded);
-        // The authority key is River's author key, which pointer-records.toml publishes.
+        // The authority is its own offline key: never River's online author key, so nobody
+        // quietly reverts to it.
         let records: toml::Table = include_str!("../../../../pointer-records.toml")
             .parse()
             .unwrap();
-        assert_eq!(
+        assert_ne!(
             doc["authority_verifying_key"],
             records["author_verifying_key"]
+        );
+        assert_eq!(
+            doc["authority_verifying_key"].as_str(),
+            Some("river:v1:vk:BjcR2x8vpUEPGLt72vm2L1ytL6JqTitZQvfpSogzMtxV")
         );
         assert_eq!(doc["app_id"].as_str(), Some("river-desktop-update-key"));
     }
@@ -454,5 +459,31 @@ pub(crate) mod tests {
         assert!(Authority::parse(&text).is_err());
         // The shipped file pins nothing yet, or pins a record that verifies (parse checks).
         assert!(Authority::shipped().is_ok());
+    }
+
+    #[test]
+    fn the_shipped_pin_verifies_and_names_the_update_key_this_build_signs_with() {
+        let a = Authority::shipped().unwrap();
+        let pin = a.pinned.as_deref().expect("the release pins its record");
+        // `parse` already verified it; this names what it says.
+        assert_eq!(effective(Some(&a), None), Effective::Key(file_key()));
+        assert!(floor_of(&a, pin).is_some());
+        // A fresh install of this build cannot be moved to an older record's key.
+        assert_eq!(
+            judge(&a, None, &KeyRecord::State(hex::decode(pin).unwrap())),
+            None
+        );
+        if let Some(env) = option_env!("RIVER_UPDATE_PUBKEY_HEX") {
+            assert_eq!(
+                hex::encode(file_key()),
+                env,
+                "the pin and the build's key differ"
+            );
+        }
+    }
+
+    fn file_key() -> [u8; 32] {
+        let hex = include_str!("../../update-pubkey.hex").trim();
+        <[u8; 32]>::try_from(hex::decode(hex).unwrap()).unwrap()
     }
 }
