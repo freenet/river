@@ -1652,9 +1652,29 @@ mod key_record {
         }));
         let err = u.check(&KeyRecord::Unavailable).unwrap_err();
         assert!(err.contains("signature"), "{err}");
+        assert!(err.contains("update key may have changed"), "{err}");
         let st = state::load(&data);
         assert_eq!(st.highest_sequence, 0, "the floor did not move");
         assert_eq!(st.highest_version, None);
         assert_eq!(st.last_checked, None);
+    }
+
+    #[test]
+    fn a_damaged_kept_record_uses_the_pins_key_when_the_build_pins_one() {
+        let ports = Ports::lock();
+        let server = ports.serve(vec![]);
+        let rig = Rig::new();
+        let mut u = rotating(&rig, &server);
+        // The build pins v1 naming key 2; its compiled key is 1.
+        let pin = hex::encode(record(1, key_of(2)));
+        u.cfg.key_authority = Some(authority().with_pinned(&pin).unwrap());
+        state::modify(rig.data.path(), |st| st.key_record = Some("zz".into())).unwrap();
+        release_signed_by(&server, 1);
+        assert!(
+            u.check(&KeyRecord::Unavailable).is_err(),
+            "not the compiled key"
+        );
+        release_signed_by(&server, 2);
+        offered(u.check(&KeyRecord::Unavailable));
     }
 }

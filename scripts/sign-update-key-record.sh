@@ -8,6 +8,10 @@
 #   scripts/sign-update-key-record.sh --version N --key <64 hex digits of the NEW update-signing public key>
 #   scripts/sign-update-key-record.sh --version N --withdraw
 #
+# Prebuild update_tool and set RIVER_UPDATE_TOOL before the key is anywhere near this machine:
+# without it, validating --key runs `cargo run`, which may fetch crates and run build scripts.
+# Every child started before the signer gets stdin from /dev/null, so none can read the key.
+#
 # The authority key is held offline. Give it as a file in $RIVER_UPDATE_AUTHORITY_KEY_FILE, or on
 # stdin (for example from the password manager): an armored block whose lines include
 # `signing_key = "river:v1:sk:..."`. There is no default location. It is piped straight into
@@ -40,9 +44,9 @@ else
     # A canonical point that is not weak: what the app itself requires of a key in a record.
     # RIVER_UPDATE_TOOL may name a prebuilt update_tool; otherwise it is built from apps/.
     if [ -n "${RIVER_UPDATE_TOOL:-}" ]; then
-        "$RIVER_UPDATE_TOOL" check-key "$NEW_KEY" || die "--key is not an acceptable update-signing public key"
+        "$RIVER_UPDATE_TOOL" check-key "$NEW_KEY" </dev/null || die "--key is not an acceptable update-signing public key"
     else
-        cargo run -q --manifest-path apps/Cargo.toml -p river-desktop --example update_tool -- check-key "$NEW_KEY" \
+        cargo run -q --manifest-path apps/Cargo.toml -p river-desktop --example update_tool -- check-key "$NEW_KEY" </dev/null \
             || die "--key is not an acceptable update-signing public key (or update_tool did not build)"
     fi
 fi
@@ -81,7 +85,7 @@ STATE="$(printf '%s\n' "$OUT" | sed -n 's/^state=//p')"
 ADDR="$(printf '%s\n' "$OUT" | sed -n 's/^key=//p')"
 [ -n "$STATE" ] && [ -n "$ADDR" ] || die "the signer produced no state/key"
 pointer-record verify --author-vk "$AUTHOR_VK" --app-id "$APP_ID" --state "$STATE" \
-    --expect-version "$VERSION" --expect-code-hash "$NEW_KEY" >/dev/null || die "the signed record does not verify"
+    --expect-version "$VERSION" --expect-code-hash "$NEW_KEY" </dev/null >/dev/null || die "the signed record does not verify"
 TOML_KEY="$(field pointer_key)"
 [ "$ADDR" = "$TOML_KEY" ] || die "signer address $ADDR != pointer_key $TOML_KEY in $TOML_PATH"
 

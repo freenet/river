@@ -459,8 +459,9 @@ impl Updater {
             // Under the state lock the key in force may no longer be the one the manifest was
             // fetched under (another River kept a rotation or a withdrawal during a slow
             // fetch): verify it again before any floor moves.
-            manifest::verify_and_parse(&manifest, &signature, &self.key(st)?)
-                .map_err(|r| r.to_string())?;
+            manifest::verify_and_parse(&manifest, &signature, &self.key(st)?).map_err(|r| {
+                format!("{r}; River's update key may have changed during the check, so try again")
+            })?;
             let trust = self.trust(st);
             let verdict = manifest::evaluate(
                 &parsed,
