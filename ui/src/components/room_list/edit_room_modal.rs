@@ -275,6 +275,7 @@ pub fn EditRoomModal() -> Element {
                                     p { class: "mt-1 text-[13px] text-text-muted",
                                         "Anyone with this link can read the room. They cannot post until they join."
                                     }
+                                    ShortLinkCopy { owner_vk: room_data.owner_vk }
                                 }
                             }
                             // Contract ID
@@ -542,6 +543,41 @@ pub fn EditRoomModal() -> Element {
 /// This is a child component rather than inline markup because the "Copied!"
 /// feedback needs `use_signal`, and the fields render inside an `if let`
 /// branch where a hook call would be conditional.
+/// "Copy short link" (freenet/river#973), a secondary action under the full
+/// public link. It appears only once a bounded lookup (one GET, no retry, 15 s)
+/// has found the room's resolver entry and verified it; otherwise nothing is
+/// shown. The full link above stays the default share link.
+#[component]
+fn ShortLinkCopy(owner_vk: VerifyingKey) -> Element {
+    // Once per mount, off the render path: the request is spawned.
+    use_hook(move || crate::short_resolve::request_check(owner_vk));
+    let published = match crate::short_resolve::PUBLISHED.try_read() {
+        Ok(p) => p.contains(&owner_vk),
+        Err(_) => {
+            crate::util::signal_guard::schedule_nudge();
+            false
+        }
+    };
+    if !published {
+        return rsx! {};
+    }
+    let link = crate::short_resolve::short_link(&owner_vk);
+    rsx! {
+        div { class: "mt-2 flex items-center gap-2", "data-testid": "room-short-link",
+            span {
+                "data-testid": "room-short-link-text",
+                class: "flex-1 min-w-0 px-3 py-2 bg-surface border border-border rounded-xl text-text-muted text-[13px] font-mono break-all select-text",
+                "{link}"
+            }
+            CopyButton {
+                value: link.clone(),
+                testid: "room-short-link-copy-button",
+                label: "Copy short link",
+            }
+        }
+    }
+}
+
 #[component]
 pub(crate) fn CopyButton(value: String, testid: String, label: String) -> Element {
     let mut copied = use_signal(|| false);

@@ -48,6 +48,12 @@ pub async fn handle_get_response(
         return Ok(());
     }
 
+    // A short room link's resolver entry (freenet/river#973), or the share
+    // dialog's check that one exists: not a room.
+    if crate::short_resolve::deliver_state(key.id(), &state) {
+        return Ok(());
+    }
+
     // A public room opened by `?room=` link (freenet/river#513): viewed
     // read-only, never one of the user's rooms.
     if crate::public_room::deliver_state(key.id(), &state) {
@@ -1459,6 +1465,9 @@ pub async fn handle_get_not_found(instance_id: ContractInstanceId) {
     // check asks again.
     if crate::components::app::freenet_api::generation_watch::is_watched(&instance_id) {
         info!("generation watch: pointer {instance_id} not found");
+        return;
+    }
+    if crate::short_resolve::deliver_not_found(&instance_id) {
         return;
     }
     if crate::public_room::deliver_not_found(&instance_id) {

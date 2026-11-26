@@ -24,6 +24,12 @@ type RiverTestHooks = {
   makeRoomPrivateWithoutSecret(): void;
   // Base58 owner key of an example room a ?room= link can open: "public" or "private"; "member" is a room in the list; "open", "hard" and "full" are public rooms that admit by proof of work (full has its one open slot held); "missing" is a valid key no room has. Only "member" is in the room list.
   viewableRoomKey(kind: "public" | "private" | "missing" | "member" | "open" | "hard" | "full"): string;
+  // Base58 short-link handle of a viewable example room; "missing" has no resolver entry, "mismatch" has an entry that points at another room's key.
+  shortHandle(kind: "public" | "private" | "open" | "hard" | "full" | "missing" | "mismatch"): string;
+  // Make the fixture resolver hold the short-link entry of the room with this owner key (base58) and forget earlier existence checks.
+  publishShortEntry(ownerKey: string): boolean;
+  // Resolver lookups this page has sent; a full link sends none.
+  resolverLookups(): number;
   // Which solver the last join used: "workers" (Web Workers) or "main" (the fallback); "" before any join.
   powSolverMode(): string;
   // As retargetPolicy, for the room the user is a member of (the current room). False if there is none.

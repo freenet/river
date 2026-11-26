@@ -37,9 +37,8 @@ pub const ROOM_PARAM: &str = "room";
 
 /// An Ed25519 verifying key.
 const OWNER_KEY_BYTES: usize = 32;
-/// The short handle proposed in #972 (22 base58 characters). Recognised now so
-/// a short link says so instead of reading as a corrupt key; resolving one is
-/// a later step.
+/// The short handle (21 or 22 base58 characters, freenet/river#973): resolved
+/// to the owner key by [`crate::short_resolve`].
 const SHORT_HANDLE_BYTES: usize = 16;
 
 /// Why a `?room=` value was refused.
@@ -47,11 +46,19 @@ const SHORT_HANDLE_BYTES: usize = 16;
 pub enum RoomLinkError {
     Empty,
     NotBase58,
-    /// Decodes to 16 bytes: the future short handle.
-    ShortHandle,
+    /// Decodes to 16 bytes but is not a handle's one canonical spelling.
+    BadHandle,
     BadLength(usize),
     /// 32 bytes, but not a valid Ed25519 public key.
     NotAKey,
+    /// The resolver's answer for a short link does not parse.
+    HandleMalformed,
+    /// The resolver returned a key that does not hash to the short link's
+    /// handle: refused, nothing is opened.
+    HandleMismatch,
+    /// The Official room's short link resolved to a key other than the
+    /// Official room's.
+    OfficialMismatch,
 }
 
 impl RoomLinkError {
@@ -62,7 +69,22 @@ impl RoomLinkError {
                 "This room link is not valid: the room key contains characters a key never has."
                     .to_string()
             }
-            Self::ShortHandle => "Short room links are not supported yet.".to_string(),
+            Self::BadHandle => {
+                "This short link is not valid: it is not spelled the way a short link is."
+                    .to_string()
+            }
+            Self::HandleMalformed => {
+                "This short link cannot be opened: what it points to is not a room key."
+                    .to_string()
+            }
+            Self::HandleMismatch => {
+                "This short link cannot be trusted: what it points to does not match the link, so it was not opened."
+                    .to_string()
+            }
+            Self::OfficialMismatch => {
+                "This short link cannot be trusted: it does not lead to the Official room, so it was not opened."
+                    .to_string()
+            }
             Self::BadLength(n) => format!(
                 "This room link is not valid: a room key decodes to {OWNER_KEY_BYTES} bytes, this one to {n}."
             ),
@@ -71,12 +93,21 @@ impl RoomLinkError {
     }
 }
 
+/// What a `?room=` value names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoomLink {
+    /// The owner's key itself: the canonical address.
+    Key(VerifyingKey),
+    /// A short handle, to be resolved to the key first.
+    Handle(crate::short_handle::ShortHandle),
+}
+
 /// Parse a `?room=` value: the owner's `VerifyingKey` in base58, which is the
-/// canonical room id (see the interface decision on freenet/river#972).
+/// canonical room id (see the interface decision on freenet/river#972), or a
+/// 16-byte short handle (freenet/river#973).
 ///
-/// The handle forms are told apart by decoded length, so a 16-byte value is
-/// reported as a short handle rather than a bad key.
-pub fn parse_room_param(raw: &str) -> Result<VerifyingKey, RoomLinkError> {
+/// The two forms are told apart by decoded length.
+pub fn parse_room_link(raw: &str) -> Result<RoomLink, RoomLinkError> {
     let raw = raw.trim();
     if raw.is_empty() {
         return Err(RoomLinkError::Empty);
@@ -87,13 +118,28 @@ pub fn parse_room_param(raw: &str) -> Result<VerifyingKey, RoomLinkError> {
         .map_err(|_| RoomLinkError::NotBase58)?;
     match decoded.len() {
         OWNER_KEY_BYTES => {}
-        SHORT_HANDLE_BYTES => return Err(RoomLinkError::ShortHandle),
+        SHORT_HANDLE_BYTES => {
+            return crate::short_handle::ShortHandle::from_base58(raw)
+                .map(RoomLink::Handle)
+                .map_err(|_| RoomLinkError::BadHandle)
+        }
         n => return Err(RoomLinkError::BadLength(n)),
     }
     let bytes: [u8; OWNER_KEY_BYTES] = decoded
         .try_into()
         .map_err(|_| RoomLinkError::BadLength(0))?;
-    VerifyingKey::from_bytes(&bytes).map_err(|_| RoomLinkError::NotAKey)
+    VerifyingKey::from_bytes(&bytes)
+        .map(RoomLink::Key)
+        .map_err(|_| RoomLinkError::NotAKey)
+}
+
+/// [`parse_room_link`] for a value that must be a full key.
+#[cfg(test)]
+pub fn parse_room_param(raw: &str) -> Result<VerifyingKey, RoomLinkError> {
+    match parse_room_link(raw)? {
+        RoomLink::Key(vk) => Ok(vk),
+        RoomLink::Handle(_) => Err(RoomLinkError::BadLength(SHORT_HANDLE_BYTES)),
+    }
 }
 
 /// The base58 form of a room's owner key: the address in the link.
@@ -111,16 +157,30 @@ const RIVER_WEB_APP: &str = include_str!("../../published-contract/contract-id.t
 /// the sharer was on (so it also works from a hosted instance such as
 /// try.freenet.org). `ui/src/util/share_link.rs` accepts it as it is.
 pub fn public_room_link(owner_vk: &VerifyingKey) -> String {
+    link_for(&owner_key_b58(owner_vk))
+}
+
+/// The share-link form around a `?room=` value: a full key (the default link)
+/// or a short handle (the secondary "Copy short link").
+pub fn link_for(room_param: &str) -> String {
     format!(
-        "https://freenet.org/open#{}/?{ROOM_PARAM}={}",
-        RIVER_WEB_APP.trim(),
-        owner_key_b58(owner_vk)
+        "https://freenet.org/open#{}/?{ROOM_PARAM}={room_param}",
+        RIVER_WEB_APP.trim()
     )
 }
 
 /// What the viewer has learned about the room so far.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ViewedRoomStatus {
+    /// A short link whose handle is being resolved to the room's key.
+    Resolving,
+    /// The short link has no resolver entry ("isn't registered yet").
+    HandleNotFound,
+    /// The resolver lookup failed before it could answer: says nothing about
+    /// whether the entry exists.
+    HandleTransportError,
+    /// Nothing answered the resolver lookup in time.
+    HandleTimedOut,
     /// Asked the network (or not yet connected).
     Loading,
     /// No peer has the room, or its state could not be read.
@@ -137,8 +197,11 @@ pub enum ViewedRoomStatus {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ViewedRoom {
-    /// `None` only for an invalid link.
+    /// `None` for an invalid link, and for a short link until it resolves.
     pub owner_vk: Option<VerifyingKey>,
+    /// The handle of a short link being resolved (or whose resolution failed).
+    /// `None` for a full link, and once the key is known.
+    pub handle: Option<crate::short_handle::ShortHandle>,
     pub status: ViewedRoomStatus,
 }
 
@@ -538,6 +601,7 @@ fn set_status(owner_vk: VerifyingKey, status: ViewedRoomStatus) {
         if still_viewed {
             *VIEWED_ROOM.write() = Some(ViewedRoom {
                 owner_vk: Some(owner_vk),
+                handle: None,
                 status,
             });
         }
@@ -576,34 +640,93 @@ pub fn open_from_discover(owner_key_b58: &str) {
     *VIEWED_ROOM.write() = Some(viewed);
 }
 
-/// What a `?room=` value opens: the room (waiting for the network) or the
-/// reason it was refused. Records what the response handlers match on.
+/// What a `?room=` value opens: the room (waiting for the network), a short
+/// link being resolved, or the reason it was refused. Records what the response
+/// handlers match on.
 fn viewed_from_param(raw: &str) -> ViewedRoom {
-    match parse_room_param(raw) {
-        Ok(owner_vk) => {
-            // The no-sync example build has no network: answer from fixtures.
-            #[cfg(all(feature = "example-data", feature = "no-sync"))]
-            let status = classify_state(crate::example_data::viewable_room_state(&owner_vk));
-            #[cfg(not(all(feature = "example-data", feature = "no-sync")))]
-            let status = ViewedRoomStatus::Loading;
-            lookup_begin(&owner_vk);
+    match parse_room_link(raw) {
+        Ok(RoomLink::Key(owner_vk)) => viewed_for_owner(owner_vk),
+        Ok(RoomLink::Handle(handle)) => {
+            // A new link replaces whatever was being viewed or resolved.
+            set_mirror(None);
             *HELD.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            set_mirror(Some(Mirror {
-                owner_vk,
-                id: *crate::util::owner_vk_to_contract_key(&owner_vk).id(),
-                requested: false,
-                status: status.clone(),
-            }));
+            lookup_begin_handle(&handle);
+            crate::short_resolve::begin(handle);
             ViewedRoom {
-                owner_vk: Some(owner_vk),
-                status,
+                owner_vk: None,
+                handle: Some(handle),
+                status: ViewedRoomStatus::Resolving,
             }
         }
         Err(e) => ViewedRoom {
             owner_vk: None,
+            handle: None,
             status: ViewedRoomStatus::Invalid(e),
         },
     }
+}
+
+/// The viewer for a room whose owner key is known, from a full link or from a
+/// verified short link.
+fn viewed_for_owner(owner_vk: VerifyingKey) -> ViewedRoom {
+    // The no-sync example build has no network: answer from fixtures.
+    #[cfg(all(feature = "example-data", feature = "no-sync"))]
+    let status = classify_state(crate::example_data::viewable_room_state(&owner_vk));
+    #[cfg(not(all(feature = "example-data", feature = "no-sync")))]
+    let status = ViewedRoomStatus::Loading;
+    lookup_begin(&owner_vk);
+    *HELD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    set_mirror(Some(Mirror {
+        owner_vk,
+        id: *crate::util::owner_vk_to_contract_key(&owner_vk).id(),
+        requested: false,
+        status: status.clone(),
+    }));
+    ViewedRoom {
+        owner_vk: Some(owner_vk),
+        handle: None,
+        status,
+    }
+}
+
+/// Show a status for the short link being resolved. Called by
+/// [`crate::short_resolve`] after it has recorded the status itself.
+pub fn show_handle_status(handle: crate::short_handle::ShortHandle, status: ViewedRoomStatus) {
+    crate::util::defer(move || {
+        let still_viewed = VIEWED_ROOM
+            .try_read()
+            .ok()
+            .is_some_and(|v| v.as_ref().and_then(|r| r.handle) == Some(handle));
+        if still_viewed {
+            *VIEWED_ROOM.write() = Some(ViewedRoom {
+                owner_vk: None,
+                handle: Some(handle),
+                status,
+            });
+        }
+    });
+}
+
+/// The short link resolved to a verified owner key: from here the page behaves
+/// as if it had been opened on `?room=<key>`, so the room lookup, held answers,
+/// the user's-own-room redirect and subscription are all the existing ones.
+pub fn open_resolved(handle: crate::short_handle::ShortHandle, owner_vk: VerifyingKey) {
+    crate::util::defer(move || {
+        let still_viewed = VIEWED_ROOM
+            .try_read()
+            .ok()
+            .is_some_and(|v| v.as_ref().and_then(|r| r.handle) == Some(handle));
+        if still_viewed {
+            let viewed = viewed_for_owner(owner_vk);
+            *VIEWED_ROOM.write() = Some(viewed);
+        }
+    });
+}
+
+/// Try again after a short link's not-found, error or timeout.
+pub fn retry_handle(handle: crate::short_handle::ShortHandle) {
+    lookup_begin_handle(&handle);
+    crate::short_resolve::retry(handle);
 }
 
 /// Which `?room=` value to open: none when the URL also carries an
@@ -695,6 +818,7 @@ pub fn redirect_to_member_room(owner: VerifyingKey) {
 fn close_now() {
     crate::public_join::reset();
     set_mirror(None);
+    crate::short_resolve::end();
     *HELD.lock().unwrap_or_else(|e| e.into_inner()) = None;
     set_answer_held(false);
     let showing = VIEWED_ROOM.try_read().ok().is_some_and(|v| v.is_some());
@@ -769,6 +893,17 @@ pub fn lookup_begin(owner_vk: &VerifyingKey) {
         "public room: lookup start {iso} (room {})",
         room_prefix(owner_vk)
     );
+}
+
+/// [`lookup_begin`] for a short link, whose room is not known yet.
+fn lookup_begin_handle(handle: &crate::short_handle::ShortHandle) {
+    *LOOKUP_START_MS.lock().unwrap_or_else(|e| e.into_inner()) = now_ms();
+    dioxus::logger::tracing::info!("public room: short link lookup start (handle {handle})");
+}
+
+/// [`now_ms`] for the resolver check's re-check interval.
+pub fn now_ms_pub() -> f64 {
+    now_ms()
 }
 
 fn room_prefix(owner_vk: &VerifyingKey) -> String {
@@ -1124,11 +1259,31 @@ mod tests {
     }
 
     #[test]
-    fn sixteen_bytes_is_a_short_handle_not_a_corrupt_key() {
-        let handle = bs58::encode([5u8; SHORT_HANDLE_BYTES]).into_string();
-        let err = parse_room_param(&handle).unwrap_err();
-        assert_eq!(err, RoomLinkError::ShortHandle);
-        assert!(err.message().contains("not supported yet"));
+    fn sixteen_bytes_is_a_short_handle_and_is_not_a_key() {
+        use crate::short_handle::ShortHandle;
+        let handle = ShortHandle::derive(key().as_bytes());
+        let text = handle.to_base58();
+        assert_eq!(parse_room_link(&text), Ok(RoomLink::Handle(handle)));
+        assert_eq!(parse_room_link(&format!(" {text}\n")), Ok(RoomLink::Handle(handle)));
+        // A full key is still a key.
+        assert_eq!(
+            parse_room_link(&owner_key_b58(&key())),
+            Ok(RoomLink::Key(key()))
+        );
+        // Anywhere a key is required, a handle is not one.
+        assert_eq!(parse_room_param(&text), Err(RoomLinkError::BadLength(16)));
+        // 17 bytes is neither.
+        let seventeen = bs58::encode([5u8; 17]).into_string();
+        assert_eq!(parse_room_link(&seventeen), Err(RoomLinkError::BadLength(17)));
+        // Nothing says "not supported yet" any more.
+        assert!(!RoomLinkError::BadHandle.message().contains("not supported"));
+    }
+
+    #[test]
+    fn the_refusals_name_what_happened() {
+        assert!(RoomLinkError::HandleMismatch.message().contains("does not match"));
+        assert!(RoomLinkError::OfficialMismatch.message().contains("Official room"));
+        assert!(RoomLinkError::HandleMalformed.message().contains("cannot be opened"));
     }
 
     #[test]

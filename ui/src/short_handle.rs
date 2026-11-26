@@ -397,10 +397,8 @@ mod tests {
         // formula and compare with the stdlib's own result.
         let code = ContractCode::from(b"some wasm".to_vec());
         let handle = ShortHandle::derive(&key_of(1));
-        let expected = ContractInstanceId::from_params_and_code(
-            Parameters::from(handle.0.to_vec()),
-            &code,
-        );
+        let expected =
+            ContractInstanceId::from_params_and_code(Parameters::from(handle.0.to_vec()), &code);
         let mut h = blake3::Hasher::new();
         h.update(&**code.hash());
         h.update(&handle.0);

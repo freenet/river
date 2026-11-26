@@ -1027,6 +1027,7 @@ fn viewed_state() -> Option<(VerifyingKey, ChatRoomStateV1)> {
         ViewedRoom {
             owner_vk: Some(owner),
             status: ViewedRoomStatus::Public(state),
+            ..
         } => Some((*owner, (**state).clone())),
         _ => None,
     }
