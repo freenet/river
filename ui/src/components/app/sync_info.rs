@@ -197,6 +197,15 @@ impl SyncInfo {
         }
     }
 
+    /// Record a skipped local change, as a pass does (`room_needs_update`).
+    /// For the test hooks, which set up a held room without a pass.
+    #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
+    pub(crate) fn hold_update_for_test(&mut self, owner_key: &VerifyingKey) {
+        if let Some(info) = self.map.get_mut(owner_key) {
+            info.update_held = true;
+        }
+    }
+
     /// Record that a request registering a subscription for `owner_key`'s
     /// room was sent in its current `Subscribing` spell. Call after the
     /// status is set to `Subscribing`.

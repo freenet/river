@@ -1414,9 +1414,7 @@ pub fn install_test_hooks() {
                     sync_info.register_new_room(key);
                     sync_info.update_sync_status(&key, RoomSyncStatus::Subscribing);
                     sync_info.update_last_synced_state(&key, &state);
-                    if let Some(info) = sync_info.map.get_mut(&key) {
-                        info.update_held = true;
-                    }
+                    sync_info.hold_update_for_test(&key);
                 });
             });
         })
