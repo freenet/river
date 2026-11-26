@@ -417,6 +417,7 @@ impl RiverApp {
         }
         self.focused = focused;
         self.focus_known = true;
+        self.chat.set_window_front(focused);
         if focused {
             self.missed = Default::default();
             // The update block in front counts as told.

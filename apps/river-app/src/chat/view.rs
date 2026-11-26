@@ -69,6 +69,7 @@ pub fn view(chat: &Chat, logo: Option<&Pixels>, cx: &mut Cx<RiverApp>) -> El {
         super::shortcuts::shortcuts_dialog(chat, win_h, &k, &mut layer);
     }
     screen = screen.child(link_menu(chat, &k, &mut layer));
+    screen = screen.child(room_menu(chat, &k, &mut layer));
     let Some(room) = chat.room() else {
         return rune_kit::root(screen.child(no_rooms(chat, &p)), layer);
     };
@@ -146,6 +147,34 @@ fn link_menu(chat: &Chat, k: &Kit, layer: &mut Vec<El>) -> El {
         },
     ))
     .on_close(|s: &mut RiverApp| s.chat.link_menu = None)
+    .build(k, layer)
+}
+
+/// The menu a right-click on a room in the list opens: move it up or down, as the web UI's drag
+/// does. The returned element is the zero-size trigger the menu hangs from.
+fn room_menu(chat: &Chat, k: &Kit, layer: &mut Vec<El>) -> El {
+    let (key, press) = match &chat.room_menu {
+        Some((key, press)) => (key.clone(), Some(*press)),
+        None => (String::new(), None),
+    };
+    let (can_up, can_down) = chat.can_move(&key);
+    let (up_key, down_key) = (key.clone(), key);
+    rune_kit::context_menu(
+        "room-menu",
+        el().key("room-menu-anchor").size(0.0, 0.0),
+        press,
+    )
+    .item(
+        rune_kit::MenuItem::new("Move up")
+            .disabled(!can_up)
+            .on_select(move |s: &mut RiverApp| s.chat.move_room(&up_key, -1)),
+    )
+    .item(
+        rune_kit::MenuItem::new("Move down")
+            .disabled(!can_down)
+            .on_select(move |s: &mut RiverApp| s.chat.move_room(&down_key, 1)),
+    )
+    .on_close(|s: &mut RiverApp| s.chat.room_menu = None)
     .build(k, layer)
 }
 
@@ -818,6 +847,7 @@ fn preview_chars(row_width: f32, badge: bool) -> usize {
 
 fn room_row(room: &Room, unread_count: usize, selected: bool, width: f32, p: &Palette) -> El {
     let key = room.key.clone();
+    let menu_key = room.key.clone();
     let unread = unread_count > 0 && !selected;
     let strong = unread || selected;
     let preview = room.last_message().map_or_else(
@@ -857,6 +887,11 @@ fn room_row(room: &Room, unread_count: usize, selected: bool, width: f32, p: &Pa
         .radius(8.0)
         .cursor(rune::Cursor::Pointer)
         .on_press(move |s: &mut RiverApp| s.chat.select(&key))
+        .on_secondary_press(
+            move |s: &mut RiverApp, press: rune::PointerPress, _: &mut rune::Tx| {
+                s.chat.open_room_menu(&menu_key, press)
+            },
+        )
         .child(
             col()
                 .grow(1.0)

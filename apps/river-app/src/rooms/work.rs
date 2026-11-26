@@ -120,6 +120,9 @@ use super::dm_store::{self, DmOp, EntryKey};
 use super::identity::{self, IdentityToken, ImportWrite};
 use super::leave::{meta_without_room, tombstone_write};
 use super::modes::{NotificationMode, meta_with_mode};
+use super::order::meta_with_order;
+use super::read::{Known, slot_with_marker};
+use river_core::room_state::message::MessageOrderKey;
 use super::rekey::{self, Found, Policy, Probe};
 
 /// How many times a write is worked out again after another writer got in first. The web UI's
@@ -253,6 +256,20 @@ enum Kind {
     Mode {
         room: VerifyingKey,
         mode: NotificationMode,
+    },
+    /// Store `order` (the room list as shown) as the room order in `rooms_meta` (the one step,
+    /// `Meta`), keeping what else is there ([`super::order`]). Like `Mode`, it holds no room and
+    /// is shown only when it fails.
+    Order {
+        order: Vec<VerifyingKey>,
+    },
+    /// Move `room`'s read marker to `mark` in its slot (the one step, `Slot`), never backwards
+    /// ([`super::read`]). `known` are the places of the room's messages as this app holds them.
+    /// Holds no room and is never shown: a marker that could not be stored is not worth a row.
+    Read {
+        room: VerifyingKey,
+        mark: MessageOrderKey,
+        known: Known,
     },
     /// Leave `room` (named `name` on the screen): tombstone its key (the step `Slot`), then take
     /// it out of `rooms_meta` (`Meta`), as the web UI's leave does ([`super::leave`]).
@@ -524,7 +541,12 @@ impl Task {
             Kind::Leave { room, .. } => Some(*room),
             Kind::Import { export, .. } => Some(export.room_owner),
             Kind::Seed { room, .. } => Some(*room),
-            Kind::Mode { .. } | Kind::DmSave { .. } | Kind::Carry(_) | Kind::Refused(_) => None,
+            Kind::Mode { .. }
+            | Kind::Order { .. }
+            | Kind::Read { .. }
+            | Kind::DmSave { .. }
+            | Kind::Carry(_)
+            | Kind::Refused(_) => None,
         }
     }
 
@@ -549,6 +571,16 @@ impl Task {
         matches!(self.kind, Kind::Mode { .. })
     }
 
+    /// Whether this only saves the room order.
+    fn is_order(&self) -> bool {
+        matches!(self.kind, Kind::Order { .. })
+    }
+
+    /// Whether this only moves a read marker.
+    fn is_read(&self) -> bool {
+        matches!(self.kind, Kind::Read { .. })
+    }
+
     /// Whether this changes the sent-message store.
     fn is_dm(&self) -> bool {
         matches!(self.kind, Kind::DmSave { .. })
@@ -566,6 +598,8 @@ impl Task {
             Kind::Join { plan, .. } => plan.as_ref().map(|p| &p.room),
             Kind::Leave { .. }
             | Kind::Mode { .. }
+            | Kind::Order { .. }
+            | Kind::Read { .. }
             | Kind::DmSave { .. }
             | Kind::Carry(_)
             | Kind::Seed { .. }
@@ -589,6 +623,8 @@ impl Task {
             Kind::Import { replace: true, .. } => "Replacing your ID in a room".to_owned(),
             Kind::Import { .. } => "Importing your ID".to_owned(),
             Kind::Mode { .. } => "Saving the notification setting".to_owned(),
+            Kind::Order { .. } => "Saving the room order".to_owned(),
+            Kind::Read { .. } => "Saving the read position".to_owned(),
             Kind::DmSave { .. } => "Saving sent messages".to_owned(),
             Kind::Leave { name, .. } => format!("Leaving “{name}”"),
             Kind::Carry(c) => carry_line(c),
@@ -683,6 +719,7 @@ impl Task {
             (Kind::Join { .. }, Step::Slot) => Step::Update,
             (Kind::Join { .. }, Step::Update) => Step::Meta,
             (Kind::Leave { .. }, Step::Slot) => Step::Meta,
+            (Kind::Read { .. }, Step::Slot) => Step::Done,
             (Kind::Import { .. }, Step::Slot) => Step::Meta,
             (_, Step::Meta) => Step::Done,
             (_, step) => step,
@@ -775,6 +812,22 @@ impl Task {
                 )
             });
         }
+        if let Kind::Order { order } = &self.kind {
+            return meta_with_order(value, order).map_err(|e| {
+                format!(
+                    "The room order was not saved: River's room list in its storage can't be \
+                     read by this app ({e}), so it stays as it was."
+                )
+            });
+        }
+        if let Kind::Read { mark, known, .. } = &self.kind {
+            return slot_with_marker(value, mark, known).map_err(|e| {
+                format!(
+                    "The read position was not saved: the room in River's storage can't be \
+                     read by this app ({e}), so it stays as it was."
+                )
+            });
+        }
         if let Kind::Leave { room, identity, .. } = &self.kind {
             return if self.step == Step::Slot {
                 // Joined again since (another invitation, or the web UI), under another key:
@@ -856,6 +909,22 @@ pub struct Work {
     delegate_shared: bool,
     /// Earlier room-contract keys whose read was given up on, until their answer comes.
     late: HashMap<ContractInstanceId, Instant>,
+    /// Read markers waiting their turn, by room: the furthest one asked for since the room's last
+    /// write, and when it may be written ([`Work::mark_read`]).
+    held_reads: HashMap<VerifyingKey, HeldRead>,
+    /// When each room's last read marker write was started.
+    last_read_write: HashMap<VerifyingKey, Instant>,
+}
+
+/// The least time between two read marker writes for one room. The web UI saves a room at most
+/// every `ROOM_SNAPSHOT_MIN_INTERVAL_MS`; a reader of a busy room moves the marker with every
+/// message, and each write is a read and a store through the node.
+pub const READ_WRITE_INTERVAL: Duration = Duration::from_secs(10);
+
+struct HeldRead {
+    mark: MessageOrderKey,
+    known: Known,
+    due: Instant,
 }
 
 impl Work {
@@ -1223,6 +1292,93 @@ impl Work {
         out
     }
 
+    /// Store `order`, the room list as shown, as the room order. A save still waiting to start
+    /// is replaced by this one (the order shown is the whole order), so moving quickly writes the
+    /// last arrangement.
+    pub fn set_order(&mut self, order: Vec<VerifyingKey>) {
+        if let Some(Task {
+            kind: Kind::Order { order: queued },
+            ..
+        }) = self
+            .tasks
+            .iter_mut()
+            .rev()
+            .find(|t| t.is_order() && t.running() && t.out.is_none() && t.phase == Phase::Read)
+        {
+            *queued = order;
+            return;
+        }
+        self.push(Kind::Order { order }, Step::Meta);
+        // Nothing here changes what the stored rooms say beyond what the screen already shows.
+        if let Some(t) = self.tasks.back_mut() {
+            t.reload_asked = true;
+        }
+    }
+
+    /// The order chosen and still being stored: it overrides what a read of the store says,
+    /// which is older. One that failed is not here, so the store's word stands.
+    pub fn pending_order(&self) -> Option<Vec<VerifyingKey>> {
+        self.tasks.iter().rev().find_map(|t| match &t.kind {
+            Kind::Order { order } if t.running() => Some(order.clone()),
+            _ => None,
+        })
+    }
+
+    /// The user has read `room` up to `mark` (a place in the room, with `known` the places of the
+    /// messages this app holds). Written to the room's slot at once if the room's last write was
+    /// longer ago than [`READ_WRITE_INTERVAL`], else held and written when that has passed; marks
+    /// that come meanwhile are folded into the held one, the furthest kept. So a reader of a busy
+    /// room causes one write per interval, and a marker never moves back.
+    pub fn mark_read(
+        &mut self,
+        room: VerifyingKey,
+        mark: MessageOrderKey,
+        known: Known,
+        now: Instant,
+    ) {
+        match self.held_reads.get_mut(&room) {
+            Some(held) => {
+                if mark > held.mark {
+                    held.mark = mark;
+                    held.known = known;
+                }
+            }
+            None => {
+                let due = self
+                    .last_read_write
+                    .get(&room)
+                    .map_or(now, |at| (*at + READ_WRITE_INTERVAL).max(now));
+                self.held_reads.insert(room, HeldRead { mark, known, due });
+            }
+        }
+    }
+
+    /// Start the writes of the held read markers that are due.
+    fn release_reads(&mut self, now: Instant) {
+        let due: Vec<VerifyingKey> = self
+            .held_reads
+            .iter()
+            .filter(|(_, h)| h.due <= now)
+            .map(|(room, _)| *room)
+            .collect();
+        for room in due {
+            let Some(HeldRead { mark, known, .. }) = self.held_reads.remove(&room) else {
+                continue;
+            };
+            self.last_read_write.insert(room, now);
+            self.push(Kind::Read { room, mark, known }, Step::Slot);
+            if let Some(t) = self.tasks.back_mut() {
+                t.reload_asked = true;
+            }
+        }
+    }
+
+    /// Whether a read marker is held for `room`, or being written.
+    #[cfg(test)]
+    fn read_held(&self, room: &VerifyingKey) -> bool {
+        self.held_reads.contains_key(room)
+    }
+
     /// Change the sent-message store by `ops` (one write at a time: nothing is queued while
     /// another is). False when one is already queued or working.
     pub fn dm_save(&mut self, ops: Vec<DmOp>, listed: bool) -> bool {
@@ -1519,6 +1675,7 @@ impl Work {
             return None;
         }
         let unit = self.jitter_unit.unwrap_or_else(rand::random::<f64>);
+        self.release_reads(now);
         let t = self.active()?;
         if t.out.is_some() {
             return None;
@@ -1628,7 +1785,9 @@ impl Work {
                 )
             }
             (Step::Slot | Step::Meta, _) => {
-                let key = if t.step == Step::Slot {
+                let key = if let Kind::Read { room, .. } = &t.kind {
+                    room_storage_key(room)
+                } else if t.step == Step::Slot {
                     room_storage_key(&owner?)
                 } else if t.is_dm() {
                     dm_cache::KEY.to_vec()
@@ -2160,8 +2319,10 @@ impl Work {
         asked
             .into_iter()
             .chain(background)
-            .filter(|t| !t.is_dm())
-            .filter(|t| !((t.is_mode() || t.is_leave()) && t.step == Step::Done))
+            .filter(|t| !t.is_dm() && !t.is_read())
+            .filter(|t| {
+                !((t.is_mode() || t.is_order() || t.is_leave()) && t.step == Step::Done)
+            })
             .filter(|t| match &t.kind {
                 // Carrying rooms over is shown while it works, and when it failed with something
                 // to try again. Not once done (the rooms show), and not when River moved on
@@ -2187,11 +2348,14 @@ impl Work {
 
     /// Drop finished tasks whose room is shown.
     pub fn forget_done(&mut self, shown: &dyn Fn(&VerifyingKey) -> bool) {
+        // A read marker that ended, stored or not, is forgotten: the next one carries its own.
+        self.tasks.retain(|t| !(t.is_read() && !t.running()));
         self.tasks.retain(|t| {
             !(t.step == Step::Done
                 && t.failed.is_none()
                 && !t.is_seed()
                 && (t.is_mode()
+                    || t.is_order()
                     || t.is_carry()
                     || (!t.is_leave() && t.owner().is_some_and(|o| shown(&o)))))
         });

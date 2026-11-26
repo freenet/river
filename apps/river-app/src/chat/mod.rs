@@ -298,6 +298,13 @@ pub struct Chat {
     /// The link a right-click landed on, and where: the link menu (Open, Copy link) is open
     /// there. Cleared when the menu closes.
     pub link_menu: Option<(String, rune::PointerPress)>,
+    /// The room a right-click on the room list landed on, and where: its menu (Move up, Move
+    /// down) is open there. Cleared when the menu closes.
+    pub room_menu: Option<(String, rune::PointerPress)>,
+    /// Whether the window is in front (it is, until told otherwise): what the user is reading.
+    window_front: bool,
+    /// The newest message (`Message::key`) reported read for each room, so each is reported once.
+    read_sent: HashMap<String, String>,
     /// The composer's emoji picker is open, and on which category.
     pub emoji_open: bool,
     pub emoji_category: usize,
@@ -507,6 +514,87 @@ impl Chat {
         }
     }
 
+    /// Open the menu of the room keyed `key` at `press`.
+    pub fn open_room_menu(&mut self, key: &str, press: rune::PointerPress) {
+        if self.rooms.iter().any(|r| r.key == key) {
+            self.room_menu = Some((key.to_owned(), press));
+        }
+    }
+
+    /// Move the room keyed `key` one place up (`delta` -1) or down (1) in the list, as the web
+    /// UI's drag does: shown at once, and for rooms from the node stored beside the web UI's
+    /// order ([`Action::MoveRoom`]). A room at the end of the list stays.
+    pub fn move_room(&mut self, key: &str, delta: i32) {
+        self.room_menu = None;
+        let Some(at) = self.rooms.iter().position(|r| r.key == key) else {
+            return;
+        };
+        let to = at as i64 + i64::from(delta);
+        if to < 0 || to >= self.rooms.len() as i64 {
+            return;
+        }
+        // Moving up goes before the room above; moving down goes before the room two below, or to
+        // the end when there is none.
+        let before = if delta < 0 {
+            Some(self.rooms[at - 1].key.clone())
+        } else {
+            self.rooms.get(at + 2).map(|r| r.key.clone())
+        };
+        let room = self.rooms.remove(at);
+        self.rooms.insert(to as usize, room);
+        if matches!(self.source, Source::Node(_)) {
+            self.emit(key.to_owned(), Action::MoveRoom { before });
+        }
+    }
+
+    /// Whether the room keyed `key` can move one place up or down in the list.
+    pub fn can_move(&self, key: &str) -> (bool, bool) {
+        let Some(at) = self.rooms.iter().position(|r| r.key == key) else {
+            return (false, false);
+        };
+        (at > 0, at + 1 < self.rooms.len())
+    }
+
+    /// The window came to the front or went away.
+    pub fn set_window_front(&mut self, front: bool) {
+        self.window_front = front;
+        self.report_read();
+    }
+
+    /// The open history now shows its newest message, or does not.
+    pub fn set_at_bottom(&mut self, at: bool) {
+        self.at_bottom = at;
+        self.report_read();
+    }
+
+    /// Tell the node the open room is read up to its newest message, as the web UI does when the
+    /// newest message is on screen in a window in front: only a room from the node, only with the
+    /// history at its end, and not under a direct-message thread. Each newest message is reported
+    /// once; the writer decides how often it is stored ([`crate::rooms::work`]), and never moves
+    /// the position back.
+    fn report_read(&mut self) {
+        if !matches!(self.source, Source::Node(_))
+            || !self.window_front
+            || !self.at_bottom
+            || self.dm.is_open()
+        {
+            return;
+        }
+        let Some(room) = self.room() else {
+            return;
+        };
+        // Not a message of yours still on its way: the node does not have it yet.
+        let Some(newest) = room.messages.iter().rev().find(|m| m.pending.is_none()) else {
+            return;
+        };
+        if self.read_sent.get(&room.key) == Some(&newest.key) {
+            return;
+        }
+        let (room_key, up_to) = (room.key.clone(), newest.key.clone());
+        self.read_sent.insert(room_key.clone(), up_to.clone());
+        self.emit(room_key, Action::MarkRead { up_to });
+    }
+
     /// Open the notification dialog of the open room.
     pub fn open_notify_dialog(&mut self) {
         if let Some(room) = self.room() {
@@ -548,6 +636,9 @@ impl Chat {
             members_open: true,
             members_overlay: false,
             link_menu: None,
+            room_menu: None,
+            window_front: true,
+            read_sent: HashMap::new(),
             emoji_open: false,
             emoji_category: 0,
             mention_sel: (String::new(), 0),
@@ -831,6 +922,7 @@ impl Chat {
                 self.read.insert(room.key.clone(), mark);
             }
         }
+        self.report_read();
         arrived
     }
 
@@ -895,6 +987,11 @@ impl Chat {
     /// Open the room keyed `key`, marking it read. The composer's text stays with the room it
     /// was typed in. Unknown keys are ignored.
     pub fn select(&mut self, key: &str) {
+        self.select_room(key);
+        self.report_read();
+    }
+
+    fn select_room(&mut self, key: &str) {
         let Some(room) = self.rooms.iter_mut().find(|r| r.key == key) else {
             return;
         };
