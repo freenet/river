@@ -59,6 +59,16 @@ impl Chat {
         let Some(room) = self.room().map(|r| r.key.clone()) else {
             return;
         };
+        // Its remembered offset has not been put back yet: where the history is now was never
+        // the reader's place, so the memory stays as it was.
+        if self
+            .scroll_memory
+            .restore
+            .as_ref()
+            .is_some_and(|r| r.room == room)
+        {
+            return;
+        }
         let (offset, at_end) = {
             let pos = self.history_pos.borrow();
             if pos.key != scroll_key(&room) {

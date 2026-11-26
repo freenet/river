@@ -110,6 +110,26 @@ fn a_room_scrolled_up_reopens_at_the_same_offset() {
     assert_eq!(rt.scroll_at_bottom(WINDOW), Some(false));
 }
 
+/// Leaving again after the history drew at its end but before the restore ran keeps the
+/// remembered offset: that end position was never the reader's.
+#[test]
+fn leaving_before_the_restore_ran_keeps_the_offset() {
+    let mut rt = long_room(|_| {});
+    scroll_up(&mut rt, 500.0);
+    select(&mut rt, B);
+    // Reopen and draw, without the per-frame hook that applies the restore.
+    rt.update(|s, _| s.chat.select(A));
+    settle(&mut rt);
+    assert_eq!(
+        rt.scroll_at_bottom(WINDOW),
+        Some(true),
+        "premise: drawn at its end"
+    );
+    select(&mut rt, B);
+    select(&mut rt, A);
+    assert_offset(&rt, 500.0);
+}
+
 #[test]
 fn several_separate_scrolls_before_leaving_are_all_remembered() {
     let mut rt = long_room(|_| {});
