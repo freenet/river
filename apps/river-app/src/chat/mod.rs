@@ -53,6 +53,8 @@ mod quick_reply;
 #[cfg(test)]
 mod reply_jump_tests;
 #[cfg(test)]
+mod scroll_memory_tests;
+#[cfg(test)]
 mod scroll_tests;
 pub mod search;
 pub mod settings;
