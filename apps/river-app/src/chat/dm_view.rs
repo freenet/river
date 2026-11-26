@@ -716,6 +716,8 @@ impl Chat {
     /// the thread's stash always reaches its draft ([`Chat::merge_stash`]). Returns the thread.
     pub(super) fn leave_dm(&mut self) -> Option<(String, String)> {
         let closed = self.dm.open.take()?;
+        // The room's history is drawn afresh, back where it was left.
+        self.stage_restore();
         self.merge_stash(&closed);
         self.dm.purge.keep_confirm_for(None);
         Some(closed)
@@ -750,6 +752,7 @@ impl Chat {
         if !known {
             return false;
         }
+        self.remember_scroll();
         // A thread left for another gets what a notification reply left for it.
         if let Some(prev) = self.dm.open.clone()
             && (prev.0 != room || prev.1 != uid)

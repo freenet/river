@@ -52,6 +52,9 @@ pub mod overview;
 mod quick_reply;
 #[cfg(test)]
 mod reply_jump_tests;
+mod scroll_memory;
+#[cfg(test)]
+mod scroll_memory_tests;
 #[cfg(test)]
 mod scroll_tests;
 pub mod search;
@@ -440,6 +443,8 @@ pub struct Chat {
     pub overview: bool,
     /// A message to scroll to once the room it is in is on screen.
     reveal: Option<overview::Reveal>,
+    /// Each room's scroll offset when it was left away from its end, and the one being restored.
+    scroll_memory: scroll_memory::ScrollMemory,
     /// Why a reply typed into a notification was not sent, shown above the composer.
     reply_notices: std::collections::BTreeMap<String, String>,
     /// When the switcher's chord last arrived, for [`switcher::chord_gate`].
@@ -466,6 +471,8 @@ pub struct HistoryPos {
     offset: f32,
     /// The furthest offset the view reports it can scroll to.
     max: f32,
+    /// How many reports the history has made, so a wait can tell a new one from an old one.
+    reports: u64,
     pending: Option<f32>,
 }
 
@@ -768,6 +775,7 @@ impl Chat {
             reply_dragged: false,
             overview: false,
             reveal: None,
+            scroll_memory: Default::default(),
             reply_notices: Default::default(),
             chord_at: None,
             node: Default::default(),
@@ -862,6 +870,9 @@ impl Chat {
     /// bytes, and losing typed text costs the user.
     pub fn set_rooms(&mut self, rooms: Vec<Room>) {
         self.rooms = rooms;
+        if self.full_list {
+            self.scroll_memory.retain_rooms(&self.rooms);
+        }
         // An export dialog is about one room: when that room leaves the list, the dialog and its
         // token go with it. Only a FULL list says so: a partial one while reconnecting or
         // catching up (see `show_node_rooms`) lacks rooms that are still there.
@@ -1065,6 +1076,9 @@ impl Chat {
     }
 
     fn select_room(&mut self, key: &str) {
+        if key != self.selected {
+            self.remember_scroll();
+        }
         let Some(room) = self.rooms.iter_mut().find(|r| r.key == key) else {
             return;
         };
@@ -1103,6 +1117,7 @@ impl Chat {
                 self.composer = draft;
             }
             self.selected = key.to_owned();
+            self.stage_restore();
             self.opened_room();
             return;
         }
@@ -1111,6 +1126,7 @@ impl Chat {
         outgoing.focused = false;
         self.park_draft(self.selected.clone(), outgoing);
         self.selected = key.to_owned();
+        self.stage_restore();
         self.opened_room();
     }
     /// Send what the composer holds to the open room. Blank text sends nothing; otherwise the
@@ -1447,6 +1463,7 @@ impl Chat {
             }
             pos.offset = offset;
             pos.max = p.max[1];
+            pos.reports += 1;
         }
     }
 
