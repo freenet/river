@@ -21,6 +21,8 @@ mod pow_worker;
 mod public_join;
 mod public_room;
 mod room_data;
+mod short_handle;
+mod short_resolve;
 pub mod signing;
 #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
 mod test_hooks;

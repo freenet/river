@@ -7,6 +7,19 @@ import { captureClipboardWrites, clipboardWrites } from "./clipboard";
 // membership. The example build has no network, so it resolves the key from
 // two fixture rooms that are NOT in the room list (one public, one private).
 
+// Base58 of `n` bytes of 5, built with the page's alphabet rules (no node needed).
+function bs58Of(n: number): string {
+  const A = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+  let x = 0n;
+  for (let i = 0; i < n; i++) x = x * 256n + 5n;
+  let out = "";
+  while (x > 0n) {
+    out = A[Number(x % 58n)] + out;
+    x /= 58n;
+  }
+  return out;
+}
+
 async function keyOf(page: Page, kind: "public" | "private" | "missing" | "member") {
   await page.goto("/");
   await waitForApp(page);
@@ -61,9 +74,9 @@ test("an invalid key is refused with a clear error", async ({ page }) => {
   await expect(page.getByTestId("viewed-room-invalid")).toContainText("not valid");
   await expect(page.getByTestId("viewed-room-message")).toHaveCount(0);
 
-  // A 16-byte short handle is recognised, and not supported yet.
-  await openLink(page, "XNbNWgRwN1puAJWaaxGEgc");
-  await expect(page.getByTestId("viewed-room-invalid")).toContainText("Short room links are not supported yet");
+  // A 17-byte value is neither a key nor a short handle (short links: short-handle-link.spec.ts).
+  await openLink(page, bs58Of(17));
+  await expect(page.getByTestId("viewed-room-invalid")).toContainText("not valid");
   expect(panics).toEqual([]);
 });
 

@@ -870,6 +870,7 @@ impl FreenetSynchronizer {
                             Err(e) => {
                                 error!("Received error in API response: {}", e);
                                 crate::public_room::deliver_error(&e.to_string());
+                                crate::short_resolve::deliver_error(&e.to_string());
                                 crate::components::app::chat_delegate::note_sweep_error(
                                     &e.to_string(),
                                 );
@@ -1183,7 +1184,7 @@ mod tests {
         let arm = production
             .find("Received error in API response")
             .expect("the error arm must exist");
-        let arm_text = production.get(arm..arm + 700).unwrap();
+        let arm_text = production.get(arm..arm + 800).unwrap();
         assert!(arm_text.contains("note_register_error_for_register_ack(key)"));
         assert!(
             arm_text.contains("names_current_register_error(&e.to_string(), &current)"),

@@ -453,6 +453,62 @@ pub fn install_test_hooks() {
         .into_js_value(),
     );
 
+    // The short-link handle (base58) of a viewable example room, "missing" (a key no
+    // resolver entry exists for) or "mismatch" (an entry that points at another room's key).
+    set_hook(
+        "shortHandle",
+        Closure::<dyn FnMut(String) -> String>::new(move |kind: String| {
+            use crate::short_handle::ShortHandle;
+            if kind == "mismatch" {
+                return ShortHandle(crate::example_data::MISMATCH_HANDLE).to_base58();
+            }
+            if kind == "missing" {
+                let vk = SigningKey::from_bytes(&[0x53; 32]).verifying_key();
+                return ShortHandle::derive(vk.as_bytes()).to_base58();
+            }
+            crate::example_data::viewable_fixtures()
+                .iter()
+                .find(|(k, _, _)| *k == kind)
+                .map(|(_, vk, _)| ShortHandle::derive(vk.as_bytes()).to_base58())
+                .unwrap_or_default()
+        })
+        .into_js_value(),
+    );
+    // Make the fixture resolver hold the short-link entry of the room with this owner key
+    // (base58), and forget earlier existence checks, as a publish would. False for a bad key.
+    set_hook(
+        "publishShortEntry",
+        Closure::<dyn FnMut(String) -> bool>::new(move |owner: String| {
+            let Ok(crate::public_room::RoomLink::Key(vk)) =
+                crate::public_room::parse_room_link(&owner)
+            else {
+                return false;
+            };
+            crate::example_data::PUBLISHED_ENTRIES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(vk);
+            crate::short_resolve::forget_checks();
+            true
+        })
+        .into_js_value(),
+    );
+    // How many resolver lookups this page has sent (a full link sends none).
+    set_hook(
+        "resolverLookups",
+        Closure::<dyn FnMut() -> u32>::new(move || crate::short_resolve::lookups_sent())
+            .into_js_value(),
+    );
+
+    // Follow a short link (base58 handle) inside the page, without closing the current viewer.
+    set_hook(
+        "viewShortLink",
+        Closure::<dyn FnMut(String)>::new(move |handle: String| {
+            crate::util::defer(move || crate::public_room::view_for_test(&handle));
+        })
+        .into_js_value(),
+    );
+
     // View another example room in place, without closing the current viewer.
     set_hook(
         "viewRoom",

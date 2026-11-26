@@ -9,9 +9,11 @@ use crate::components::icons::{line_icon, MENU_ICON_PATH};
 use crate::components::room_list::receive_invitation_modal::invitation_accept_disabled;
 use crate::public_join::{self, offers_join, JoinPhase, JOIN};
 use crate::public_room::{
-    close, composer_note, fetch_action, request_fetch, request_subscribe, retry, waiting_hint,
-    FetchAction, ViewedRoom, ViewedRoomStatus, VIEWED_ROOM,
+    close, composer_note, fetch_action, request_fetch, request_subscribe, retry, retry_handle,
+    waiting_hint, FetchAction, ViewedRoom, ViewedRoomStatus, VIEWED_ROOM,
 };
+use crate::short_handle::ShortHandle;
+use crate::short_resolve;
 use crate::util::display_name::{contains_hidden_chars, display_nickname, EMOJI_REJECTION_MESSAGE};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
@@ -46,6 +48,9 @@ pub fn ViewedRoomPane() -> Element {
     // the room is known to be public, and again after each reconnect.
     let last_connected = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(false)));
     let asked = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(false)));
+    // The short link whose resolver GET this pane has sent.
+    let resolve_asked: std::rc::Rc<std::cell::Cell<Option<ShortHandle>>> =
+        use_hook(|| std::rc::Rc::new(std::cell::Cell::new(None)));
     use_effect(move || {
         crate::util::signal_guard::anchor();
         let connected = match SYNC_STATUS.try_read() {
@@ -80,9 +85,29 @@ pub fn ViewedRoomPane() -> Element {
             crate::util::signal_guard::schedule_nudge();
             return;
         };
+        // A short link: resolve the handle first, in parallel with nothing
+        // else (not gated on the user's rooms loading). The no-sync example
+        // build has no socket and is answered from fixtures.
+        if let Some(ViewedRoom {
+            owner_vk: None,
+            handle: Some(handle),
+            status,
+        }) = viewed.as_ref()
+        {
+            let can_send = connected || cfg!(feature = "no-sync");
+            if short_resolve::should_request(can_send, resolve_asked.get(), *handle, status) {
+                resolve_asked.set(Some(*handle));
+                short_resolve::request(*handle);
+            }
+            return;
+        }
+        // Not (or no longer) a short link being resolved: a later link to the
+        // same handle, followed in place, must send its own GET.
+        resolve_asked.set(None);
         let Some(ViewedRoom {
             owner_vk: Some(owner_vk),
             status,
+            ..
         }) = viewed.as_ref()
         else {
             return;
@@ -148,7 +173,9 @@ pub fn ViewedRoomPane() -> Element {
                 ViewedRoomStatus::Public(state) => rsx! {
                     PublicRoomView { owner_vk: viewed.owner_vk, state: *state }
                 },
-                other => rsx! { Notice { status: other, owner_vk: viewed.owner_vk } },
+                other => rsx! {
+                    Notice { status: other, owner_vk: viewed.owner_vk, handle: viewed.handle }
+                },
             }
         }
     }
@@ -169,8 +196,40 @@ fn close_button() -> Element {
 }
 
 #[component]
-fn Notice(status: ViewedRoomStatus, owner_vk: Option<ed25519_dalek::VerifyingKey>) -> Element {
+fn Notice(
+    status: ViewedRoomStatus,
+    owner_vk: Option<ed25519_dalek::VerifyingKey>,
+    handle: Option<ShortHandle>,
+) -> Element {
     let (testid, title, body) = match &status {
+        ViewedRoomStatus::Resolving => {
+            let connected = SYNC_STATUS
+                .try_read()
+                .map(|s| matches!(&*s, SynchronizerStatus::Connected))
+                .unwrap_or(false);
+            (
+                "viewed-room-resolving",
+                "Opening short link".to_string(),
+                short_resolve::waiting_hint(connected || cfg!(feature = "no-sync")).to_string(),
+            )
+        }
+        ViewedRoomStatus::HandleNotFound => (
+            "viewed-room-handle-not-found",
+            "Short link not found".to_string(),
+            "This short link isn't registered yet.".to_string(),
+        ),
+        ViewedRoomStatus::HandleTransportError => (
+            "viewed-room-handle-error",
+            "Couldn't look up this short link".to_string(),
+            "The lookup failed before it got an answer, which says nothing about the link. Check your connection and try again."
+                .to_string(),
+        ),
+        ViewedRoomStatus::HandleTimedOut => (
+            "viewed-room-handle-timed-out",
+            "No answer yet".to_string(),
+            "Nothing replied about this short link. Check your connection and try again."
+                .to_string(),
+        ),
         ViewedRoomStatus::Loading => {
             // Before the GET is sent the pane is waiting on the connection.
             // An unreadable signal falls back to the usual text.
@@ -212,10 +271,16 @@ fn Notice(status: ViewedRoomStatus, owner_vk: Option<ed25519_dalek::VerifyingKey
         ),
         ViewedRoomStatus::Public(_) => ("viewed-room-loading", String::new(), String::new()),
     };
-    let can_retry = matches!(
+    let can_retry = (matches!(
         status,
         ViewedRoomStatus::NotFound | ViewedRoomStatus::TimedOut
-    ) && owner_vk.is_some();
+    ) && owner_vk.is_some())
+        || (matches!(
+            status,
+            ViewedRoomStatus::HandleNotFound
+                | ViewedRoomStatus::HandleTransportError
+                | ViewedRoomStatus::HandleTimedOut
+        ) && handle.is_some());
     rsx! {
         div { class: "flex-1 flex items-center justify-center p-6",
             div {
@@ -232,6 +297,8 @@ fn Notice(status: ViewedRoomStatus, owner_vk: Option<ed25519_dalek::VerifyingKey
                             onclick: move |_| {
                                 if let Some(owner_vk) = owner_vk {
                                     crate::util::defer(move || retry(owner_vk));
+                                } else if let Some(handle) = handle {
+                                    crate::util::defer(move || retry_handle(handle));
                                 }
                             },
                             "Try again"
@@ -343,6 +410,7 @@ pub fn ViewedMemberList() -> Element {
     let Some(ViewedRoom {
         owner_vk,
         status: ViewedRoomStatus::Public(state),
+        ..
     }) = viewed
     else {
         return rsx! {};
@@ -404,6 +472,7 @@ pub fn ViewedRailRow() -> Element {
     let Some(ViewedRoom {
         owner_vk: Some(_),
         status: ViewedRoomStatus::Public(state),
+        ..
     }) = viewed
     else {
         return rsx! {};

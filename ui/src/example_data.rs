@@ -382,6 +382,44 @@ pub fn fixture_owner_sk(kind: &str) -> Option<SigningKey> {
     Some(SigningKey::from_bytes(&[seed; 32]))
 }
 
+/// The handle the no-sync fixture resolver answers with another room's key.
+#[cfg(feature = "no-sync")]
+pub const MISMATCH_HANDLE: [u8; 16] = [0xEE; 16];
+
+/// Rooms whose short-link entry the fixture resolver holds, besides the
+/// viewable fixture rooms (which always have one). A test adds one with the
+/// `publishShortEntry` hook.
+#[cfg(feature = "no-sync")]
+pub static PUBLISHED_ENTRIES: std::sync::Mutex<Vec<VerifyingKey>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// What the fixture resolver holds at the contract `id`: a viewable room's own
+/// entry, an entry for a room published by a test, a deliberately wrong entry
+/// ([`MISMATCH_HANDLE`] points at the public fixture room, whose key does not
+/// hash to that handle), or nothing. The no-sync build has no node to ask.
+#[cfg(feature = "no-sync")]
+pub fn resolver_fixture(id: &freenet_stdlib::prelude::ContractInstanceId) -> Option<Vec<u8>> {
+    use crate::short_handle::{minimal_state, ShortHandle};
+    let published: Vec<VerifyingKey> = PUBLISHED_ENTRIES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let candidates = viewable_fixtures()
+        .iter()
+        .map(|(_, vk, _)| *vk)
+        .chain(published);
+    for vk in candidates {
+        if ShortHandle::derive(vk.as_bytes()).resolver_instance_id() == *id {
+            return Some(minimal_state(vk.as_bytes()));
+        }
+    }
+    if ShortHandle(MISMATCH_HANDLE).resolver_instance_id() == *id {
+        let (_, vk, _) = viewable_fixtures().first()?;
+        return Some(minimal_state(vk.as_bytes()));
+    }
+    None
+}
+
 /// The fixture room whose owner key is `owner_vk`.
 pub fn viewable_room_state(owner_vk: &VerifyingKey) -> Option<ChatRoomStateV1> {
     viewable_fixtures()
