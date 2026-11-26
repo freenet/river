@@ -85,11 +85,13 @@
 //! **What the user sees.** A task working, failed (with why, Try again and Dismiss) or done
 //! ([`WorkView`]). Nothing fails without saying so.
 //!
-//! What this leaves to the web UI: for a room the user owns, asking the delegate to follow it
-//! (`EnsureRoomSubscription`), which the web UI does for every stored room each time it loads
-//! (`hydrate_loaded_rooms_with_authority` in `freenet_api/response_handler.rs`). The room's
-//! signing key is stored in the delegate by the background sweep in [`super::keys`], not by
-//! these tasks, so a task is done as soon as the room is stored.
+//! Asking the delegate to follow a room the user owns (`EnsureRoomSubscription`, which lets it
+//! rotate a private room's secret when the members change) is not a step of these tasks. The
+//! background sweep in [`super::keys`] sends it, once per room per connection, after it has
+//! verified the room's signing key in the delegate (the delegate refuses without it), so a
+//! task is done as soon as the room is stored. (The web UI sends it for every stored room it
+//! owns each time it loads, `hydrate_loaded_rooms_with_authority` in
+//! `freenet_api/response_handler.rs`.)
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};

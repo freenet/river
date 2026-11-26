@@ -175,6 +175,17 @@ for n in gw peer; do
   fi
 done
 
+# Print only, never a failure: does the chat delegate log receipt of EnsureRoomSubscription
+# (the app asks it to follow a room the user owns, once the room's key is stored and the
+# generation watch has confirmed the build)? It becomes a gate once it has been seen on both
+# pinned Freenet releases. On a fresh network the pointer records may be unreachable, in which
+# case the app does not ask and no line appears.
+for n in gw peer; do
+  echo "--- EnsureRoomSubscription lines on the $n node (informational)"
+  find "$WORK/$n/log" -name 'freenet.*.log' ! -name 'freenet.error.*' -print0 2>/dev/null \
+    | sort -z | xargs -0 -r grep -h "EnsureRoomSubscription room=" 2>/dev/null | tail -n 5 || true
+done
+
 # The app pointed at the gateway as a node it was told about, on a port other than 7509.
 FWD=$PEER_NET   # TCP; the peer's network port of that number is UDP
 for mode in saved env tunnel; do

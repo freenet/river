@@ -437,6 +437,51 @@ fn a_current_network_leaves_writes_on() {
     assert!(!watch.is_stale());
 }
 
+/// `confirmed_current` fails closed: only a record naming this build's generation counts, not
+/// silence, an absent pointer, a watch of nothing, or a newer record.
+#[test]
+fn the_room_contract_is_confirmed_only_by_a_record_naming_this_build() {
+    let watched = test_watched();
+    let confirmed = |answers: Vec<(ContractInstanceId, Fetch)>, watched: Vec<Watched>| {
+        let source = Arc::new(FakePointers::default());
+        *source.answer.lock().unwrap() = answers;
+        let watch = Watch::new(watched, source, None);
+        assert!(
+            !watch.confirmed_current(Artifact::RoomContract),
+            "before any check"
+        );
+        settle(&watch);
+        watch.confirmed_current(Artifact::RoomContract)
+    };
+    let ids = (watched[0].pointer_id, watched[1].pointer_id);
+    assert!(confirmed(
+        vec![
+            (ids.0, Fetch::State(room_state(1))),
+            (ids.1, Fetch::State(delegate_state(1)))
+        ],
+        watched.clone()
+    ));
+    assert!(!confirmed(Vec::new(), watched.clone()), "unreachable");
+    assert!(
+        !confirmed(
+            vec![(ids.0, Fetch::Absent), (ids.1, Fetch::Absent)],
+            watched.clone()
+        ),
+        "absent"
+    );
+    assert!(!confirmed(Vec::new(), Vec::new()), "nothing watched");
+    assert!(
+        !confirmed(
+            vec![
+                (ids.0, Fetch::State(room_state(1))),
+                (ids.1, Fetch::State(delegate_state(2)))
+            ],
+            watched
+        ),
+        "River moved on"
+    );
+}
+
 #[test]
 fn a_newer_delegate_closes_the_gate_and_is_kept() {
     let dir = temp_dir("newer");

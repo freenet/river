@@ -617,6 +617,13 @@ struct World {
     key_stores: Vec<([u8; 32], [u8; 32], bool)>,
     /// Every `GetPublicKey` received.
     key_reads: Vec<[u8; 32]>,
+    /// Every `EnsureRoomSubscription` received: the room, the correlator, the contract id, and
+    /// whether the delegate held a key for the room when it arrived.
+    ensures: Vec<([u8; 32], u64, [u8; 32], bool)>,
+    /// The delegate refuses every `EnsureRoomSubscription`.
+    refuse_ensure: bool,
+    /// The delegate never answers `EnsureRoomSubscription`.
+    silent_ensure: bool,
     /// How the delegate answers the signing key requests.
     key_play: KeyPlay,
     /// The connection a key request was left unanswered on, until another connection.
@@ -1331,6 +1338,30 @@ fn answer(world: &Mutex<World>, n: usize, bytes: &[u8]) -> Vec<Vec<u8>> {
                                 room_key,
                                 result: Ok(()),
                             }
+                        }
+                    }
+                    // `handle_ensure_room_subscription`: refuses without the room's key.
+                    ChatDelegateRequestMsg::EnsureRoomSubscription {
+                        room_owner_vk,
+                        request_id,
+                        contract_id,
+                    } => {
+                        let held = w.signing_keys.contains_key(&room_owner_vk);
+                        w.ensures
+                            .push((room_owner_vk, request_id, contract_id, held));
+                        if w.silent_ensure {
+                            continue;
+                        }
+                        ChatDelegateResponseMsg::EnsureRoomSubscriptionResponse {
+                            room_owner_vk,
+                            request_id,
+                            result: if w.refuse_ensure {
+                                Err("refused".into())
+                            } else if held {
+                                Ok(())
+                            } else {
+                                Err("no signing key".into())
+                            },
                         }
                     }
                     other => panic!("the app sent a request it must not: {other:?}"),
@@ -4333,6 +4364,109 @@ fn a_created_rooms_signing_key_is_stored_once_under_the_owner_key() {
     });
 }
 
+/// A session whose watch has confirmed this build's room contract is current, with a created
+/// room beside "A", both the user's own.
+fn create_and_wait_confirmed(node: &FakeNode, label: &str) -> (Running, PathBuf) {
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let source = Arc::new(FakePointers::default());
+    let (session, dir) = following_watched(
+        node,
+        &[&a],
+        label,
+        Outbox::default(),
+        watched(&source, Some(1)),
+    );
+    session.list(Action::CreateRoom {
+        name: "Book club".into(),
+        nickname: "Ada".into(),
+        private: false,
+    });
+    session.wait_rooms("the new room is in the list", |r, _, _| {
+        r.iter().any(|r| r.name == "Book club")
+    });
+    (session, dir)
+}
+
+/// Both rooms here are the user's own (the created one, and "A", which holds its own key):
+/// once a room's key is stored and verified, and the watch has confirmed the build, the
+/// delegate is asked to follow it, once, with the room's contract id and the key already held.
+#[test]
+fn an_owned_room_is_registered_with_the_delegate_once_after_its_key() {
+    let node = fake_node(vec![]);
+    let (session, _dir) = create_and_wait_confirmed(&node, "key-ensure");
+    session.wait_until("both rooms were registered", || {
+        node.with(|w| w.ensures.len() >= 2)
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    node.with(|w| {
+        assert_eq!(w.ensures.len(), 2, "{:?}", w.ensures);
+        assert_ne!(w.ensures[0].0, w.ensures[1].0, "one each");
+        for (room, _, contract, held) in &w.ensures {
+            assert!(held, "asked before the key was the delegate's");
+            let owner = VerifyingKey::from_bytes(room).unwrap();
+            assert_eq!(
+                *contract,
+                super::super::delegate::independent_contract_id(&owner)
+            );
+        }
+    });
+}
+
+/// With no confirmation that this build's room contract is current (a watch with nothing to
+/// watch, as an unreachable pointer leaves it), keys are stored and nothing is asked.
+#[test]
+fn nothing_is_registered_without_the_generation_watchs_confirmation() {
+    let node = fake_node(vec![]);
+    let (session, _dir) = create_and_wait(&node, "key-no-ensure");
+    session.wait_until("both keys are in the delegate", || {
+        node.with(|w| w.signing_keys.len() == 2)
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(node.with(|w| w.ensures.is_empty()));
+}
+
+/// A refusal is taken quietly: asked once per room, no more, and the connection stays.
+#[test]
+fn a_refused_registration_is_not_repeated_and_does_not_reconnect() {
+    let node = fake_node(vec![]);
+    node.with(|w| w.refuse_ensure = true);
+    let (session, _dir) = create_and_wait_confirmed(&node, "key-ensure-refused");
+    session.wait_until("both rooms were asked", || {
+        node.with(|w| w.ensures.len() >= 2)
+    });
+    std::thread::sleep(Duration::from_millis(600));
+    node.with(|w| {
+        assert_eq!(w.ensures.len(), 2, "{:?}", w.ensures);
+        assert_eq!(w.connections.len(), 1, "no reconnect for a refusal");
+    });
+}
+
+/// An ask the delegate never answers retires the connection once (a late error would name no
+/// request), and each room is asked once in all: the reconnect does not repeat it.
+#[test]
+fn an_unanswered_registration_retires_the_connection_once_and_is_not_repeated() {
+    let node = fake_node(vec![]);
+    node.with(|w| w.silent_ensure = true);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let source = Arc::new(FakePointers::default());
+    let (session, _dir) = following_watched(
+        &node,
+        &[&a],
+        "key-ensure-silent",
+        Outbox::default(),
+        watched(&source, Some(1)),
+    );
+    session.wait_until(
+        "the ask went unanswered and the connection was replaced",
+        || node.with(|w| !w.ensures.is_empty() && w.connections.len() >= 2),
+    );
+    std::thread::sleep(Duration::from_millis(1500));
+    node.with(|w| {
+        assert_eq!(w.ensures.len(), 1, "asked again: {:?}", w.ensures);
+        assert_eq!(w.connections.len(), 2, "a reconnect loop");
+    });
+}
+
 /// A join's key is the invitee's own key, under the room owner's key.
 #[test]
 fn a_joined_rooms_signing_key_is_the_members_under_the_owner_key() {
@@ -4359,6 +4493,12 @@ fn a_joined_rooms_signing_key_is_the_members_under_the_owner_key() {
     });
     std::thread::sleep(Duration::from_millis(300));
     node.with(|w| {
+        // The joined room is not the user's own: the delegate is never asked to follow it.
+        assert!(
+            w.ensures.iter().all(|(r, ..)| *r != room.vk().to_bytes()),
+            "{:?}",
+            w.ensures
+        );
         let joined = key_stores_besides(w, &other.vk());
         assert_eq!(
             joined,
