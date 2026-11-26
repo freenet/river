@@ -875,6 +875,9 @@ impl FreenetSynchronizer {
                                 if let Some(key) = legacy_not_installed_key(&e) {
                                     info!("A legacy delegate is not installed on this node; noted for the migration journal");
                                     note_legacy_delegate_not_installed(key);
+                                    crate::components::app::legacy_sweep_marker::note_legacy_absent(
+                                        key.bytes(),
+                                    );
                                 } else if names_current_missing(&e, &current) {
                                     warn!("The CURRENT chat delegate was reported missing; registering it (freenet/river#707, #757)");
                                     on_current_delegate_missing();
