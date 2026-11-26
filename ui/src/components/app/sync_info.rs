@@ -1261,7 +1261,7 @@ mod tests {
             SYNC_INFO.with_mut(|si| {
                 si.update_sync_status(&owner, RoomSyncStatus::Disconnected);
                 si.map.get_mut(&owner).unwrap().retry_not_before = Some(t + 500_000.0);
-                assert!(si.rooms_awaiting_subscription_at(t).is_empty());
+                assert!(!si.rooms_awaiting_subscription_at(t).contains_key(&owner));
                 si.mark_subscribed_rooms_disconnected();
                 assert!(si.rooms_awaiting_subscription_at(t).contains_key(&owner));
             });

@@ -1402,8 +1402,8 @@ pub fn install_test_hooks() {
     // baseline, so every message posted afterwards is one that was not sent.
     set_hook(
         "holdRoomUpdates",
-        Closure::<dyn FnMut(bool)>::new(|errored: bool| {
-            crate::util::defer(|| {
+        Closure::<dyn FnMut(bool)>::new(move |errored: bool| {
+            crate::util::defer(move || {
                 let Some(key) = CURRENT_ROOM.peek().owner_key else {
                     return;
                 };
