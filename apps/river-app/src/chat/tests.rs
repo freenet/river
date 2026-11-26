@@ -1581,6 +1581,120 @@ fn a_name_that_imitates_the_owner_is_warned_about() {
     assert!(rt.find("member-tag-impersonation").is_none());
 }
 
+/// The web UI's `member-list-impersonation-warning` and `message-author-impersonation-warning`:
+/// the member list row and the author line of a member whose name imitates the owner's.
+#[test]
+fn a_look_alike_name_is_warned_about_in_the_list_and_on_their_messages() {
+    let mut state = connected();
+    let mut impostor = 0;
+    state.chat.edit_rooms(|rooms| {
+        let room = &mut rooms[0];
+        let owner = room
+            .members
+            .iter()
+            .find(|m| m.role == super::model::Role::Owner)
+            .unwrap()
+            .id;
+        // Cyrillic "а" for the first "a".
+        let mut m = super::model::Member::new(91, "M\u{0430}ya Chen", super::model::Role::Member);
+        m.invited_by = Some(owner);
+        impostor = m.id;
+        room.members.push(m);
+        let mid = room.messages.last().map_or(0, |m| m.id) + 1;
+        room.messages.push(super::model::Message {
+            id: mid,
+            key: "impostor-msg".into(),
+            author: impostor,
+            time: room.messages.last().map_or(0, |m| m.time) + 1,
+            text: "hello".into(),
+            source: String::new(),
+            md: String::new(),
+            reply_to: None,
+            reply_gone: false,
+            reactions: Vec::new(),
+            edited: false,
+            pending: None,
+        });
+    });
+    let rt = render(state, WINDOW_SIZE);
+    let info = |rt: &Runtime<RiverApp>, key: &str| {
+        rt.elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some(key))
+            .unwrap_or_else(|| panic!("{key} is not drawn"))
+    };
+    // The list row and the author line carry the web UI's sentence as tooltip and as the sign's
+    // accessible label.
+    for key in [
+        format!("member-impersonation-{impostor}"),
+        "author-impersonation-sign-impostor-msg".to_owned(),
+    ] {
+        let e = info(&rt, &key);
+        assert_eq!(e.help.as_deref(), Some(super::member_modal::IMPERSONATION));
+        assert_eq!(e.label.as_deref(), Some(super::member_modal::IMPERSONATION));
+    }
+    // A screen reader reads the row's label, so the warning is in it.
+    let row = info(&rt, &format!("member-{impostor}"));
+    assert_eq!(
+        row.label.as_deref(),
+        Some("Member info: M\u{0430}ya Chen, Impersonation warning")
+    );
+    assert!(shows(&rt, "Similar name"));
+    // Nobody else is accused: not the real owner, not their other members.
+    let room = rt.state.chat.room().unwrap();
+    for m in room.members.iter().filter(|m| m.id != impostor) {
+        assert!(
+            rt.find(&format!("member-impersonation-{}", m.id)).is_none(),
+            "{}",
+            m.nickname
+        );
+    }
+    let warned = rt
+        .elements()
+        .into_iter()
+        .filter(|e| {
+            e.key
+                .as_deref()
+                .is_some_and(|k| k.starts_with("author-impersonation-sign-"))
+        })
+        .count();
+    assert_eq!(warned, 1, "only the impostor's message group");
+}
+
+/// A member imitating a deputy gets the deputy sentence on the row, and the deputy is not
+/// accused. `Role::Deputy` is only set for a member with a badge (`rooms/room.rs`), the set the
+/// web UI protects.
+#[test]
+fn a_name_that_imitates_a_deputy_is_warned_about_in_the_list() {
+    use super::model::{Appointer, Member, Role};
+    let mut state = connected();
+    state.chat.edit_rooms(|rooms| {
+        let room = &mut rooms[0];
+        let mut d = Member::new(91, "Zed", Role::Deputy);
+        d.invited_by = Some(12);
+        d.deputized_by = vec![Appointer::Owner];
+        d.can_ban_you = Some(true);
+        room.members.push(d);
+        let mut imp = Member::new(92, "Z\u{0435}d", Role::Member);
+        imp.invited_by = Some(12);
+        room.members.push(imp);
+    });
+    let rt = render(state, WINDOW_SIZE);
+    let tip = |id: u32| {
+        rt.elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some(format!("member-impersonation-{id}").as_str()))
+            .and_then(|e| e.help)
+    };
+    assert_eq!(
+        tip(92).as_deref(),
+        Some(super::member_modal::IMPERSONATION_DEPUTY)
+    );
+    // The deputy and the imitator are both Zed to the fold, but a deputy is not the imitator of
+    // a plain member.
+    assert_eq!(tip(91).as_deref(), None);
+}
+
 #[test]
 fn a_member_who_leaves_closes_the_dialog_for_good() {
     let mut rt = render(connected(), WINDOW_SIZE);

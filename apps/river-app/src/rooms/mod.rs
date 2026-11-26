@@ -87,7 +87,7 @@ pub mod socket;
 pub mod token;
 pub mod work;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -99,6 +99,16 @@ pub use session::{Access, Issues, LinkStatus, RoomsUpdate};
 /// The node's client API on this computer, which River uses unless told another
 /// ([`crate::address`]).
 pub const NODE_AUTHORITY: &str = crate::address::DEFAULT_AUTHORITY;
+
+/// The grant saved in `config_dir` for the node at `authority` (`explicit`: the person chose
+/// it, see [`token::node_dir`]), if there is one.
+pub fn saved_grant(
+    config_dir: &Path,
+    authority: &str,
+    explicit: bool,
+) -> Option<grant::GrantToken> {
+    token::TokenStore::in_dir(&token::node_dir(config_dir, authority, explicit)).load()
+}
 
 /// Starts and owns the background work that reads the rooms. Cloning shares it.
 #[derive(Clone)]
@@ -223,6 +233,20 @@ impl Link {
                 viewing: Mutex::new(None),
             }),
         }
+    }
+
+    /// The node's authority and the grant saved for it, if there is one: what a read of the
+    /// node outside the session (the update-key record) connects with.
+    pub fn node_access(&self) -> Option<(String, grant::GrantToken)> {
+        let dir = self.inner.config_dir.as_deref()?;
+        let authority = self
+            .inner
+            .authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let token = saved_grant(dir, &authority, self.inner.explicit.load(Ordering::Acquire))?;
+        Some((authority, token))
     }
 
     /// The number of the node in use: it grows with every [`set_node`](Link::set_node), and

@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use river_app::{UpdateCheck, UpdateHost, UpdateInfo, UpdateSupport};
+use river_app::{KeyRecord, UpdateCheck, UpdateHost, UpdateInfo, UpdateSupport};
 
+use super::keyrecord;
 use super::manifest::Offer;
 use super::platform::Installer;
 #[cfg(not(target_os = "linux"))]
@@ -57,6 +58,15 @@ fn manifest_override() -> Option<String> {
     None
 }
 
+/// The shipped trust anchor for the update-key record. A file that does not parse is a build
+/// error caught by a test; if it ever happens anyway, no record is read and the compiled-in key
+/// stands, which is what a build without this feature does.
+fn keyrecord_authority() -> Option<keyrecord::Authority> {
+    keyrecord::Authority::shipped()
+        .inspect_err(|e| river_app::diag!("River: not reading the update-key record: {e}"))
+        .ok()
+}
+
 impl DesktopUpdate {
     /// The updater for the running app, or `None` when there is nowhere to keep its state.
     pub fn new() -> Option<Arc<DesktopUpdate>> {
@@ -65,6 +75,7 @@ impl DesktopUpdate {
             .to_owned();
         let running = parse_version(env!("CARGO_PKG_VERSION")).ok()?;
         let over = manifest_override();
+        let allow_override = over.is_some();
         let key = super::pubkey();
         let cfg = Config {
             allow_loopback_http: over.is_some(),
@@ -77,6 +88,13 @@ impl DesktopUpdate {
             handshake_timeout: HANDSHAKE_TIMEOUT,
             floor: super::build_floor(),
             retry_delay: Duration::from_secs(30),
+            // A build pointed at a local update server (debug and test-hooks only) signs with a
+            // throwaway key that has nothing to do with the real record, so it reads none.
+            key_authority: if allow_override {
+                None
+            } else {
+                keyrecord_authority()
+            },
         };
         let updater = Updater::new(cfg, installer());
         // So the swap guard knows what is installed however early an update is applied.
@@ -235,11 +253,12 @@ impl UpdateHost for DesktopUpdate {
         self.updater.take_notice()
     }
 
-    fn check(&self) -> Result<UpdateCheck, String> {
-        if super::is_placeholder(&self.key) {
-            return Err("this build has no update key".into());
-        }
-        Ok(match self.updater.check()? {
+    fn key_record_id(&self) -> Option<[u8; 32]> {
+        self.updater.key_record_id()
+    }
+
+    fn check(&self, record: KeyRecord) -> Result<UpdateCheck, String> {
+        Ok(match self.updater.check(&record)? {
             CheckResult::UpToDate => UpdateCheck::UpToDate,
             CheckResult::Available(offer) => UpdateCheck::Available(info(&offer)),
         })
@@ -254,6 +273,33 @@ impl UpdateHost for DesktopUpdate {
     }
 }
 
+/// What `--self-update` reads the update-key record with: the grant the app saved for the node
+/// it would use. `None` without a config directory; a grant that was never saved makes the
+/// source answer `Unavailable`, and the check then goes on with the record an earlier run kept.
+fn cli_record_source() -> Option<Arc<dyn river_app::KeyRecordSource>> {
+    let dir = crate::host::config_local_dir()?;
+    let startup = river_app::address::NodeChoice::startup(std::env::args_os(), Some(&dir));
+    Some(Arc::new(river_app::update::NodeRecordSource::saved(
+        dir,
+        startup.choice.address.authority(),
+        startup.choice.is_existing_node(),
+    )))
+}
+
+/// Check for an update the way the app does: read the update-key record from the node first.
+pub(crate) fn cli_check(
+    u: &DesktopUpdate,
+    source: Option<Arc<dyn river_app::KeyRecordSource>>,
+) -> Result<UpdateCheck, String> {
+    let record = river_app::update::fetch_key_record(
+        u,
+        source,
+        Duration::from_secs(5),
+        Duration::from_secs(2),
+    );
+    u.check(record)
+}
+
 /// `river --self-update`: check, download, verify, install and start the new version, once,
 /// with no window. Exits 0 when the new version started (this process exits as it does),
 /// 10 when already current, 11 when this copy is not River's to replace, 1 on any refusal
@@ -265,7 +311,7 @@ pub fn run_cli() -> i32 {
         return 1;
     };
     println!("river {}: checking for an update", u.version());
-    match u.check() {
+    match cli_check(&u, cli_record_source()) {
         Err(e) => {
             river_app::diag!("river: update refused: {e}");
             1

@@ -329,6 +329,10 @@ pub(crate) struct FakePointers {
     /// Pointers that never answer: the fetch waits out its whole `wait` for them.
     pub silent: Mutex<Vec<ContractInstanceId>>,
     pub fetches: AtomicUsize,
+    /// Fetches entered, and fetches returned. `deliver` runs inside a fetch, so once a fetch
+    /// has returned, everything its answers caused (the kept record) has happened.
+    pub started: AtomicUsize,
+    pub finished: AtomicUsize,
 }
 
 impl PointerSource for FakePointers {
@@ -340,6 +344,7 @@ impl PointerSource for FakePointers {
         wait: Duration,
         deliver: &dyn Fn(ContractInstanceId, Fetch),
     ) {
+        self.started.fetch_add(1, Ordering::SeqCst);
         let delay = *self.delay.lock().unwrap();
         std::thread::sleep(delay);
         self.fetches.fetch_add(1, Ordering::SeqCst);
@@ -357,6 +362,27 @@ impl PointerSource for FakePointers {
         if !silent.is_empty() {
             std::thread::sleep(wait);
         }
+        self.finished.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Wait until every fetch that has started has returned. `settle` can return as soon as the
+/// gate closes, which `judge_one` does before it keeps the record; the keep runs inside the
+/// fetch, so a test that reads the kept file must wait for the fetch to finish. Fails the
+/// test, rather than hanging, if a fetch has not returned in 10 seconds.
+fn wait_for_fetches(source: &FakePointers) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let started = source.started.load(Ordering::SeqCst);
+        if source.finished.load(Ordering::SeqCst) >= started {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{started} fetch(es) started but {} returned within 10s",
+            source.finished.load(Ordering::SeqCst)
+        );
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -411,6 +437,51 @@ fn a_current_network_leaves_writes_on() {
     assert!(!watch.is_stale());
 }
 
+/// `confirmed_current` fails closed: only a record naming this build's generation counts, not
+/// silence, an absent pointer, a watch of nothing, or a newer record.
+#[test]
+fn the_room_contract_is_confirmed_only_by_a_record_naming_this_build() {
+    let watched = test_watched();
+    let confirmed = |answers: Vec<(ContractInstanceId, Fetch)>, watched: Vec<Watched>| {
+        let source = Arc::new(FakePointers::default());
+        *source.answer.lock().unwrap() = answers;
+        let watch = Watch::new(watched, source, None);
+        assert!(
+            !watch.confirmed_current(Artifact::RoomContract),
+            "before any check"
+        );
+        settle(&watch);
+        watch.confirmed_current(Artifact::RoomContract)
+    };
+    let ids = (watched[0].pointer_id, watched[1].pointer_id);
+    assert!(confirmed(
+        vec![
+            (ids.0, Fetch::State(room_state(1))),
+            (ids.1, Fetch::State(delegate_state(1)))
+        ],
+        watched.clone()
+    ));
+    assert!(!confirmed(Vec::new(), watched.clone()), "unreachable");
+    assert!(
+        !confirmed(
+            vec![(ids.0, Fetch::Absent), (ids.1, Fetch::Absent)],
+            watched.clone()
+        ),
+        "absent"
+    );
+    assert!(!confirmed(Vec::new(), Vec::new()), "nothing watched");
+    assert!(
+        !confirmed(
+            vec![
+                (ids.0, Fetch::State(room_state(1))),
+                (ids.1, Fetch::State(delegate_state(2)))
+            ],
+            watched
+        ),
+        "River moved on"
+    );
+}
+
 #[test]
 fn a_newer_delegate_closes_the_gate_and_is_kept() {
     let dir = temp_dir("newer");
@@ -422,6 +493,7 @@ fn a_newer_delegate_closes_the_gate_and_is_kept() {
     assert!(watch.is_stale());
     assert!(watch.gate().is_closed());
     assert!(!watch.writes_allowed(&pace()));
+    wait_for_fetches(&source);
     assert_eq!(
         std::fs::read(dir.join("newer-river.river.chat-delegate")).unwrap(),
         delegate_state(2)
