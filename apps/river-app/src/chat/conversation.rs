@@ -218,6 +218,7 @@ fn history(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
     // The ids a reply's strip can jump to, built once for the whole history.
     let present: std::collections::HashSet<model::MessageId> =
         room.messages.iter().map(|m| m.id).collect();
+    let imitations = chat.imitations();
     let mut day = None;
     // A join line is not part of a message group: it ends the group before it, so the same
     // author's messages either side of it are two groups, as in the web UI.
@@ -236,7 +237,7 @@ fn history(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
         }
         for group in model::groups(&room.messages[at..end]) {
             items = day_break(items, &mut day, group.messages[0].time, chat, p);
-            items = items.child(group_el(chat, room, &group, &present, p, k));
+            items = items.child(group_el(chat, room, &group, &present, &imitations, p, k));
         }
         at = end;
     }
@@ -457,6 +458,7 @@ fn group_el(
     room: &Room,
     group: &Group,
     present: &std::collections::HashSet<model::MessageId>,
+    imitations: &super::member_modal::Imitations,
     p: &Palette,
     k: &Kit,
 ) -> El {
@@ -506,24 +508,23 @@ fn group_el(
     // The web UI's `message-author-impersonation-warning`: after the role tags (a deputy's name
     // can collide with another's, so both can show), the sign and "Similar name", the tooltip
     // the full sentence.
-    if let Some(i) = author.and_then(|m| super::member_modal::imitation(room, m)) {
+    if let Some(i) = author.and_then(|m| imitations.get(room, m.id)) {
         name_row = name_row.child(
             row()
                 .key(format!("author-impersonation-{}", first.key))
                 .gap(4.0)
                 .center_y()
-                .label(i.text)
-                .help(i.text)
-                .child(label(
-                    "\u{26a0}".to_owned(),
-                    st::SMALL_STRONG,
-                    p.warning_text,
-                ))
-                .child(label(
-                    "Similar name".to_owned(),
-                    st::SMALL_STRONG,
-                    p.warning_text,
-                )),
+                // The sentence is on the sign, as the web UI's `aria-label` is, so a screen
+                // reader finds it where the warning is.
+                .child(
+                    label("\u{26a0}".to_owned(), st::SMALL_STRONG, p.warning_text)
+                        .key(format!("author-impersonation-sign-{}", first.key))
+                        .label(i.text)
+                        .help(i.text),
+                )
+                .child(
+                    label("Similar name".to_owned(), st::SMALL_STRONG, p.warning_text).help(i.text),
+                ),
         );
     }
     name_row = name_row.child(
