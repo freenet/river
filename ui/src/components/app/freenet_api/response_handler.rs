@@ -1700,21 +1700,35 @@ fn empty_rooms() -> Rooms {
 /// `rooms_awaiting_subscription()`. Mirrors the `flags.subscriptions_initiated`
 /// branch of the message loop, which the per-room path (running off-loop) can't
 /// reach via `flags`.
-fn schedule_subscription_timeout_check() {
-    let tx = crate::components::app::SYNCHRONIZER
-        .read()
-        .get_message_sender();
+pub(crate) fn schedule_subscription_timeout_check() {
+    #[cfg(test)]
+    {
+        SCHEDULED_TIMEOUT_PASSES.with(|n| n.set(n.get() + 1));
+    }
     crate::util::safe_spawn_local(async move {
         crate::util::sleep(std::time::Duration::from_millis(
             super::constants::REPUT_DELAY_MS + 1000,
         ))
         .await;
-        if let Err(e) =
-            tx.unbounded_send(super::freenet_synchronizer::SynchronizerMessage::ProcessRooms)
-        {
-            error!("Failed to schedule subscription timeout check: {}", e);
-        }
+        crate::util::defer(|| {
+            let tx = crate::components::app::SYNCHRONIZER
+                .read()
+                .get_message_sender();
+            if let Err(e) =
+                tx.unbounded_send(super::freenet_synchronizer::SynchronizerMessage::ProcessRooms)
+            {
+                error!("Failed to schedule subscription timeout check: {}", e);
+            }
+        });
     });
+}
+
+/// Test seam: how many timeout passes `schedule_subscription_timeout_check`
+/// was asked to arm on this thread.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static SCHEDULED_TIMEOUT_PASSES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// Hydrate the in-memory `ROOMS` signal from a `Rooms` value assembled from the

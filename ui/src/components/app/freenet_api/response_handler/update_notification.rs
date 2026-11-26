@@ -248,6 +248,19 @@ pub fn handle_update_notification(
         }
     };
 
+    // The node delivers a notification only to a client it holds a
+    // subscription for, so one for this room's key proves our subscription
+    // when we asked for it. Decided on the deferred write, which re-checks
+    // that the room is still Subscribing with a request of ours outstanding.
+    if SYNC_INFO
+        .try_read()
+        .is_ok_and(|si| si.notification_proves_subscription(&room_owner_vk))
+    {
+        crate::util::defer(move || {
+            crate::components::app::sync_info::mark_room_subscribed_by_notification(room_owner_vk);
+        });
+    }
+
     // Handle update notification
     match update {
         UpdateData::State(state) => {
@@ -376,5 +389,25 @@ mod tests {
         let from = *visited.iter().next().unwrap();
         let decision = classify_upgrade_hop(&mut visited, Some(from), cid(250));
         assert_eq!(decision, UpgradeHopDecision::CapReached);
+    }
+
+    /// The notification handler asks whether the notification proves our
+    /// subscription only for a room it resolved from the notification's own
+    /// contract key, never before that lookup.
+    #[test]
+    fn the_notification_handler_proves_only_the_resolved_key() {
+        let src = include_str!("update_notification.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        let lookup = prod
+            .find("get_owner_vk_for_instance_id(key.id())")
+            .expect("owner lookup");
+        let proof = prod
+            .find("notification_proves_subscription(&room_owner_vk)")
+            .expect("proof check");
+        assert!(
+            lookup < proof,
+            "the key is resolved before it can prove anything"
+        );
+        assert!(prod.contains("mark_room_subscribed_by_notification(room_owner_vk)"));
     }
 }

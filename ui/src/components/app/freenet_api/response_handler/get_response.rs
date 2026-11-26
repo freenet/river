@@ -865,6 +865,15 @@ pub async fn handle_get_response(
                     mark_initial_sync_complete(&owner_vk);
                 });
 
+                // The PUT subscribes. If neither its PutResponse nor a
+                // SubscribeResponse ever arrives, the room stays Subscribing
+                // and nothing else runs a pass, so a message posted meanwhile
+                // would never be sent: arm this PUT's own timeout pass, as
+                // loaded rooms do. Deferred after the Subscribing write above.
+                crate::util::defer(move || {
+                    crate::components::app::sync_info::subscribe_request_sent(owner_vk);
+                });
+
                 // Close the invitation modal by updating PENDING_INVITES directly.
                 // PENDING_INVITES is a GlobalSignal — writing to it re-renders the modal.
                 crate::util::defer(move || {
@@ -3578,5 +3587,35 @@ mod tests {
                 other => panic!("a PUT sends a state that is not the normalized bytes: {other}"),
             }
         }
+    }
+
+    /// The invitation-accept PUT arms its own timeout pass and notes its
+    /// subscribe request, after the `Subscribing` write that precedes it. The
+    /// 90 s invite check armed at the GET fires before a slow GET's PUT has
+    /// been outstanding for `REPUT_DELAY_MS`, so it cannot stand in for this.
+    #[test]
+    fn the_invite_put_arms_its_own_subscription_timeout_pass() {
+        let full = include_str!("get_response.rs");
+        let prod = full.split("#[cfg(test)]").next().unwrap();
+        let start = prod
+            .find("Sent PUT+subscribe for invited room")
+            .expect("invite PUT branch");
+        let end = start
+            + prod[start..]
+                .find("} else if is_existing_room")
+                .expect("end of invite branch");
+        let arm = &prod[start..end];
+        assert!(
+            arm.contains("sync_info::subscribe_request_sent(owner_vk)"),
+            "the invite PUT success arm must arm its own pass"
+        );
+        let set_subscribing = prod
+            .find("sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Subscribing);")
+            .expect("Subscribing write");
+        let noted = start
+            + arm
+                .find("sync_info::subscribe_request_sent(owner_vk)")
+                .unwrap();
+        assert!(set_subscribing < noted, "noted after Subscribing is set");
     }
 }

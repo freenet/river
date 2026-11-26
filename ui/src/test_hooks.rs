@@ -1396,6 +1396,55 @@ pub fn install_test_hooks() {
         .into_js_value(),
     );
 
+    // The current room as still subscribing with the sync pass having skipped
+    // its unsent changes: the state a message posted before the subscription
+    // is confirmed is in. The room's current state becomes the last synced
+    // baseline, so every message posted afterwards is one that was not sent.
+    set_hook(
+        "holdRoomUpdates",
+        Closure::<dyn FnMut()>::new(|| {
+            crate::util::defer(|| {
+                let Some(key) = CURRENT_ROOM.peek().owner_key else {
+                    return;
+                };
+                let Some(state) = ROOMS.peek().map.get(&key).map(|r| r.room_state.clone()) else {
+                    return;
+                };
+                SYNC_INFO.with_mut(|sync_info| {
+                    sync_info.register_new_room(key);
+                    sync_info.update_sync_status(&key, RoomSyncStatus::Subscribing);
+                    sync_info.update_last_synced_state(&key, &state);
+                    if let Some(info) = sync_info.map.get_mut(&key) {
+                        info.update_held = true;
+                    }
+                });
+            });
+        })
+        .into_js_value(),
+    );
+
+    // The held changes go out, as `mark_room_subscribed` and the pass it
+    // requests do: the room is subscribed and its current state is the last
+    // synced one.
+    set_hook(
+        "releaseRoomUpdates",
+        Closure::<dyn FnMut()>::new(|| {
+            crate::util::defer(|| {
+                let Some(key) = CURRENT_ROOM.peek().owner_key else {
+                    return;
+                };
+                let Some(state) = ROOMS.peek().map.get(&key).map(|r| r.room_state.clone()) else {
+                    return;
+                };
+                SYNC_INFO.with_mut(|sync_info| {
+                    sync_info.mark_subscribed(&key);
+                    sync_info.state_updated(&key, state);
+                });
+            });
+        })
+        .into_js_value(),
+    );
+
     set_hook(
         "showRoomInitialSync",
         Closure::<dyn FnMut()>::new(|| {

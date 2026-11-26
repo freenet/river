@@ -115,6 +115,14 @@ pub struct RoomSyncInfo {
     /// again. An extra request costs nothing, since a pass compares against
     /// the last synced state.
     pub update_held: bool,
+    /// This client sent a request that registers a subscription for the room
+    /// (a PUT or GET with `subscribe: true`) during its current `Subscribing`
+    /// spell. The node delivers an `UpdateNotification` only to a client it
+    /// holds a subscription for, so the first notification for the room's
+    /// own key, with this set, proves the subscription before any reply
+    /// arrives ([`SyncInfo::notification_proves_subscription`]). Cleared by
+    /// every status change, so it never outlives the spell it was set in.
+    pub subscribe_requested: bool,
 }
 
 impl SyncInfo {
@@ -145,6 +153,7 @@ impl SyncInfo {
                 subscribe_get_in_flight: false,
                 needs_seed_put: false,
                 update_held: false,
+                subscribe_requested: false,
             });
 
             self.instances.insert(*contract_id, owner_key);
@@ -163,6 +172,9 @@ impl SyncInfo {
 
     pub fn update_sync_status(&mut self, owner_key: &VerifyingKey, status: RoomSyncStatus) {
         if let Some(sync_info) = self.map.get_mut(owner_key) {
+            // A request belongs to one Subscribing spell; the caller notes the
+            // new one after the status is set (`note_subscribe_requested`).
+            sync_info.subscribe_requested = false;
             // Track when subscription starts for timeout detection
             if status == RoomSyncStatus::Subscribing {
                 sync_info.subscribing_since = Some(now_ms());
@@ -183,6 +195,69 @@ impl SyncInfo {
             }
             sync_info.sync_status = status;
         }
+    }
+
+    /// Record that a request registering a subscription for `owner_key`'s
+    /// room was sent in its current `Subscribing` spell. Call after the
+    /// status is set to `Subscribing`.
+    pub fn note_subscribe_requested(&mut self, owner_key: &VerifyingKey) {
+        if let Some(sync_info) = self.map.get_mut(owner_key) {
+            sync_info.subscribe_requested = true;
+        }
+    }
+
+    /// Whether an `UpdateNotification` for this room's own contract key proves
+    /// the subscription: the room is `Subscribing` and we sent our own
+    /// subscribing request for it. A room we never asked to subscribe to is
+    /// never proven this way.
+    pub fn notification_proves_subscription(&self, owner_key: &VerifyingKey) -> bool {
+        self.map.get(owner_key).is_some_and(|info| {
+            info.sync_status == RoomSyncStatus::Subscribing && info.subscribe_requested
+        })
+    }
+
+    /// Whether the room has been `Subscribing` for at least `REPUT_DELAY_MS`
+    /// at `now` (ms), so the pass that evaluates it must count a failed attempt.
+    pub(crate) fn subscribing_timed_out(&self, owner_key: &VerifyingKey, now: f64) -> bool {
+        self.map.get(owner_key).is_some_and(|info| {
+            info.sync_status == RoomSyncStatus::Subscribing
+                && info
+                    .subscribing_since
+                    .is_some_and(|started_at| now - started_at >= REPUT_DELAY_MS as f64)
+        })
+    }
+
+    /// How many of the user's own chat messages in `state` have not been sent:
+    /// a sync pass skipped them (`update_held`) and they are not in the last
+    /// synced state. Joins and other events do not count. Zero when nothing is
+    /// held, or when there is no baseline to compare against.
+    pub fn held_message_count(
+        &self,
+        owner_key: &VerifyingKey,
+        state: &ChatRoomStateV1,
+        author: MemberId,
+    ) -> usize {
+        let Some(info) = self.map.get(owner_key) else {
+            return 0;
+        };
+        let (true, Some(baseline)) = (info.update_held, info.last_synced_state.as_ref()) else {
+            return 0;
+        };
+        let sent: HashSet<_> = baseline
+            .recent_messages
+            .messages
+            .iter()
+            .map(|m| m.id())
+            .collect();
+        state
+            .recent_messages
+            .display_messages()
+            .filter(|m| {
+                m.message.author == author
+                    && !m.message.content.is_event()
+                    && !sent.contains(&m.id())
+            })
+            .count()
     }
 
     /// Mark the room `Subscribed`. Returns whether a local change skipped
@@ -495,18 +570,12 @@ impl SyncInfo {
 
             // Check for subscription timeout - if subscribing for longer than REPUT_DELAY_MS,
             // count a failed attempt and (unless the retry bound is reached) re-PUT.
-            if sync_info.sync_status == RoomSyncStatus::Subscribing {
-                if let Some(started_at) = sync_info.subscribing_since {
-                    let elapsed_ms = current_time - started_at;
-                    if elapsed_ms >= REPUT_DELAY_MS as f64 {
-                        warn!(
-                            "Subscription timeout for room {:?} after {:.1}s - will retry with a seeding PUT",
-                            MemberId::from(*key),
-                            elapsed_ms / 1000.0
-                        );
-                        timed_out.push(*key);
-                    }
-                }
+            if self.subscribing_timed_out(key, current_time) {
+                warn!(
+                    "Subscription timeout for room {:?} - will retry with a seeding PUT",
+                    MemberId::from(*key)
+                );
+                timed_out.push(*key);
             }
         }
 
@@ -614,6 +683,57 @@ pub enum RoomSyncStatus {
     Error(ErrorReport),
 }
 
+/// A request that registers a subscription for the room (a PUT or GET with
+/// `subscribe: true`) was sent. Records it, and arms this request's own
+/// timeout pass: without a reply nothing else runs `process_rooms` for the
+/// room, so a change held while it is `Subscribing` would wait for an
+/// unrelated trigger. One pass per request sent; the pass counts a failed
+/// attempt and sends the next request, which arms the next pass. Call after
+/// the status is set to `Subscribing`, from a deferred context.
+pub(crate) fn subscribe_request_sent(owner_vk: VerifyingKey) {
+    SYNC_INFO.with_mut(|sync_info| subscribe_request_sent_in(sync_info, owner_vk));
+}
+
+/// The decision behind [`subscribe_request_sent`], testable without the
+/// Dioxus runtime.
+pub(crate) fn subscribe_request_sent_in(sync_info: &mut SyncInfo, owner_vk: VerifyingKey) {
+    sync_info.note_subscribe_requested(&owner_vk);
+    crate::components::app::freenet_api::response_handler::schedule_subscription_timeout_check();
+}
+
+/// An `UpdateNotification` arrived for `owner_vk`'s room key. If we asked for
+/// a subscription and the room is still `Subscribing`, the notification proves
+/// it: mark it `Subscribed` (and request the held pass), without waiting for
+/// a PutResponse or SubscribeResponse that may never come. From a deferred
+/// context. Returns whether it did.
+pub(crate) fn mark_room_subscribed_by_notification(owner_vk: VerifyingKey) -> bool {
+    let mut requested = None;
+    let proven = SYNC_INFO.with_mut(|sync_info| {
+        subscribe_on_notification(sync_info, owner_vk, |vk| requested = Some(vk))
+    });
+    if let Some(vk) = requested {
+        crate::components::app::mark_needs_sync(vk);
+    }
+    proven
+}
+
+/// The decision behind [`mark_room_subscribed_by_notification`].
+pub(crate) fn subscribe_on_notification(
+    sync_info: &mut SyncInfo,
+    owner_vk: VerifyingKey,
+    request_pass: impl FnOnce(VerifyingKey),
+) -> bool {
+    if !sync_info.notification_proves_subscription(&owner_vk) {
+        return false;
+    }
+    info!(
+        "Room {:?}: update notification proves the subscription",
+        MemberId::from(owner_vk)
+    );
+    subscribe_and_request_held_pass(sync_info, owner_vk, request_pass);
+    true
+}
+
 /// Mark `owner_vk`'s room `Subscribed`, and request a sync pass if one skipped
 /// a local change while the room was still subscribing (a message posted
 /// between an invitation's PUT and its PutResponse). Call from a deferred
@@ -672,6 +792,194 @@ mod tests {
             info.update_sync_status(&live, status);
             assert_eq!(info.has_syncing_rooms(&[live]), expected);
         }
+    }
+
+    fn scheduled_passes() -> usize {
+        crate::components::app::freenet_api::response_handler::SCHEDULED_TIMEOUT_PASSES
+            .with(|n| n.get())
+    }
+
+    /// A chat message from `author_sk` in `state`.
+    fn add_chat_message(state: &mut ChatRoomStateV1, author_sk: &SigningKey, text: &str) {
+        use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
+        state
+            .recent_messages
+            .messages
+            .push(AuthorizedMessageV1::new(
+                MessageV1 {
+                    room_owner: MemberId::from(&test_owner(1)),
+                    author: MemberId::from(&author_sk.verifying_key()),
+                    content: RoomMessageBody::public(text.to_string()),
+                    time: std::time::SystemTime::now().into(),
+                },
+                author_sk,
+            ));
+    }
+
+    /// The lost-message case: the invitation PUT is sent and no reply of any
+    /// kind arrives. The PUT arms its own timeout pass; the user's message is
+    /// held; the pass counts the failure and re-PUTs (arming the next pass,
+    /// one per PUT sent); the re-PUT's reply sends the held change, once.
+    #[test]
+    fn a_held_message_is_sent_when_no_reply_arrives_and_the_timeout_pass_runs() {
+        let mut si = SyncInfo::new();
+        let room = test_owner(60);
+        si.register_new_room(room);
+        let joined = ChatRoomStateV1::default();
+        si.update_last_synced_state(&room, &joined);
+
+        // The invitation's PUT+subscribe goes out.
+        si.update_sync_status(&room, RoomSyncStatus::Subscribing);
+        let before = scheduled_passes();
+        subscribe_request_sent_in(&mut si, room);
+        assert_eq!(
+            scheduled_passes(),
+            before + 1,
+            "the PUT must arm its own timeout pass"
+        );
+
+        // The user posts: the pass skips it and holds it.
+        let mut posted = joined.clone();
+        posted.configuration.configuration.max_recent_messages += 1;
+        assert!(!si.room_needs_update(&room, &posted));
+        assert!(si.map.get(&room).unwrap().update_held);
+
+        // Nothing arrives. Before the timeout the pass does nothing...
+        let started = si.map.get(&room).unwrap().subscribing_since.unwrap();
+        assert!(!si.subscribing_timed_out(&room, started + REPUT_DELAY_MS as f64 - 1.0));
+        // ...and the timer fires after REPUT_DELAY_MS + 1 s.
+        let fired_at = started + REPUT_DELAY_MS as f64 + 1000.0;
+        assert!(si.subscribing_timed_out(&room, fired_at));
+        assert!(si.record_failed_sync_attempt(&room, false));
+        assert_eq!(
+            si.get_sync_status(&room),
+            Some(&RoomSyncStatus::Disconnected)
+        );
+
+        // The re-PUT goes out, and arms its own pass: the second missing
+        // reply is not stranded the same way.
+        si.update_sync_status(&room, RoomSyncStatus::Subscribing);
+        subscribe_request_sent_in(&mut si, room);
+        assert_eq!(scheduled_passes(), before + 2, "one pass per PUT sent");
+
+        // Its reply arrives: the held change is requested and sent once.
+        let mut requests = 0;
+        subscribe_and_request_held_pass(&mut si, room, |_| requests += 1);
+        assert_eq!(requests, 1);
+        assert!(si.room_needs_update(&room, &posted), "the delta goes out");
+        si.state_updated(&room, posted.clone());
+        subscribe_and_request_held_pass(&mut si, room, |_| requests += 1);
+        assert_eq!(requests, 1, "a later reply requests nothing");
+        assert!(!si.room_needs_update(&room, &posted), "and sends nothing");
+    }
+
+    /// An `UpdateNotification` for the room's own key, after our subscribing
+    /// request, proves the subscription: the held change is sent at once, and
+    /// the PutResponse or timer that follows sends nothing more.
+    #[test]
+    fn a_notification_after_our_subscribe_request_sends_the_held_message_once() {
+        let mut si = SyncInfo::new();
+        let room = test_owner(61);
+        si.register_new_room(room);
+        let joined = ChatRoomStateV1::default();
+        si.update_last_synced_state(&room, &joined);
+        si.update_sync_status(&room, RoomSyncStatus::Subscribing);
+        subscribe_request_sent_in(&mut si, room);
+
+        let mut posted = joined.clone();
+        posted.configuration.configuration.max_recent_messages += 1;
+        assert!(!si.room_needs_update(&room, &posted));
+
+        let mut requests = 0;
+        assert!(subscribe_on_notification(&mut si, room, |_| requests += 1));
+        assert_eq!(si.get_sync_status(&room), Some(&RoomSyncStatus::Subscribed));
+        assert_eq!(requests, 1);
+        assert!(si.room_needs_update(&room, &posted));
+        si.state_updated(&room, posted.clone());
+
+        // Late PutResponse, a second notification, a late timer pass: nothing.
+        subscribe_and_request_held_pass(&mut si, room, |_| requests += 1);
+        assert!(!subscribe_on_notification(&mut si, room, |_| requests += 1));
+        assert!(!si.subscribing_timed_out(&room, f64::MAX));
+        assert!(!si.room_needs_update(&room, &posted));
+        assert_eq!(requests, 1, "exactly one send");
+    }
+
+    /// A notification proves only a subscription we asked for: not for a key
+    /// we never requested, not outside a `Subscribing` spell, not for an
+    /// unknown key, and not for a request from an earlier spell.
+    #[test]
+    fn a_notification_is_ignored_unless_we_requested_that_subscription() {
+        let mut si = SyncInfo::new();
+        let room = test_owner(62);
+        let stranger = test_owner(63);
+        si.register_new_room(room);
+        si.register_new_room(stranger);
+
+        // Subscribing, but our request for it never went out (an invitation
+        // GET, an imported room's GET, the rekey merge hold).
+        si.update_sync_status(&room, RoomSyncStatus::Subscribing);
+        assert!(!subscribe_on_notification(&mut si, room, |_| {}));
+        assert_eq!(
+            si.get_sync_status(&room),
+            Some(&RoomSyncStatus::Subscribing)
+        );
+
+        // A request sent for one room says nothing about another.
+        si.update_sync_status(&stranger, RoomSyncStatus::Subscribing);
+        si.note_subscribe_requested(&room);
+        assert!(!subscribe_on_notification(&mut si, stranger, |_| {}));
+        assert_eq!(
+            si.get_sync_status(&stranger),
+            Some(&RoomSyncStatus::Subscribing)
+        );
+
+        // A key this client has no entry for.
+        assert!(!subscribe_on_notification(&mut si, test_owner(64), |_| {}));
+
+        // A request does not carry into the next spell: the retry that sets
+        // `Subscribing` again must send its own.
+        si.update_sync_status(&room, RoomSyncStatus::Disconnected);
+        si.update_sync_status(&room, RoomSyncStatus::Subscribing);
+        assert!(!subscribe_on_notification(&mut si, room, |_| {}));
+
+        // Not while Disconnected or in error, even with a request noted.
+        si.update_sync_status(&room, RoomSyncStatus::Disconnected);
+        si.note_subscribe_requested(&room);
+        assert!(!subscribe_on_notification(&mut si, room, |_| {}));
+    }
+
+    /// The marker the conversation shows: the user's own chat messages that
+    /// the pass held and the last synced state lacks. It goes away when the
+    /// change is sent, and never counts joins, other people's messages or a
+    /// room with nothing held.
+    #[test]
+    fn a_held_message_is_shown_as_pending_until_it_is_sent() {
+        let mut si = SyncInfo::new();
+        let room = test_owner(65);
+        let me_sk = SigningKey::from_bytes(&[66u8; 32]);
+        let me = MemberId::from(&me_sk.verifying_key());
+        let other_sk = SigningKey::from_bytes(&[67u8; 32]);
+        si.register_new_room(room);
+        si.update_sync_status(&room, RoomSyncStatus::Subscribing);
+
+        let mut joined = ChatRoomStateV1::default();
+        add_chat_message(&mut joined, &other_sk, "earlier, sent");
+        si.update_last_synced_state(&room, &joined);
+
+        let mut posted = joined.clone();
+        add_chat_message(&mut posted, &me_sk, "hello");
+        add_chat_message(&mut posted, &other_sk, "someone else");
+
+        // Not held until a pass has skipped it.
+        assert_eq!(si.held_message_count(&room, &posted, me), 0);
+        assert!(!si.room_needs_update(&room, &posted));
+        assert_eq!(si.held_message_count(&room, &posted, me), 1);
+        // Subscribed and sent: pending clears.
+        si.mark_subscribed(&room);
+        assert!(si.room_needs_update(&room, &posted));
+        si.state_updated(&room, posted.clone());
+        assert_eq!(si.held_message_count(&room, &posted, me), 0);
     }
 
     #[test]

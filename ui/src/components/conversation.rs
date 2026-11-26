@@ -81,7 +81,7 @@ use self::mobile_surface::MobileSurfaceGuard;
 use self::not_member_notification::NotMemberNotification;
 use self::outbox::{NewMessage, PendingEffect, PendingKind, OUTBOX};
 use self::pending_effects::{apply_pending_effects, own_reaction_after_pending};
-use self::pending_sends::PendingSends;
+use self::pending_sends::{HeldSends, PendingSends};
 use self::reaction_picker::{ReactionInvoker, ReactionPicker, ReactionSurfaces};
 use self::seal::SealInput;
 use crate::components::conversation::message_input::MessageInput;
@@ -3188,6 +3188,7 @@ pub fn Conversation() -> Element {
                     {
                         if !reader_position.has_newer.get() {
                             PendingSends { room, author }
+                            HeldSends { room, author }
                         }
                     }
                     // Invisible sentinel right under the newest rendered row,
