@@ -273,8 +273,10 @@ fn the_arrow_keys_choose_sections_and_move_the_keyboard_with_them() {
     key(&mut rt, Key::Down);
     assert_eq!(rt.state.chat.settings.section, Section::Appearance);
     key(&mut rt, Key::Down);
-    assert_eq!(rt.state.chat.settings.section, Section::Appearance);
-    for _ in 0..4 {
+    assert_eq!(rt.state.chat.settings.section, Section::About);
+    key(&mut rt, Key::Down);
+    assert_eq!(rt.state.chat.settings.section, Section::About);
+    for _ in 0..5 {
         key(&mut rt, Key::Up);
     }
     assert_eq!(rt.state.chat.settings.section, Section::Updates);
@@ -282,7 +284,7 @@ fn the_arrow_keys_choose_sections_and_move_the_keyboard_with_them() {
     key(&mut rt, Key::Up);
     assert_eq!(rt.state.chat.settings.section, Section::Updates);
     key(&mut rt, Key::End);
-    assert_eq!(rt.state.chat.settings.section, Section::Appearance);
+    assert_eq!(rt.state.chat.settings.section, Section::About);
     key(&mut rt, Key::Home);
     assert_eq!(rt.state.chat.settings.section, Section::Updates);
     assert!(is_open(&rt), "arrows never close it");
@@ -1138,6 +1140,8 @@ fn every_scene_of_these_sections_exists() {
         "chat-settings-appearance",
         "chat-settings-appearance-narrow",
         "chat-settings-diagnostics",
+        "chat-settings-about",
+        "chat-settings-about-narrow",
         "chat-dnd-on",
     ] {
         assert!(names.contains(&want), "{want}");
@@ -1487,4 +1491,201 @@ fn the_new_sections_are_listed_and_reachable_in_a_narrow_window() {
     press(&mut rt, "settings-back");
     press(&mut rt, "settings-section-identity");
     assert!(rt.find("settings-import-id").is_some());
+}
+
+// ---- Light and dark themes, and the About section ----
+
+fn render_in(state: RiverApp, system_dark: bool) -> Runtime<RiverApp> {
+    let env = Env {
+        system_dark,
+        scale: 1.0,
+    };
+    let mut rt = Runtime::new(state, view, WINDOW_SIZE, env);
+    rt.on_key = crate::spec().on_key;
+    rt.frame(0.0);
+    rt.frame(1.0 / 60.0);
+    rt
+}
+
+#[test]
+fn the_appearance_mode_resolves_against_the_system() {
+    use super::style::Mode;
+    assert!(Mode::System.dark(true));
+    assert!(!Mode::System.dark(false));
+    assert!(!Mode::Light.dark(true));
+    assert!(Mode::Dark.dark(false));
+    assert_eq!(Mode::default(), Mode::System);
+    for m in Mode::ALL {
+        assert_eq!(Mode::from_name(m.name()), m);
+    }
+    assert_eq!(Mode::from_name("nonsense"), Mode::System);
+    assert_eq!(Mode::from_name(""), Mode::System);
+}
+
+#[test]
+fn the_screen_follows_the_systems_appearance() {
+    let want = |dark: bool| super::style::palette_for(dark).bg;
+    let light = render_in(connected(), false);
+    assert_eq!(find(&light, "chat").fill, want(false), "light system");
+    let dark = render_in(connected(), true);
+    assert_eq!(find(&dark, "chat").fill, want(true), "dark system");
+}
+
+#[test]
+fn the_screen_changes_theme_when_the_system_does() {
+    let mut rt = render_in(connected(), true);
+    assert_eq!(find(&rt, "chat").fill, super::style::palette_for(true).bg);
+    rt.set_system_dark(false);
+    settle(&mut rt);
+    assert_eq!(find(&rt, "chat").fill, super::style::palette_for(false).bg);
+    rt.set_system_dark(true);
+    settle(&mut rt);
+    assert_eq!(find(&rt, "chat").fill, super::style::palette_for(true).bg);
+}
+
+#[test]
+fn a_chosen_theme_overrides_the_system() {
+    use super::style::{Mode, palette_for};
+    let mut s = connected();
+    s.chat.load_theme("light");
+    let rt = render_in(s, true);
+    assert_eq!(find(&rt, "chat").fill, palette_for(false).bg);
+    let mut s = connected();
+    s.chat.load_theme("dark");
+    let rt = render_in(s, false);
+    assert_eq!(find(&rt, "chat").fill, palette_for(true).bg);
+    assert_eq!(Mode::from_name("light"), Mode::Light);
+}
+
+#[test]
+fn the_theme_buttons_set_and_save_the_choice() {
+    use super::style::Mode;
+    let mut s = connected();
+    s.chat.settings.open_at(Section::Appearance);
+    let mut rt = render_in(s, true);
+    assert_eq!(rt.state.chat.theme(), Mode::System, "system is the default");
+    assert_eq!(rt.state.chat.take_theme_dirty(), None);
+    press(&mut rt, "settings-theme-light");
+    assert_eq!(rt.state.chat.theme(), Mode::Light);
+    assert_eq!(
+        find(&rt, "chat").fill,
+        super::style::palette_for(false).bg,
+        "light on a dark system"
+    );
+    assert_eq!(rt.state.chat.take_theme_dirty(), Some("light"));
+    assert_eq!(rt.state.chat.take_theme_dirty(), None);
+    press(&mut rt, "settings-theme-system");
+    assert_eq!(rt.state.chat.take_theme_dirty(), Some("system"));
+    assert_eq!(find(&rt, "chat").fill, super::style::palette_for(true).bg);
+    press(&mut rt, "settings-theme-light");
+    // Choosing what is already chosen saves nothing.
+    rt.state.chat.take_theme_dirty();
+    press(&mut rt, "settings-theme-light");
+    assert_eq!(rt.state.chat.take_theme_dirty(), None);
+}
+
+#[test]
+fn the_dialog_is_light_on_a_light_system() {
+    let mut s = connected();
+    s.chat.settings.open_at(Section::Appearance);
+    let rt = render_in(s, false);
+    let p = super::style::palette_for(false);
+    assert_eq!(
+        find(&rt, "settings-theme-note").text_color,
+        Some(p.text_muted)
+    );
+}
+
+#[test]
+fn the_about_section_shows_the_versions_the_source_and_the_licence() {
+    let mut s = connected();
+    s.chat.update.node_version = Some("0.2.156".into());
+    s.chat.settings.open_at(Section::About);
+    let rt = render(s, WINDOW_SIZE);
+    assert_eq!(
+        find(&rt, "settings-about-version").text.as_deref(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+    assert_eq!(
+        find(&rt, "settings-about-node-version").text.as_deref(),
+        Some("0.2.156")
+    );
+    assert_eq!(
+        find(&rt, "settings-about-source-url").text.as_deref(),
+        Some("https://github.com/freenet/river")
+    );
+    assert!(super::settings::SOURCE_URL.starts_with("https://"));
+    assert_eq!(find(&rt, "settings-about-source").role, "button");
+    assert_eq!(
+        find(&rt, "settings-about-licence").text.as_deref(),
+        Some("LGPL-3.0-only")
+    );
+}
+
+#[test]
+fn the_about_section_shows_the_version_the_node_last_answered() {
+    use super::node_status::{Reach, StatusEvent};
+    let mut s = connected();
+    // What River learned when it connected, then what the node says after updating itself.
+    s.chat.update.node_version = Some("0.2.155".into());
+    let at = s.chat.status.address.clone();
+    s.chat.status.apply(
+        &at,
+        StatusEvent::Reach {
+            authority: at.clone(),
+            reach: Reach::Answered {
+                version: "0.2.158".into(),
+            },
+        },
+        std::time::Instant::now(),
+    );
+    s.chat.settings.open_at(Section::About);
+    let rt = render(s, WINDOW_SIZE);
+    assert_eq!(
+        find(&rt, "settings-about-node-version").text.as_deref(),
+        Some("0.2.158")
+    );
+    // Connection shows the same.
+    let mut s = connected();
+    s.chat.update.node_version = Some("0.2.155".into());
+    s.chat.status.apply(
+        &at,
+        StatusEvent::Reach {
+            authority: at.clone(),
+            reach: Reach::Answered {
+                version: "0.2.158".into(),
+            },
+        },
+        std::time::Instant::now(),
+    );
+    s.chat.settings.open_at(Section::Connection);
+    let rt = render(s, WINDOW_SIZE);
+    assert_eq!(
+        find(&rt, "settings-node-version").text.as_deref(),
+        Some("0.2.158")
+    );
+}
+
+#[test]
+fn the_about_section_says_when_no_version_is_known() {
+    let mut s = connected();
+    s.chat.update.node_version = None;
+    s.chat.settings.open_at(Section::About);
+    let rt = render(s, WINDOW_SIZE);
+    assert_eq!(
+        find(&rt, "settings-about-node-version").text.as_deref(),
+        Some("Not connected")
+    );
+}
+
+#[test]
+fn the_source_button_opens_the_repository_in_the_browser() {
+    let mut s = connected();
+    s.chat.settings.open_at(Section::About);
+    let mut rt = render(s, WINDOW_SIZE);
+    press(&mut rt, "settings-about-source");
+    assert_eq!(
+        rt.take_url_requests(),
+        vec!["https://github.com/freenet/river".to_owned()]
+    );
 }

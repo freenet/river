@@ -223,6 +223,23 @@ jobs:
             test -s "snapshots/$scene.png"
           done
 
+          # The same app on a light system: a few screens that cover the chat
+          # screen, a dialog, a warning and a setup card, for review. Each must
+          # differ from its dark render.
+          for scene in chat chat-settings-appearance chat-settings-about chat-similar-name not-installed-node-warning; do
+            ./target/debug/river --snap "snapshots/light-$scene.png" --scene "$scene" --scale 2 --theme light
+            test -s "snapshots/light-$scene.png"
+            # rune treats any --theme other than "light" as dark, so a light render
+            # that is byte-identical to the dark one did not render light.
+            ./target/debug/river --snap "snapshots/dark-$scene.png" --scene "$scene" --scale 2 --theme dark
+            test -s "snapshots/dark-$scene.png"
+            # (`! cmp` would not fail the step: set -e ignores a negated command.)
+            if cmp -s "snapshots/light-$scene.png" "snapshots/dark-$scene.png"; then
+              echo "::error::light-$scene.png is identical to the dark render"
+              exit 1
+            fi
+          done
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:

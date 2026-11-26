@@ -1335,7 +1335,7 @@ pub(crate) fn dialog(chat: &super::Chat, k: &Kit, layer: &mut Vec<El>) {
     for l in lines(chat) {
         let color = match l.tone {
             Tone::Plain => p.text,
-            Tone::Good => p.success,
+            Tone::Good => p.success_text,
             Tone::Bad => p.danger,
             Tone::Muted => p.text_muted,
         };

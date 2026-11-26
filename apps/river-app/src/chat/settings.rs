@@ -9,9 +9,10 @@
 //! **Background and startup** (the tray and login item, only where the shell offers them,
 //! [`super::background::background_section`]), **Connection** (the Freenet node,
 //! [`connection_section`]), **Identity** (import and export, [`identity_section`]) and
-//! **Appearance** (size and the shortcuts page, [`appearance_section`]) and **Diagnostics**
+//! **Appearance** (light or dark, size and the shortcuts page, [`appearance_section`]), **Diagnostics**
 //! (the log file's path and a button that opens its folder, only where the shell keeps one,
-//! [`super::diagnostics::diagnostics_section`]). A section exists only when it has content ([`Section::shown`]). A new
+//! [`super::diagnostics::diagnostics_section`]) and **About** (versions, source and licence,
+//! [`about_section`]). A section exists only when it has content ([`Section::shown`]). A new
 //! section is an entry in [`Section::ALL`] and an arm in [`section_content`]; the rest (list,
 //! keys, narrow screens, arrow keys) follows from those.
 //! Which section was last shown is not remembered: the dialog opens on the first section, and
@@ -49,6 +50,7 @@ pub enum Section {
     Identity,
     Appearance,
     Diagnostics,
+    About,
 }
 
 impl Section {
@@ -61,6 +63,7 @@ impl Section {
         Section::Identity,
         Section::Appearance,
         Section::Diagnostics,
+        Section::About,
     ];
 
     /// The sections the list shows: all of them, but Background and startup only where the
@@ -84,6 +87,7 @@ impl Section {
             Section::Identity => "Identity",
             Section::Appearance => "Appearance",
             Section::Diagnostics => "Diagnostics",
+            Section::About => "About",
         }
     }
 
@@ -97,6 +101,7 @@ impl Section {
             Section::Identity => "identity",
             Section::Appearance => "appearance",
             Section::Diagnostics => "diagnostics",
+            Section::About => "about",
         }
     }
 
@@ -255,6 +260,18 @@ pub(super) fn section_rows(key: &'static str, rows: Vec<El>, p: &Palette) -> El 
     s
 }
 
+/// The node's version as Node status shows it: what it last answered with, else what River
+/// learned when it connected.
+fn node_version_text(chat: &super::Chat) -> String {
+    match chat
+        .status
+        .node_version(chat.update.node_version.as_deref())
+    {
+        Some(v) => super::node_status::safe_version(v),
+        None => "Not connected".to_owned(),
+    }
+}
+
 /// The Connection section: the node River talks to, the node's version, and where to see more.
 fn connection_section(chat: &super::Chat, p: &Palette, k: &Kit) -> El {
     let ui = &chat.update;
@@ -323,15 +340,7 @@ fn connection_section(chat: &super::Chat, p: &Palette, k: &Kit) -> El {
                 "settings-version-node-row",
                 label("Freenet version", st::BODY, p.text),
                 version_note,
-                label(
-                    match &ui.node_version {
-                        Some(v) => super::node_status::safe_version(v),
-                        None => "Not connected".to_owned(),
-                    },
-                    st::BODY,
-                    p.text,
-                )
-                .key("settings-node-version"),
+                label(node_version_text(chat), st::BODY, p.text).key("settings-node-version"),
                 p,
             ),
             setting_row(
@@ -373,6 +382,7 @@ fn section_content(section: Section, chat: &super::Chat, p: &Palette, k: &Kit) -
         Section::Identity => identity_section(chat, p, k),
         Section::Appearance => appearance_section(chat, p, k),
         Section::Diagnostics => super::diagnostics::diagnostics_section(chat, p, k),
+        Section::About => about_section(chat, p, k),
     }
 }
 
@@ -523,6 +533,41 @@ fn appearance_section(chat: &super::Chat, p: &Palette, k: &Kit) -> El {
             .key("settings-size-note"),
         )
         .child(sizes);
+    let mut modes = row().key("settings-theme-options").gap(6.0).flex_wrap();
+    for mode in st::Mode::ALL {
+        modes = modes.child(
+            Button::new(mode.title())
+                .variant(if mode == chat.theme() {
+                    ButtonVariant::Contrast
+                } else {
+                    ButtonVariant::Outline
+                })
+                .on_press_tx(move |s: &mut RiverApp, tx: &mut rune::Tx| {
+                    tx.instant();
+                    s.chat.set_theme(mode);
+                })
+                .build(k)
+                .checked(mode == chat.theme())
+                .key(format!("settings-theme-{}", mode.name())),
+        );
+    }
+    let theme = col()
+        .key("settings-theme-group")
+        .w_full()
+        .gap(8.0)
+        .child(label("Theme", st::BODY, p.text))
+        .child(
+            label(
+                "Light or dark. Same as system follows your computer's appearance setting and \
+                 changes with it. Saved on this device.",
+                st::SMALL,
+                p.text_muted,
+            )
+            .wrap()
+            .w_full()
+            .key("settings-theme-note"),
+        )
+        .child(modes);
     let shortcuts = setting_row(
         "settings-shortcuts-row",
         label("Keyboard shortcuts", st::BODY, p.text),
@@ -553,9 +598,66 @@ fn appearance_section(chat: &super::Chat, p: &Palette, k: &Kit) -> El {
         .key("settings-appearance")
         .w_full()
         .gap(14.0)
+        .child(theme)
+        .child(rule(p))
         .child(size)
         .child(rule(p))
         .child(shortcuts)
+}
+
+/// Where River's source is.
+pub const SOURCE_URL: &str = "https://github.com/freenet/river";
+
+/// The About section: the versions of River and of the Freenet node it talks to, and where the
+/// source and the licence are.
+fn about_section(chat: &super::Chat, p: &Palette, k: &Kit) -> El {
+    let value = |text: String, key: &'static str| label(text, st::BODY, p.text).key(key);
+    let river = setting_row(
+        "settings-about-river-row",
+        label("River version", st::BODY, p.text),
+        None,
+        value(
+            env!("CARGO_PKG_VERSION").to_owned(),
+            "settings-about-version",
+        ),
+        p,
+    );
+    let node = setting_row(
+        "settings-about-node-row",
+        label("Freenet version", st::BODY, p.text),
+        None,
+        value(node_version_text(chat), "settings-about-node-version"),
+        p,
+    );
+    let source = setting_row(
+        "settings-about-source-row",
+        label("Source code", st::BODY, p.text),
+        Some(
+            label(SOURCE_URL, st::SMALL, p.text_muted)
+                .wrap()
+                .w_full()
+                .key("settings-about-source-url"),
+        ),
+        Button::new("Open in browser")
+            .variant(ButtonVariant::Outline)
+            .on_press_tx(|_: &mut RiverApp, tx: &mut rune::Tx| {
+                let _ = tx.open_url(SOURCE_URL);
+            })
+            .build(k)
+            .key("settings-about-source"),
+        p,
+    );
+    let licence = setting_row(
+        "settings-about-licence-row",
+        label("Licence", st::BODY, p.text),
+        None,
+        value(
+            env!("CARGO_PKG_LICENSE").to_owned(),
+            "settings-about-licence",
+        ),
+        p,
+    );
+    section_rows("settings-about", vec![river, node, source, licence], p)
 }
 
 /// The Notifications section: do not disturb, whether notifications show who wrote and what,

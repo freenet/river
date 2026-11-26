@@ -448,6 +448,9 @@ pub struct Chat {
     shortcode: shortcodes::State,
     /// The window's zoom level, kept per device ([`zoom`]).
     pub zoom: zoom::Zoom,
+    /// Light, dark or the system's appearance, kept per device ([`style::Mode`]).
+    theme: style::Mode,
+    theme_dirty: bool,
     /// Whether the keyboard shortcuts page is open ([`shortcuts`]).
     pub shortcuts_open: bool,
     /// Direct messages: the rail's threads, the open thread and what has been read
@@ -490,6 +493,41 @@ impl HistoryPos {
 }
 
 impl Chat {
+    /// The appearance setting.
+    pub fn theme(&self) -> style::Mode {
+        self.theme
+    }
+
+    /// Take the stored appearance. Not marked to save.
+    pub fn load_theme(&mut self, stored: &str) {
+        self.theme = style::Mode::from_name(stored);
+    }
+
+    /// Choose the appearance, saved like the zoom.
+    pub fn set_theme(&mut self, theme: style::Mode) {
+        if theme != self.theme {
+            self.theme = theme;
+            self.theme_dirty = true;
+        }
+    }
+
+    /// Take this device's settings (appearance, size, do not disturb, private previews) from
+    /// `old`, the chat being replaced for another node: they belong to the device, not to the
+    /// node. A change `old` had not saved yet is still saved.
+    pub fn keep_device_settings(&mut self, old: &mut Chat) {
+        std::mem::swap(&mut self.theme, &mut old.theme);
+        std::mem::swap(&mut self.theme_dirty, &mut old.theme_dirty);
+        std::mem::swap(&mut self.zoom, &mut old.zoom);
+        std::mem::swap(&mut self.dnd, &mut old.dnd);
+        std::mem::swap(&mut self.private_previews, &mut old.private_previews);
+        std::mem::swap(&mut self.previews_dirty, &mut old.previews_dirty);
+    }
+
+    /// The appearance to save, once, if it changed since the last call.
+    pub fn take_theme_dirty(&mut self) -> Option<&'static str> {
+        std::mem::take(&mut self.theme_dirty).then_some(self.theme.name())
+    }
+
     /// The notification mode of the room keyed `room`.
     pub fn mode_of(&self, room: &str) -> NotificationMode {
         self.modes.get(room).copied().unwrap_or_default()
@@ -712,6 +750,8 @@ impl Chat {
             previews_dirty: false,
             shortcode: Default::default(),
             zoom: Default::default(),
+            theme: Default::default(),
+            theme_dirty: false,
             shortcuts_open: false,
             dm: Default::default(),
             catching_up: true,
