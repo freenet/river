@@ -285,6 +285,9 @@ pub struct Chat {
     selected: String,
     /// The room that was open when the list last went empty, to reopen when it comes back.
     last_open: String,
+    /// Set while a room snapshot settles which room is open: nothing is reported read until the
+    /// room finally shown is known, so a room opened only on the way to it keeps its marker.
+    reads_held: bool,
     /// What is typed in the open room's composer.
     pub composer: TextEdit,
     /// Unsent text in the other rooms' composers, by room key, so switching rooms never carries
@@ -586,6 +589,7 @@ impl Chat {
     /// the position back.
     fn report_read(&mut self) {
         if !matches!(self.source, Source::Node(_))
+            || self.reads_held
             || !self.window_front
             || !self.at_bottom
             || self.dm.is_open()
@@ -656,6 +660,7 @@ impl Chat {
             rooms: Vec::new(),
             selected: String::new(),
             last_open: String::new(),
+            reads_held: false,
             composer: TextEdit::new(""),
             drafts: HashMap::new(),
             members_open: true,
@@ -921,6 +926,7 @@ impl Chat {
             }
         }
         let first = !self.node_rooms_shown && !rooms.is_empty();
+        self.reads_held = true;
         self.set_rooms(rooms);
         if first {
             self.node_rooms_shown = true;
@@ -948,6 +954,7 @@ impl Chat {
                 self.read.insert(room.key.clone(), mark);
             }
         }
+        self.reads_held = false;
         self.report_read();
         arrived
     }

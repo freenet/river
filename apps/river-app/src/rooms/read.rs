@@ -17,10 +17,14 @@
 //! message this app has read is often newer than that copy, which the web UI wrote. So when the
 //! marker is not in the slot's copy, this app's copy of the room is merged into it (with the
 //! room's own merge, [`ChatRoomStateV1::merge_from`]) in the same edit, and the marker then
-//! names a message the slot holds. If that merge is refused, or leaves the message out, the
+//! names a message the slot holds. The merge re-encodes the slot's whole `room_state` with this
+//! build's type, so it is done only when that state decodes and encodes back to exactly what is
+//! stored; a state carrying a field this build does not know (written by a newer web build) is
+//! never re-encoded. If the merge is not done, is refused, or leaves the message out, the
 //! marker written is the furthest message this app holds that the slot's copy also holds, or none
-//! when there is none: a write never makes the web UI count more unread than before. The cost is
-//! that the slot's copy of the room grows to this app's, which the web UI would merge anyway.
+//! when there is none: a write never makes the web UI count more unread than before. The cost of a
+//! merge is that the slot's copy of the room grows to this app's, which the web UI would merge
+//! anyway.
 //!
 //! Residual: a web tab that has not yet received the message (its live state is behind) can
 //! still hold an older marker for a moment, and a read position held back for pacing is lost if
@@ -112,19 +116,21 @@ pub fn slot_with_marker(
     let mut marker = mark.id.clone();
     let mut merged_state = None;
     if !own.iter().any(|k| k.id == mark.id) {
-        let merged = state.and_then(|state| {
-            let mut merged = stored.room_state.clone();
-            let params = ChatRoomParametersV1 {
-                owner: stored.owner_vk,
-            };
-            merged.merge_from(&params, state).ok()?;
-            merged
-                .recent_messages
-                .messages
-                .iter()
-                .any(|m| m.id() == mark.id)
-                .then_some(merged)
-        });
+        let merged = state
+            .filter(|_| room_state_round_trips(bytes, &stored.room_state))
+            .and_then(|state| {
+                let mut merged = stored.room_state.clone();
+                let params = ChatRoomParametersV1 {
+                    owner: stored.owner_vk,
+                };
+                merged.merge_from(&params, state).ok()?;
+                merged
+                    .recent_messages
+                    .messages
+                    .iter()
+                    .any(|m| m.id() == mark.id)
+                    .then_some(merged)
+            });
         match merged {
             Some(merged) => merged_state = Some(merged),
             None => {
@@ -176,6 +182,29 @@ pub fn slot_with_marker(
     ciborium::ser::into_writer(&Value::Map(outer), &mut out)
         .map_err(|e| format!("room slot: {e}"))?;
     Ok(Some(out))
+}
+
+/// Whether the slot's `room_state` survives decoding and encoding with this build's type
+/// unchanged. A web build newer than this one may have added room fields this type drops; a
+/// merge would write them away, so it is only done when nothing would be lost.
+fn room_state_round_trips(bytes: &[u8], decoded: &ChatRoomStateV1) -> bool {
+    let Ok(Value::Map(outer)) = ciborium::de::from_reader::<Value, _>(bytes) else {
+        return false;
+    };
+    let Some(Value::Map(fields)) = outer
+        .iter()
+        .find(|(k, _)| k.as_text() == Some("Present"))
+        .map(|(_, v)| v)
+    else {
+        return false;
+    };
+    let Some((_, original)) = fields
+        .iter()
+        .find(|(k, _)| k.as_text() == Some("room_state"))
+    else {
+        return false;
+    };
+    Value::serialized(decoded).is_ok_and(|again| &again == original)
 }
 
 #[cfg(test)]

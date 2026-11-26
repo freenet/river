@@ -6862,6 +6862,23 @@ fn the_open_room_is_reported_read_up_to_its_newest_message_once() {
 }
 
 #[test]
+fn an_open_room_other_than_the_first_is_the_only_one_reported_on_the_first_load() {
+    let mut s = node_chat();
+    s.chat.set_window_front(true);
+    let rooms = super::example::data().rooms;
+    let (first, open) = (rooms[0].key.clone(), rooms[1].key.clone());
+    s.chat
+        .show_node_rooms(rooms, Some(&open), super::LinkStatus::Live, 29_000_000);
+    let reported: Vec<String> = s.chat.reported.iter().map(|c| c.room.clone()).collect();
+    assert_eq!(
+        reported,
+        std::slice::from_ref(&open),
+        "only the room finally shown, not {first}"
+    );
+    assert_eq!(s.chat.room().unwrap().key, open);
+}
+
+#[test]
 fn nothing_is_reported_read_before_the_window_has_reported_focus() {
     // Started at login there is no window, so no focus event ever arrives: whatever arrives in
     // the open room is not read.

@@ -70,6 +70,10 @@ pub struct RiverApp {
     /// Whether a focus event has arrived. Until one has, the title treats the window as
     /// focused, so a focused window never shows an unread prefix it should not.
     focus_known: bool,
+    /// Whether a window is on screen from the start. Only a windowed start counts as in front
+    /// before the first focus event ([`RiverApp::window_in_front`]); a windowless one (started
+    /// at login into the tray) does not.
+    window_shown: bool,
     /// Messages that arrived in the open room while the window was not focused. The room counts
     /// them as read the moment they land, so the title adds them back until the person returns.
     missed: (String, usize),
@@ -203,6 +207,7 @@ impl RiverApp {
             notifier: Box::new(notify::Silent),
             focused: false,
             focus_known: false,
+            window_shown: false,
             missed: Default::default(),
             reported_unread: None,
             limiter: Default::default(),
@@ -280,6 +285,7 @@ impl RiverApp {
             notifier: Box::new(notify::Silent),
             focused: false,
             focus_known: false,
+            window_shown: false,
             missed: Default::default(),
             reported_unread: None,
             limiter: Default::default(),
@@ -582,11 +588,18 @@ impl RiverApp {
         self.chat.unread_total() + self.missed.1 + self.chat.dm_unread_counted()
     }
 
-    /// Whether the window is known to be in front: what decides whether an open thread is being
-    /// read. A window that has not reported focus (none is shown when started at login) is not
-    /// in front, so what arrives in it still notifies.
+    /// Whether the window is in front: what decides whether an open thread is being read. Focus
+    /// says so. Before any focus event, a window that was shown at start counts as in front (a
+    /// platform may never report focus when a window first appears); a windowless start (at
+    /// login, into the tray) has none, so what arrives still notifies.
     fn window_in_front(&self) -> bool {
-        self.focused
+        self.focused || (!self.focus_known && self.window_shown)
+    }
+
+    /// Say that a window is on screen from the start (see [`RiverApp::window_in_front`]).
+    pub fn with_window_shown(mut self, shown: bool) -> Self {
+        self.window_shown = shown;
+        self
     }
 
     /// Notify about the direct messages in `arrived`, as about mentions: the user is the one

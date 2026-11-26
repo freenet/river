@@ -920,12 +920,23 @@ pub struct Work {
     held_reads: HashMap<VerifyingKey, HeldRead>,
     /// When each room's last read marker write was started.
     last_read_write: HashMap<VerifyingKey, Instant>,
+    /// How many times in a row each room's read marker could not be stored. A new marker, or a
+    /// store that works, starts the count again.
+    read_failures: HashMap<VerifyingKey, u32>,
 }
 
 /// The least time between two read marker writes for one room. The web UI saves a room at most
 /// every `ROOM_SNAPSHOT_MIN_INTERVAL_MS`; a reader of a busy room moves the marker with every
 /// message, and each write is a read and a store through the node.
 pub const READ_WRITE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// The longest wait before a read marker that could not be stored is tried again: the wait
+/// doubles from [`READ_WRITE_INTERVAL`] with each failure up to this.
+const READ_RETRY_CEILING: Duration = Duration::from_secs(300);
+
+/// How many failures in a row a read marker is held again after. Past it the marker is left
+/// unwritten until a newer one is asked for, so a store that always refuses is not tried forever.
+const READ_RETRIES: u32 = 6;
 
 struct HeldRead {
     mark: MessageOrderKey,
@@ -1165,6 +1176,7 @@ impl Work {
         }
         // A read marker held for the room has no use any more.
         self.held_reads.remove(&room);
+        self.read_failures.remove(&room);
         // An earlier leave that failed is replaced by this one, not shown beside it.
         self.tasks
             .retain(|t| !(t.is_leave() && t.owner() == Some(room) && t.failed.is_some()));
@@ -1346,6 +1358,8 @@ impl Work {
         state: Option<Box<ChatRoomStateV1>>,
         now: Instant,
     ) {
+        // A newer marker is a fresh start for a room whose writes had been failing.
+        self.read_failures.remove(&room);
         match self.held_reads.get_mut(&room) {
             Some(held) => {
                 if mark > held.mark {
@@ -2391,7 +2405,11 @@ impl Work {
         let mut again = Vec::new();
         for mut t in std::mem::take(&mut self.tasks) {
             if t.is_read() && !t.running() {
-                if matches!(t.failed, Some((_, true))) {
+                if t.failed.is_none() {
+                    if let Kind::Read { room, .. } = &t.kind {
+                        self.read_failures.remove(room);
+                    }
+                } else if matches!(t.failed, Some((_, true))) {
                     // `Task` has a destructor, so its kind is swapped out, not moved.
                     again.push(std::mem::replace(
                         &mut t.kind,
@@ -2411,6 +2429,15 @@ impl Work {
             } = kind
                 && !self.leaving(&room)
             {
+                let failures = {
+                    let n = self.read_failures.entry(room).or_insert(0);
+                    *n += 1;
+                    *n
+                };
+                if failures > READ_RETRIES {
+                    // Given up until a newer marker is asked for ([`Work::mark_read`]).
+                    continue;
+                }
                 match self.held_reads.get_mut(&room) {
                     // A later marker is already waiting: it is further on, and carries its own.
                     Some(held) if held.mark >= mark => {}
@@ -2420,7 +2447,9 @@ impl Work {
                         held.state = state;
                     }
                     None => {
-                        let due = now + READ_WRITE_INTERVAL;
+                        let wait =
+                            (READ_WRITE_INTERVAL * 2u32.pow(failures - 1)).min(READ_RETRY_CEILING);
+                        let due = now + wait;
                         self.held_reads.insert(
                             room,
                             HeldRead {

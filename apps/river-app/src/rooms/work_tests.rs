@@ -3615,6 +3615,42 @@ fn a_read_marker_that_could_not_be_stored_is_held_again_and_tried_after_the_inte
 }
 
 #[test]
+fn a_read_marker_that_keeps_failing_backs_off_then_stops_until_a_newer_one() {
+    let (owner, slot) = room_with_messages(100);
+    let key = room_storage_key(&owner);
+    let mut w = Work::default();
+    let mut now = Instant::now();
+    w.mark_read(owner, place(5), vec![place(5)], None, now);
+    let mut waits = Vec::new();
+    for _ in 0..=READ_RETRIES {
+        w.next_request(false, now).expect("sent");
+        assert!(w.on_delegate(&read_answer(&key, Some(slot.clone()), 3)));
+        let _ = expect_store(&mut w, &key, 3);
+        assert!(w.on_delegate(&store_answer(&key, CasStoreResult::Failed("no".into()))));
+        w.forget_done(&|_| false, now);
+        match w.held_reads.get(&owner) {
+            Some(h) => {
+                waits.push(h.due - now);
+                now = h.due;
+            }
+            None => break,
+        }
+    }
+    assert_eq!(waits.len() as u32, READ_RETRIES, "given up after {waits:?}");
+    assert_eq!(waits[0], READ_WRITE_INTERVAL);
+    assert_eq!(waits[1], READ_WRITE_INTERVAL * 2, "doubles");
+    assert!(waits.iter().all(|d| *d <= READ_RETRY_CEILING));
+    assert!(!w.read_held(&owner));
+    assert!(
+        w.next_request(false, now + READ_RETRY_CEILING * 10)
+            .is_none()
+    );
+    // A newer marker starts over.
+    w.mark_read(owner, place(9), vec![place(9)], None, now);
+    assert!(w.read_held(&owner));
+}
+
+#[test]
 fn a_failed_read_marker_gives_way_to_a_further_one_held_meanwhile() {
     let (owner, slot) = room_with_messages(100);
     let key = room_storage_key(&owner);

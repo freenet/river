@@ -258,3 +258,51 @@ fn a_marker_the_slot_cannot_locate_and_no_merge_can_place_writes_nothing() {
         Ok(None)
     );
 }
+
+/// `bytes` with a field this build does not know added to the slot's `room_state`.
+fn with_unknown_room_field(bytes: &[u8]) -> Vec<u8> {
+    let Value::Map(mut outer) = ciborium::de::from_reader::<Value, _>(bytes).unwrap() else {
+        panic!("a map");
+    };
+    let Some(Value::Map(fields)) = outer
+        .iter_mut()
+        .find(|(k, _)| k.as_text() == Some("Present"))
+        .map(|(_, v)| v)
+    else {
+        panic!("present");
+    };
+    let Some((_, Value::Map(room))) = fields
+        .iter_mut()
+        .find(|(k, _)| k.as_text() == Some("room_state"))
+    else {
+        panic!("room state");
+    };
+    room.push((
+        Value::Text("added_by_a_newer_web".into()),
+        Value::from(9u32),
+    ));
+    let mut out = Vec::new();
+    ciborium::ser::into_writer(&Value::Map(outer), &mut out).unwrap();
+    out
+}
+
+#[test]
+fn a_room_state_with_a_field_this_build_lacks_is_not_re_encoded() {
+    let ms = messages();
+    let before = with_unknown_room_field(&slot(&ms[..2], Some(&ms[0])));
+    let mut native = new_room(owner(), "Book club", "Ada", false)
+        .unwrap()
+        .room
+        .room_state;
+    native.recent_messages.messages = ms.clone();
+    let after = slot_with_marker(Some(&before), &ms[3].order_key(), &keys(&ms), Some(&native))
+        .unwrap()
+        .expect("the fallback marker is written");
+    // No merge: the marker is the furthest message the slot's copy holds.
+    assert_eq!(marker(&after), Some(ms[1].id()));
+    assert_eq!(field(&after, "room_state"), field(&before, "room_state"));
+    assert!(matches!(
+        field(&after, "room_state"),
+        Some(Value::Map(m)) if m.iter().any(|(k, _)| k.as_text() == Some("added_by_a_newer_web"))
+    ));
+}

@@ -753,6 +753,32 @@ fn a_window_that_never_reported_focus_still_notifies_for_the_open_thread() {
 }
 
 #[test]
+fn a_windowed_start_that_never_reports_focus_counts_as_in_front() {
+    let rec = Recorder::default();
+    let mut w = world();
+    w.s = RiverApp::detached()
+        .with_notifier(Box::new(rec.clone()))
+        .with_window_shown(true);
+    w.rec = rec;
+    let rooms = rooms_with_sentinels();
+    w.s.chat.source = Source::Node(LinkStatus::Live);
+    w.s.chat
+        .show_node_rooms(rooms, None, LinkStatus::Live, 1000);
+    w.give(snap(&[&w.room.clone()], vec![]));
+    assert!(w.s.chat.open_dm(&w.room, &w.peer));
+    // A window is on screen and no focus event has come: the open thread is being read.
+    w.arrive("m1", WORDS);
+    assert!(
+        w.shown().is_empty(),
+        "the thread on screen is not announced"
+    );
+    // Once focus is known, it decides.
+    w.s.focus_changed(false);
+    w.arrive("m2", WORDS);
+    assert_eq!(w.shown().len(), 1);
+}
+
+#[test]
 fn threads_have_their_own_cooldown_and_a_room_its_per_minute_cap() {
     let mut w = world();
     let rooms = example::data().rooms;
