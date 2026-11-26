@@ -11,7 +11,9 @@ use crate::components::app::notifications::{
     mark_initial_sync_complete, notify_new_messages, INITIAL_SYNC_COMPLETE,
 };
 use crate::components::app::receive_times::record_receive_times;
-use crate::components::app::sync_info::{now_ms, RoomSyncStatus, SubscribeRoute, SYNC_INFO};
+use crate::components::app::sync_info::{
+    now_ms, subscribe_request_sent_in, RoomSyncStatus, SubscribeRoute, SYNC_INFO,
+};
 use crate::components::app::{PENDING_INVITES, ROOMS, WEB_API};
 use crate::constants::ROOM_CONTRACT_WASM;
 use crate::invites::PendingRoomStatus;
@@ -1004,6 +1006,11 @@ impl RoomSynchronizer {
         } else {
             std::collections::HashMap::new()
         };
+        if web_api_available {
+            // The rooms that were due are settled: wake once more for the
+            // earliest one still waiting (a pause, or a later request).
+            super::response_handler::arm_next_timeout_pass();
+        }
 
         if !rooms_to_subscribe.is_empty() {
             for (owner_vk, state) in &rooms_to_subscribe {
@@ -1111,6 +1118,9 @@ impl RoomSynchronizer {
                                 SYNC_INFO.with_mut(|sync_info| {
                                     sync_info
                                         .update_sync_status(owner_vk, RoomSyncStatus::Subscribing);
+                                    // This GET subscribes, and nothing else
+                                    // runs a pass if its reply never comes.
+                                    subscribe_request_sent_in(sync_info, *owner_vk);
                                 });
                             }
                             Err(e) => {
@@ -1174,6 +1184,9 @@ impl RoomSynchronizer {
                             // Update the sync status to subscribing using with_mut
                             SYNC_INFO.with_mut(|sync_info| {
                                 sync_info.update_sync_status(owner_vk, RoomSyncStatus::Subscribing);
+                                // The re-PUT subscribes too: arm its own pass,
+                                // so a missing reply cannot strand a held change.
+                                subscribe_request_sent_in(sync_info, *owner_vk);
                             });
                         }
                         Err(e) => {
@@ -2520,6 +2533,27 @@ mod tests {
             .insert(river_core::room_state::message::MessageId(FastHash(7)));
         assert_ne!(rebuilt, network, "fixture: only actions_state differs");
         assert!(!local_state_ahead(&rebuilt, &network, &owner));
+    }
+
+    /// Each request the subscribe sweep sends that subscribes (the code-free
+    /// GET and the seeding PUT) must arm its own timeout pass and note itself
+    /// as requested, after setting `Subscribing`: nothing else runs a pass if
+    /// its reply never comes.
+    #[test]
+    fn every_subscribing_request_of_the_sweep_arms_its_own_pass() {
+        let body = process_rooms_source();
+        let sent = "subscribe_request_sent_in(sync_info,*owner_vk)";
+        assert_eq!(body.matches(sent).count(), 2, "the GET arm and the PUT arm");
+        let status = "update_sync_status(owner_vk,RoomSyncStatus::Subscribing);";
+        for (name, start) in [
+            ("GET", body.find("subscribe_get_request(owner_vk)").unwrap()),
+            ("PUT", body.find("SentPutRequestforroom").unwrap()),
+        ] {
+            let tail = &body[start..];
+            let set = tail.find(status).expect("status set after the send");
+            let arm = tail.find(sent).expect("request noted");
+            assert!(set < arm, "{name}: noted after Subscribing is set");
+        }
     }
 
     /// `process_rooms`' body, comments and whitespace stripped, test module cut.

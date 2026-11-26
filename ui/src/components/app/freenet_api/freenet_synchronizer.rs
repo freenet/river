@@ -843,22 +843,8 @@ impl FreenetSynchronizer {
                                             // Subscriptions were initiated - schedule a timeout check
                                             info!("Scheduling subscription timeout check (waiting {}ms)",
                                                   super::constants::REPUT_DELAY_MS);
-                                            let tx = message_tx.clone();
-                                            spawn_local(async move {
-                                                sleep(Duration::from_millis(
-                                                    super::constants::REPUT_DELAY_MS + 1000, // Add 1s buffer
-                                                ))
-                                                .await;
-                                                info!("Subscription timeout check triggered");
-                                                if let Err(e) = tx.unbounded_send(
-                                                    SynchronizerMessage::ProcessRooms,
-                                                ) {
-                                                    error!(
-                                                        "Failed to schedule timeout check: {}",
-                                                        e
-                                                    );
-                                                }
-                                            });
+                                            // One shared timer, not one per response.
+                                            super::response_handler::schedule_subscription_timeout_check();
                                         }
                                     }
                                     Err(e) => {

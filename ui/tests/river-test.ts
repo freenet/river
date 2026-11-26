@@ -134,6 +134,11 @@ type RiverTestHooks = {
   setSyncStatus(status: SyncStatus): void;
   // A connection error report with one of the report labels.
   setSyncErrorReport(label: ReportLabel, summary: string, detail: string): void;
+  // The current room as still subscribing, with the sync pass having skipped its unsent
+  // changes; the room's current state is the last synced one, so later messages are unsent.
+  holdRoomUpdates(errored: boolean): void;
+  // The held changes go out: the room is subscribed and its state is the last synced one.
+  releaseRoomUpdates(): void;
   // The current room as a placeholder subscribing to receive its signed state.
   showRoomInitialSync(): void;
   // The current room as a placeholder awaiting its initial sync that ended in this error.
