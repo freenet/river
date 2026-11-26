@@ -525,6 +525,27 @@ export function deliveredResizeTargets(page: Page): Promise<string[]> {
 const TEST_IMAGE_SVG =
   '<svg xmlns="http://www.w3.org/2000/svg" width="400" height="300"><rect width="400" height="300" fill="#888"/></svg>';
 
+/// Keep an `<img src="/test-image.svg">` in every message body holding `text`,
+/// adding it again whenever the row is rendered anew (a room reopened, a window
+/// swap). Messages never render images, so a row that grows late is made by
+/// the test.
+export async function addTestImageToRow(page: Page, text: string) {
+  await page.evaluate((text) => {
+    const ensure = () => {
+      for (const body of Array.from(document.querySelectorAll('[data-testid="message-body"]'))) {
+        if (!body.textContent?.includes(text) || body.querySelector("img")) continue;
+        const img = document.createElement("img");
+        img.src = "/test-image.svg";
+        img.alt = "";
+        img.style.maxWidth = "100%";
+        body.appendChild(img);
+      }
+    };
+    ensure();
+    new MutationObserver(ensure).observe(document.body, { childList: true, subtree: true });
+  }, text);
+}
+
 /// Hold every request for `/test-image.svg` (a 400x300 SVG) until `release`.
 /// Each mount of the image may ask again, so all of them are held and all
 /// released, and any request after `release` is served at once.

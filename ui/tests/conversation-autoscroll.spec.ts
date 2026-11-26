@@ -21,6 +21,7 @@ import {
   expectStaysPut,
   fillHistory,
   holdSettleEvents,
+  addTestImageToRow,
   holdTestImage,
   newestRowFromViewBottom,
   nextFrames,
@@ -1313,27 +1314,27 @@ test.describe("Own send goes to the newest message once (A06)", () => {
 
 // Once an explicit request (opening a room, an own send,
 // Latest) has put the reader at the end, the end stays in view while rows
-// change height (a private room's placeholders decrypting, late images, font
+// change height (a private room's placeholders decrypting, an image added by a test, font
 // swaps), until the reader first scrolls away. An arrival ends the hold; a
 // followed one lands a new request, which holds again.
 //
-// The growing row is a Markdown image whose request is held until the test
+// The growing row holds an image, added by the test, whose request is held until the test
 // lets it load, two short messages above the end.
 test.describe("The end holds after an explicit request", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
 
   const imageRow = (page: Page) => page.locator("[data-item-key]", { hasText: "image fixture" });
 
-  /// An image row, still loading, two short messages above the end of the
+  /// A growing row, its image still loading, two short messages above the end of the
   /// open room. All three arrive while the reader is parked at the top, so
   /// nothing follows them and the room is unread.
   async function addLoadingImageAboveTheEnd(page: Page, image: { requested: () => number }) {
     await readerScrollsWithoutGesture(page, 0);
-    // The Markdown renders to text plus an <img>, so wait on the plain words.
-    await callRiverTest(page, "appendMessage", "image fixture ![fixture](/test-image.svg) above the end");
+    await callRiverTest(page, "appendMessage", "image fixture above the end");
     await expect(imageRow(page)).toHaveCount(1, { timeout: 5_000 });
     await deliverOffscreen(page, "below the image 1");
     await deliverOffscreen(page, "below the image 2");
+    await addTestImageToRow(page, "image fixture");
     await expect.poll(image.requested, { message: "premise: the image is requested and held" }).toBeGreaterThan(0);
   }
 
@@ -1343,7 +1344,7 @@ test.describe("The end holds after an explicit request", () => {
     const before = await height();
     await image.release();
     await expect
-      .poll(height, { message: "premise: the image row should grow when the image lays out" })
+      .poll(height, { message: "premise: the row should grow when the image lays out" })
       .toBeGreaterThan(before + 50);
   }
 
@@ -1358,7 +1359,7 @@ test.describe("The end holds after an explicit request", () => {
     await page.mouse.move(0, 0);
     await expectSettledAtBottom(page, "premise: the room opens at its newest message");
     const imageTop = await rowOffset(page, (await imageRow(page).getAttribute("data-item-key"))!);
-    expect(imageTop, "premise: the image row is in view").toBeGreaterThan(0);
+    expect(imageTop, "premise: the growing row is in view").toBeGreaterThan(0);
   }
 
   test("a row growing above the end after the room opens keeps the newest message in view, and the room read", async ({
@@ -1387,7 +1388,7 @@ test.describe("The end holds after an explicit request", () => {
     const row = await expectReadingRow(page);
     expect(
       (await rowOffset(page, (await imageRow(page).getAttribute("data-item-key"))!))!,
-      "premise: the image row is below the reading row",
+      "premise: the growing row is below the reading row",
     ).toBeGreaterThan(row.top);
 
     await loadImage(page, image);
