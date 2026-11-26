@@ -1214,6 +1214,32 @@ mod tests {
         });
     }
 
+    /// A room backing off for minutes must not delay a new invite's pass: the
+    /// new PUT's own ~22 s timer is armed even though a much later one is.
+    #[test]
+    fn a_new_request_is_not_held_back_by_a_later_armed_timer() {
+        use crate::components::app::freenet_api::response_handler::arm_next_timeout_pass;
+        in_runtime(|| {
+            // Room A: long in backoff, so the armed timer is minutes away.
+            let (a, _, _) = invited_room(85);
+            SYNC_INFO.with_mut(|si| {
+                si.update_sync_status(&a, RoomSyncStatus::Disconnected);
+                si.map.get_mut(&a).unwrap().retry_not_before = Some(now_ms() + 500_000.0);
+            });
+            arm_next_timeout_pass();
+            let armed = armed_passes();
+            assert_eq!(armed.len(), 1);
+            assert!(armed[0] > 400_000, "A's timer is far off: {armed:?}");
+
+            // Room B: a new invite's PUT goes out.
+            let (b, _, joined) = invited_room(86);
+            invite_put_sent(b, joined);
+            let armed = armed_passes();
+            assert_eq!(armed.len(), 2, "B gets its own timer: {armed:?}");
+            assert_eq!(armed[1], REPUT_DELAY_MS + 1000);
+        });
+    }
+
     /// A synced room whose node never replies is retried with a growing pause,
     /// not every ~21 s for ever: at most 10 PUTs in the first hour, then one
     /// per 10 minutes. A reconnect cancels the pause.

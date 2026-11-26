@@ -842,10 +842,14 @@ pub async fn handle_get_response(
             };
 
             if let Err(report) = put_result {
+                // The state that was to be PUT is the baseline, so a message
+                // posted meanwhile is marked as not sent.
+                let put_state = retrieved_state_for_put.clone();
                 crate::util::defer(move || {
-                    SYNC_INFO
-                        .write()
-                        .update_sync_status(&owner_vk, RoomSyncStatus::Error(report));
+                    SYNC_INFO.with_mut(|sync_info| {
+                        sync_info.update_last_synced_state(&owner_vk, &put_state);
+                        sync_info.update_sync_status(&owner_vk, RoomSyncStatus::Error(report));
+                    });
                 });
                 // Reset invite status so the normal retry flow can pick it up
                 crate::util::defer(move || {
