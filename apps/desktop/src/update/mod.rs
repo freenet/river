@@ -3,12 +3,14 @@
 //!
 //! # Trust
 //!
-//! The only thing trusted is [`pubkey`], River's update-signing public key, compiled in. The
-//! server (any host, any redirect, a hijacked DNS name) can only offer bytes that either
-//! verify against that key or are refused. In order, before the installed binary is touched:
+//! The only thing trusted is the update-signing public key: [`pubkey`], compiled in, until the
+//! update-key record (below) names another. The server (any host, any redirect, a hijacked DNS
+//! name) can only offer bytes that either verify against that key or are refused. In order,
+//! before the installed binary is touched:
 //!
 //! 0. The key must not be the placeholder: every entry point refuses it ([`manifest::verify_and_parse`]
 //!    and [`Updater::check`]), so an unconfigured build cannot update whatever the server says.
+//!    A key named by the record is never the placeholder either (see [`keyrecord::usable_key`]).
 //! 1. The manifest's ed25519 signature ([`manifest::verify_and_parse`]), then its rules: channel,
 //!    expiry, sequence replay, version rollback ([`manifest::evaluate`]).
 //! 2. The artifact's exact size and SHA-256, both from the signed manifest, while it downloads
@@ -17,6 +19,40 @@
 //!    hash again ([`Updater::apply`]): a file left on disk by an earlier run is not trusted
 //!    for having been checked then.
 //! 4. The unpacked binary must run and report the manifest's version ([`platform::Installer::prepare`]).
+//!
+//! # The update-key record (key rotation and revocation, freenet/river#927)
+//!
+//! If the signing key leaks, an attacker who can also serve files from the update address could
+//! offer a build the key signed. So a build that can reach the Freenet node it already requires
+//! reads a small record before each check, and trusts the key that record names.
+//!
+//! The record is a freenet-migrate pointer record at a fixed address derived from
+//! `update-authority.toml` (authority key and app id `river-desktop-update-key`): 100 bytes,
+//! signed by the authority key (River's author key, never the update-signing key), carrying a
+//! version that only rises and, as its payload, the trusted update-signing public key. An
+//! all-zero payload is a tombstone. [`keyrecord`] judges it with [`freenet_migrate::PointerResolver`],
+//! seeded with the floor rebuilt from the record the last check kept in the state file
+//! (`key_record`, the raw bytes, verified again on every load, so a file someone else wrote
+//! changes nothing). The key in force is [`Updater::key`], and check, download and the second
+//! look at apply time all use it, so a build staged under a key revoked since is refused at
+//! restart.
+//!
+//! | What the node gave | Effect |
+//! |---|---|
+//! | Verified record above the kept one, naming a usable key | That key is trusted from now on; the record is kept. |
+//! | Verified tombstone above the kept one | No key is trusted: every check, download and apply is refused ([`keyrecord::WITHDRAWN`]). A higher record naming a key lifts it. |
+//! | Older record, or the kept one again | Ignored: the kept record stands. A node holding no copy yet can serve an older record, so this is routine. |
+//! | Competing record at the kept version | The lower key wins, as on the network; the higher is ignored. |
+//! | Record signed by another key, for another app id, malformed, or naming a weak, non-canonical or all-zero key | Ignored. All zero is the tombstone encoding, so it withdraws; it is never adopted as a key. |
+//! | Absent, unreachable, no grant yet, or no answer within a few seconds | Ignored: the check goes on with the key the kept record names, or the compiled-in key if none was ever kept. It never goes back to the compiled-in key once a record has been kept, so making the node quiet is not a downgrade. |
+//! | Kept record that no longer verifies (file damaged or written by someone else) | Ignored as if nothing were kept, until the next served record replaces it. |
+//!
+//! What it cannot do: undo an update that is already installed; act on a build that has never
+//! seen the record and cannot reach its node (a fresh offline install trusts the compiled-in key;
+//! `river --self-update` has no node connection and uses only what an earlier run kept); or help
+//! if the authority key itself leaks (that is a new release carrying a new `update-authority.toml`).
+//! It is independent of freenet.org: whoever controls the update address cannot change or silence
+//! it. To publish a rotation or a withdrawal, see `update-authority.toml`.
 //!
 //! The private key never touches the app or this repository. `examples/update_tool.rs`
 //! generates a pair and signs manifests; the key is Ian's.

@@ -6,6 +6,23 @@
 //! this module never sees a key, a hash or a path. It asks the host to check, to download and to
 //! restart, and shows what comes back.
 //!
+//! # Trust
+//!
+//! The one thing this module does for the trust decision is carry bytes. A host that has an
+//! update-key record ([`UpdateHost::key_record_id`], freenet/river#927: it says which key signs
+//! updates, or that none does) gets it fetched from the node right before each check
+//! ([`UpdateController::set_record_source`], [`NodeRecordSource`]: a GET with the app's saved
+//! grant, no code, no subscription) and receives the raw bytes as a [`KeyRecord`]. Whether they
+//! are a record, which key they name, and what to do with an older one are the host's alone
+//! (see `apps/desktop/src/update/mod.rs`, `# Trust`, for the failure table). Here:
+//!
+//! - **No answer** (no grant yet, node down, slower than a few seconds) is
+//!   [`KeyRecord::Unavailable`]: the check goes ahead, never delayed past that wait, and the
+//!   host falls back on what an earlier check kept.
+//! - The node's own answer that it has no such contract is [`KeyRecord::Absent`].
+//! - This module cannot undo an installed update and cannot act while the node is unreachable on
+//!   a fresh install.
+//!
 //! # What the person sees
 //!
 //! - **Automatic (the default).** A newer signed version downloads in the background, is
@@ -472,6 +489,42 @@ impl UpdateUi {
     }
 }
 
+/// Reads the update-key record from the node the rooms link follows, with the grant it holds:
+/// a GET without code or subscription, as the generation watch reads its records.
+pub struct NodeRecordSource {
+    link: crate::rooms::Link,
+}
+
+impl NodeRecordSource {
+    pub fn new(link: crate::rooms::Link) -> Self {
+        NodeRecordSource { link }
+    }
+}
+
+impl KeyRecordSource for NodeRecordSource {
+    fn fetch(&self, id: [u8; 32], wait: Duration) -> KeyRecord {
+        use crate::rooms::generation::{Fetch, NodePointers, PointerSource};
+        // No saved grant yet (first run, not approved): nothing to ask with.
+        let Some((authority, token)) = self.link.node_access() else {
+            return KeyRecord::Unavailable;
+        };
+        let id = freenet_stdlib::prelude::ContractInstanceId::new(id);
+        let answer = Mutex::new(KeyRecord::Unavailable);
+        NodePointers.fetch(&authority, &token, &[id], wait, &|_, fetch| {
+            *answer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = match fetch {
+                Fetch::State(bytes) => KeyRecord::State(bytes),
+                Fetch::Absent => KeyRecord::Absent,
+                Fetch::Unreachable => KeyRecord::Unavailable,
+            };
+        });
+        answer
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,6 +550,8 @@ mod tests {
         restarts: AtomicUsize,
         check_calls: AtomicUsize,
         confirms: AtomicUsize,
+        record_id: Option<[u8; 32]>,
+        records: Mutex<Vec<KeyRecord>>,
     }
 
     impl FakeHost {
@@ -512,6 +567,8 @@ mod tests {
                 restarts: AtomicUsize::new(0),
                 check_calls: AtomicUsize::new(0),
                 confirms: AtomicUsize::new(0),
+                record_id: None,
+                records: Mutex::new(Vec::new()),
             }
         }
     }
@@ -532,7 +589,11 @@ mod tests {
         fn confirm_started(&self) {
             self.confirms.fetch_add(1, Ordering::SeqCst);
         }
-        fn check(&self, _: KeyRecord) -> Result<UpdateCheck, String> {
+        fn key_record_id(&self) -> Option<[u8; 32]> {
+            self.record_id
+        }
+        fn check(&self, record: KeyRecord) -> Result<UpdateCheck, String> {
+            self.records.lock().unwrap().push(record);
             self.check_calls.fetch_add(1, Ordering::SeqCst);
             self.checks
                 .lock()
@@ -1249,40 +1310,47 @@ mod tests {
         });
         assert_eq!(host.confirms.load(Ordering::SeqCst), 1);
     }
-}
 
-/// Reads the update-key record from the node the rooms link follows, with the grant it holds:
-/// a GET without code or subscription, as the generation watch reads its records.
-pub struct NodeRecordSource {
-    link: crate::rooms::Link,
-}
-
-impl NodeRecordSource {
-    pub fn new(link: crate::rooms::Link) -> Self {
-        NodeRecordSource { link }
+    struct FakeSource(Box<dyn Fn() -> KeyRecord + Send + Sync>);
+    impl KeyRecordSource for FakeSource {
+        fn fetch(&self, id: [u8; 32], _: Duration) -> KeyRecord {
+            assert_eq!(id, [7; 32], "asked for the host's record");
+            (self.0)()
+        }
     }
-}
 
-impl KeyRecordSource for NodeRecordSource {
-    fn fetch(&self, id: [u8; 32], wait: Duration) -> KeyRecord {
-        use crate::rooms::generation::{Fetch, NodePointers, PointerSource};
-        // No saved grant yet (first run, not approved): nothing to ask with.
-        let Some((authority, token)) = self.link.node_access() else {
-            return KeyRecord::Unavailable;
-        };
-        let id = freenet_stdlib::prelude::ContractInstanceId::new(id);
-        let answer = Mutex::new(KeyRecord::Unavailable);
-        NodePointers.fetch(&authority, &token, &[id], wait, &|_, fetch| {
-            *answer
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = match fetch {
-                Fetch::State(bytes) => KeyRecord::State(bytes),
-                Fetch::Absent => KeyRecord::Absent,
-                Fetch::Unreachable => KeyRecord::Unavailable,
-            };
-        });
-        answer
-            .into_inner()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn keyed(source: Option<FakeSource>) -> Arc<FakeHost> {
+        let mut host = FakeHost::new(UpdateSupport::Automatic, vec![Ok(UpdateCheck::UpToDate)]);
+        host.record_id = Some([7; 32]);
+        let host = Arc::new(host);
+        let (ctl, rx) = controller(host.clone(), false);
+        if let Some(s) = source {
+            ctl.set_record_source(Arc::new(s));
+        }
+        ctl.check_now();
+        settle(&ctl, &rx);
+        host
+    }
+
+    #[test]
+    fn the_checked_record_is_what_the_node_served() {
+        let host = keyed(Some(FakeSource(Box::new(|| KeyRecord::State(vec![1, 2])))));
+        assert_eq!(
+            *host.records.lock().unwrap(),
+            [KeyRecord::State(vec![1, 2])]
+        );
+    }
+
+    #[test]
+    fn without_a_source_the_record_is_unavailable() {
+        let host = keyed(None);
+        assert_eq!(*host.records.lock().unwrap(), [KeyRecord::Unavailable]);
+        // A host with no record at all is never asked.
+        let plain = Arc::new(FakeHost::new(UpdateSupport::Automatic, vec![]));
+        let (ctl, rx) = controller(plain.clone(), false);
+        ctl.set_record_source(Arc::new(FakeSource(Box::new(|| unreachable!()))));
+        ctl.check_now();
+        settle(&ctl, &rx);
+        assert_eq!(*plain.records.lock().unwrap(), [KeyRecord::Unavailable]);
     }
 }
