@@ -17,6 +17,7 @@ import {
   gateResizeObservers,
   hideChatBehindMembers,
   holdResizeObservations,
+  addTestImageToRow,
   holdTestImage,
   knownFailure,
   nextFrames,
@@ -59,14 +60,14 @@ test.describe("Reading position when content above changes (A02)", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
 
   // freenet/river#507. Browser scroll anchoring is off on the history, and the
-  // app compensates only for window-head swaps, so a Markdown image that loads
+  // app compensates only for window-head swaps, so an image that loads
   // above a parked reader pushes their text down by its height.
   test("an image loading above a parked reader keeps their row in place", async ({ page }) => {
     const heldImage = await holdTestImage(page);
     await openRoomAtBottom(page, "Team Chat Room");
-    // The Markdown renders to text plus an <img>, so wait on the plain words.
-    await callRiverTest(page, "appendMessage", "image fixture ![fixture](/test-image.svg) above the reader");
+    await callRiverTest(page, "appendMessage", "image fixture above the reader");
     await expect(page.getByText("image fixture", { exact: false })).toBeVisible({ timeout: 5_000 });
+    await addTestImageToRow(page, "image fixture");
     await fillHistory(page);
     await expect.poll(heldImage.requested, { message: "premise: the image is requested and held" }).toBeGreaterThan(0);
 

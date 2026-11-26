@@ -287,8 +287,49 @@ fn markdown_to_html(original_text: &str, plain: &str, behind_gateway: bool) -> S
 /// Convert markdown to HTML using GFM mode, which includes autolink literals
 /// that correctly handle code spans, existing links, etc.
 fn render_gfm(text: &str) -> String {
-    markdown::to_html_with_options(text, &markdown::Options::gfm())
-        .unwrap_or_else(|_| markdown::to_html(text))
+    let html = markdown::to_html_with_options(text, &markdown::Options::gfm())
+        .unwrap_or_else(|_| markdown::to_html(text));
+    images_to_text(&html)
+}
+
+/// Replace each `<img>` the markdown renderer emitted with its alt text and
+/// address as plain text. Images are not displayed in messages. Raw HTML is
+/// escaped by the renderer (`allow_dangerous_html` is off), so an `<img` in
+/// its output is always one it generated, from `![..](..)` or a reference.
+/// Attribute values are entity-escaped, so they are valid as text too, and
+/// a `>` cannot occur inside a tag.
+fn images_to_text(html: &str) -> String {
+    if !html.contains("<img") {
+        return html.to_string();
+    }
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(pos) = rest.find("<img") {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos..];
+        let Some(end) = after.find('>') else {
+            // Not a complete tag: drop it rather than pass it on.
+            rest = "";
+            break;
+        };
+        let tag = &after[..=end];
+        let alt = extract_attr(tag, "alt").unwrap_or_default();
+        let src = extract_attr(tag, "src").unwrap_or_default();
+        match (alt.is_empty(), src.is_empty()) {
+            (false, false) => {
+                out.push_str(&alt);
+                out.push_str(" (");
+                out.push_str(&src);
+                out.push(')');
+            }
+            (false, true) => out.push_str(&alt),
+            (true, false) => out.push_str(&src),
+            (true, true) => {}
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Render message text to HTML, turning `@[name](rv:id)` mention tokens into
@@ -1697,6 +1738,88 @@ mod tests {
         }
     }
 
+    /// Images are not displayed in messages: no syntax variant may produce an
+    /// element that loads a resource, on any render path.
+    #[test]
+    fn images_are_never_emitted() {
+        let variants = [
+            "![alt text](https://example.com/a.png)",
+            "![alt text](https://example.com/a.png \"title\")",
+            "![alt text][ref]\n\n[ref]: https://example.com/a.png",
+            "![ref]\n\n[ref]: https://example.com/a.png",
+            "![](https://example.com/a.png)",
+            "[![alt text](https://example.com/a.png)](https://example.com/page)",
+            "![alt text](data:image/png;base64,iVBORw0KGgo=)",
+            "![alt text](javascript:alert(1))",
+            "![alt text](freenet:6nKqPz3GkBzJZVq1hdaVKFvh5oXJcX2tTqTmg4c5Fwa7/a.png)",
+            "<img src=\"https://example.com/a.png\">",
+            "<picture><source srcset=\"https://example.com/a.png\"><img src=\"https://example.com/a.png\"></picture>",
+            "<svg><image href=\"https://example.com/a.png\"/></svg>",
+            "<object data=\"https://example.com/a.png\"></object>",
+            "<embed src=\"https://example.com/a.png\">",
+            "<iframe src=\"https://example.com/a.png\"></iframe>",
+            "<div style=\"background-image:url(https://example.com/a.png)\">x</div>",
+            "<https://example.com/a.png>",
+            "https://example.com/a.png",
+            "www.example.com/a.png",
+            "> ![alt text](https://example.com/a.png)",
+            "- ![alt text](https://example.com/a.png)",
+            "| a |\n|---|\n| ![alt text](https://example.com/a.png) |",
+        ];
+        let forbidden = [
+            "<img", "<picture", "<source", "<svg", "<image", "<object", "<embed", "<iframe",
+            "<video", "<audio",
+        ];
+        for text in variants {
+            let outputs = [
+                (
+                    "message_to_html_inner(false)",
+                    message_to_html_inner(text, false),
+                ),
+                (
+                    "message_to_html_inner(true)",
+                    message_to_html_inner(text, true),
+                ),
+                ("description_to_html", description_to_html(text, false)),
+                (
+                    "with_mentions",
+                    message_to_html_with_mentions(
+                        &format!("@[Bob](rv:{}) {text}", "1".repeat(8)),
+                        &HashMap::new(),
+                        None,
+                    ),
+                ),
+            ];
+            for (path, html) in outputs {
+                let lower = html.to_ascii_lowercase();
+                for tag in forbidden {
+                    assert!(
+                        !lower.contains(tag),
+                        "{path} emitted {tag:?} for {text:?}: {html}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// An image in a message shows as its alt text and address, as text.
+    #[test]
+    fn image_syntax_renders_as_alt_text_and_url() {
+        let html = message_to_html_inner("see ![a cat](https://example.com/cat.png) here", false);
+        assert!(html.contains("a cat"), "{html}");
+        assert!(html.contains("https://example.com/cat.png"), "{html}");
+        assert!(!html.contains("<img"), "{html}");
+
+        let html = message_to_html_inner("![](https://example.com/cat.png)", false);
+        assert!(html.contains("https://example.com/cat.png"), "{html}");
+        assert!(!html.contains("<img"), "{html}");
+
+        // A scheme the renderer refuses leaves only the alt text.
+        let html = message_to_html_inner("![only alt](javascript:alert(1))", false);
+        assert!(html.contains("only alt"), "{html}");
+        assert!(!html.contains("javascript"), "{html}");
+    }
+
     /// Issue #315 — pin that the markdown renderer never emits a dangerous
     /// URL scheme in an `href`. GFM mode defaults
     /// `allow_dangerous_protocol = false`, so `javascript:` / `vbscript:` /
@@ -2654,8 +2777,6 @@ mod tests {
         let (head, tail) = RIVER_ID.split_at(20);
         let hidden = format!("/v1/contract/web/{SAMPLE_ID}/");
         for label in [
-            format!("{head}![]({hidden}x.png){tail}"),
-            format!("{head}![Q](x.png){tail}"),
             format!("{head}\n{tail}"),
             format!("{head}\u{0591}{tail}"),
             format!("{head}\u{200A}{tail}"),
@@ -2707,13 +2828,15 @@ mod tests {
     #[test]
     fn node_link_title_is_checked_like_the_label() {
         let href = format!("/v1/contract/web/{SAMPLE_ID}/");
-        for text in [
-            format!("[River]({href} \"freenet:{RIVER_ID}\")"),
-            format!("[![River](x.png \"freenet:{RIVER_ID}\")]({href})"),
-        ] {
-            let html = message_to_html(&text);
-            assert!(!html.contains("<a "), "{text:?}: {html}");
-        }
+        let text = format!("[River]({href} \"freenet:{RIVER_ID}\")");
+        let html = message_to_html(&text);
+        assert!(!html.contains("<a "), "{text:?}: {html}");
+        // An image has no tooltip: its title is not rendered at all.
+        let html = message_to_html(&format!("[![River](x.png \"freenet:{RIVER_ID}\")]({href})"));
+        assert!(
+            !html.contains(RIVER_ID) && !html.contains("title="),
+            "{html}"
+        );
         let html = message_to_html(&format!(
             "[Explore with Atlas](http://127.0.0.1:7509/v1/contract/web/{SAMPLE_ID}/ \"Atlas search engine\")"
         ));

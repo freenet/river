@@ -21,6 +21,7 @@ import {
   expectStaysPut,
   fillHistory,
   holdSettleEvents,
+  addTestImageToRow,
   holdTestImage,
   newestRowFromViewBottom,
   nextFrames,
@@ -1317,7 +1318,7 @@ test.describe("Own send goes to the newest message once (A06)", () => {
 // swaps), until the reader first scrolls away. An arrival ends the hold; a
 // followed one lands a new request, which holds again.
 //
-// The growing row is a Markdown image whose request is held until the test
+// The growing row holds an image, added by the test, whose request is held until the test
 // lets it load, two short messages above the end.
 test.describe("The end holds after an explicit request", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
@@ -1329,11 +1330,11 @@ test.describe("The end holds after an explicit request", () => {
   /// nothing follows them and the room is unread.
   async function addLoadingImageAboveTheEnd(page: Page, image: { requested: () => number }) {
     await readerScrollsWithoutGesture(page, 0);
-    // The Markdown renders to text plus an <img>, so wait on the plain words.
-    await callRiverTest(page, "appendMessage", "image fixture ![fixture](/test-image.svg) above the end");
+    await callRiverTest(page, "appendMessage", "image fixture above the end");
     await expect(imageRow(page)).toHaveCount(1, { timeout: 5_000 });
     await deliverOffscreen(page, "below the image 1");
     await deliverOffscreen(page, "below the image 2");
+    await addTestImageToRow(page, "image fixture");
     await expect.poll(image.requested, { message: "premise: the image is requested and held" }).toBeGreaterThan(0);
   }
 
