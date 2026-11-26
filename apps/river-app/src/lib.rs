@@ -2733,6 +2733,14 @@ pub const SCENES: &[Scene] = &[
         details_scene(s, chat::example::EMPTY_ROOM, |_, _| {});
         fill_room(s, chat::example::EMPTY_ROOM);
     }),
+    // The room list's menu: right-click a room to move it up or down, as the web UI's drag does.
+    ("chat-room-list-menu", |s| {
+        details_scene(s, "town-square", |_, _| {});
+        s.chat.room_menu = Some((
+            "town-square".to_owned(),
+            rune::PointerPress { x: 120.0, y: 200.0 },
+        ));
+    }),
     // Leave room: the question as a member and as the owner sees it.
     ("chat-room-leave-member", |s| {
         details_scene(s, "town-square", |chat, _| chat.ask_leave())

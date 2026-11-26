@@ -11218,3 +11218,278 @@ fn leaving_a_room_removes_its_record_of_deletions() {
     let after = PurgeRecord::open(&dir);
     assert!(after.for_room(&b.vk()).is_some(), "the other room's stays");
 }
+
+// Room order and read position ---------------------------------------------------------------------
+
+/// `a`'s room with `others` messages from other members after its own, oldest first.
+fn room_read_by_others(seed: u8, others: usize) -> (TestRoom, Vec<MessageId>) {
+    let mut room = TestRoom::new(seed, "A", 1, &["mine"]);
+    let stranger = SigningKey::from_bytes(&[200 + seed; 32]);
+    let base = SystemTime::now();
+    for i in 0..others {
+        room.state.recent_messages.messages.push(message(
+            &stranger,
+            base + Duration::from_secs(i as u64 + 1),
+            &format!("theirs {i}"),
+        ));
+    }
+    let ids = room
+        .state
+        .recent_messages
+        .messages
+        .iter()
+        .map(|m| m.id())
+        .collect();
+    (room, ids)
+}
+
+fn key_of(room: &TestRoom) -> String {
+    bs58::encode(room.vk().to_bytes()).into_string()
+}
+
+fn unread_of(rooms: &Rooms, room: &TestRoom) -> usize {
+    shown(rooms, room).view(&local_minutes).unread
+}
+
+#[test]
+fn a_move_is_shown_at_once_stored_beside_the_web_uis_order_and_kept_over_an_older_read() {
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let b = TestRoom::new(2, "B", 1, &["b1"]);
+    let c = TestRoom::new(3, "C", 1, &["c1"]);
+    let mut rooms = Rooms::default();
+    let mut first = loaded(vec![a.stored(), b.stored(), c.stored()]);
+    first.meta.room_order = vec![a.vk(), b.vk(), c.vk()];
+    rooms.replace(first);
+    let order = |rooms: &Rooms| -> Vec<VerifyingKey> {
+        rooms.list.iter().map(|r| r.stored.owner_vk).collect()
+    };
+    assert_eq!(order(&rooms), vec![a.vk(), b.vk(), c.vk()]);
+
+    // C before A: shown at once, and queued as one order write.
+    assert!(rooms.list_command(
+        &key_of(&c),
+        Action::MoveRoom {
+            before: Some(key_of(&a)),
+        }
+    ));
+    assert_eq!(order(&rooms), vec![c.vk(), a.vk(), b.vk()]);
+    assert_eq!(
+        rooms.outbox.work.pending_order(),
+        Some(vec![c.vk(), a.vk(), b.vk()])
+    );
+    // A read of the store made before the write landed still says the old order: the pick stays.
+    let mut stale = loaded(vec![a.stored(), b.stored(), c.stored()]);
+    stale.meta.room_order = vec![a.vk(), b.vk(), c.vk()];
+    rooms.replace(stale);
+    assert_eq!(order(&rooms), vec![c.vk(), a.vk(), b.vk()]);
+
+    // To the end; a move that changes nothing, or names a room not shown, queues nothing new.
+    assert!(rooms.list_command(&key_of(&c), Action::MoveRoom { before: None }));
+    assert_eq!(order(&rooms), vec![a.vk(), b.vk(), c.vk()]);
+    assert!(!rooms.list_command(&key_of(&c), Action::MoveRoom { before: None }));
+    assert!(!rooms.list_command(
+        &key_of(&a),
+        Action::MoveRoom {
+            before: Some(key_of(&TestRoom::new(9, "Z", 1, &[]))),
+        }
+    ));
+}
+
+#[test]
+fn a_move_reaches_the_store_without_losing_what_the_web_ui_wrote() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let b = TestRoom::new(2, "B", 2, &["b1"]);
+    let c = TestRoom::new(3, "C", 3, &["c1"]);
+    node.with(|w| {
+        w.slots.insert(
+            ROOMS_META_KEY.to_vec(),
+            web_ui_meta_with_modes(a.vk(), &[a.vk(), b.vk(), c.vk()]),
+        );
+    });
+    let (session, _dir) = following(&node, &[&a, &b, &c], "move-order", quick());
+    session.wait_rooms("in the web UI's order", |r, _, _| {
+        r.iter().map(|x| x.key.clone()).collect::<Vec<_>>()
+            == vec![key_of(&a), key_of(&b), key_of(&c)]
+    });
+    session.act(
+        &c,
+        Action::MoveRoom {
+            before: Some(key_of(&a)),
+        },
+    );
+    session.wait_until("the order is stored", || {
+        node.with(|w| {
+            crate::rooms::order::decode_order(w.slots.get(ROOMS_META_KEY).unwrap())
+                == vec![c.vk(), a.vk(), b.vk()]
+        })
+    });
+    node.with(|w| {
+        let meta = w.slots.get(ROOMS_META_KEY).unwrap();
+        // The web UI's mode and its unknown field are as it left them.
+        assert_eq!(
+            crate::rooms::modes::decode_modes(meta)[&a.vk()],
+            NotificationMode::Muted
+        );
+        assert_eq!(meta_marker(meta), Some(11));
+        assert_eq!(w.overlaps, 0);
+    });
+    session.wait_rooms("shown in the new order", |r, _, _| {
+        r.iter().map(|x| x.key.clone()).collect::<Vec<_>>()
+            == vec![key_of(&c), key_of(&a), key_of(&b)]
+    });
+    drop(session);
+    // A new run reads the order back from the store.
+    let again = Running::start(&node, &_dir, quick());
+    again.wait_rooms("the rooms are live in the stored order", |r, _, s| {
+        s == LinkStatus::Live
+            && r.iter().map(|x| x.key.clone()).collect::<Vec<_>>()
+                == vec![key_of(&c), key_of(&a), key_of(&b)]
+    });
+}
+
+#[test]
+fn leaving_still_takes_the_room_out_of_the_order_the_web_ui_and_a_move_wrote() {
+    let node = fake_node(vec![]);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let b = TestRoom::new(2, "B", 2, &["b1"]);
+    node.with(|w| {
+        w.slots.insert(
+            ROOMS_META_KEY.to_vec(),
+            web_ui_meta_with_modes(b.vk(), &[a.vk(), b.vk()]),
+        );
+    });
+    let (session, _dir) = following(&node, &[&a, &b], "move-then-leave", quick());
+    session.act(
+        &b,
+        Action::MoveRoom {
+            before: Some(key_of(&a)),
+        },
+    );
+    session.wait_until("the move is stored", || {
+        node.with(|w| {
+            crate::rooms::order::decode_order(w.slots.get(ROOMS_META_KEY).unwrap())
+                == vec![b.vk(), a.vk()]
+        })
+    });
+    session.act(&b, Action::LeaveRoom);
+    session.wait_until("B is gone from the order", || {
+        node.with(|w| {
+            crate::rooms::order::decode_order(w.slots.get(ROOMS_META_KEY).unwrap()) == vec![a.vk()]
+        })
+    });
+}
+
+#[test]
+fn reading_a_room_stores_the_position_and_only_ever_moves_it_forward() {
+    let node = fake_node(vec![]);
+    let (a, ids) = room_read_by_others(1, 3);
+    let (session, _dir) = following(&node, &[&a], "mark-read", quick());
+    let stored_marker = |node: &FakeNode| -> Option<MessageId> {
+        node.with(|w| {
+            let bytes = w.slots.get(&room_storage_key(&a.vk())).unwrap().clone();
+            match decode_room_slot(&bytes).unwrap() {
+                StoredRoomSlot::Present(r) => r.last_read_message_id,
+                StoredRoomSlot::Tombstone => None,
+            }
+        })
+    };
+    assert_eq!(stored_marker(&node), None);
+    session.act(
+        &a,
+        Action::MarkRead {
+            up_to: message_key(&ids[2]),
+        },
+    );
+    session.wait_until("the position is stored", || {
+        stored_marker(&node) == Some(ids[2].clone())
+    });
+    // An older position, reported late, changes nothing.
+    session.act(
+        &a,
+        Action::MarkRead {
+            up_to: message_key(&ids[1]),
+        },
+    );
+    session.act(
+        &a,
+        Action::MarkRead {
+            up_to: message_key(&ids[3]),
+        },
+    );
+    // (The newer one is held for the write interval; the older one never was queued.)
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(stored_marker(&node), Some(ids[2].clone()));
+    node.with(|w| assert_eq!(w.overlaps, 0));
+}
+
+#[test]
+fn an_own_position_is_not_put_back_by_an_older_read_and_one_the_web_ui_wrote_is_taken() {
+    let (a, ids) = room_read_by_others(1, 3);
+    let mut rooms = Rooms::default();
+    rooms.replace(loaded(vec![a.stored()]));
+    // Nothing read yet: this app counts nothing unread without a position (as before).
+    assert_eq!(unread_of(&rooms, &a), 0);
+
+    // Read up to the second message here: two of theirs are after it.
+    assert!(rooms.list_command(
+        &key_of(&a),
+        Action::MarkRead {
+            up_to: message_key(&ids[1]),
+        }
+    ));
+    assert_eq!(unread_of(&rooms, &a), 2);
+
+    // A read of the store made before that was stored (no position) does not undo it.
+    rooms.replace(loaded(vec![a.stored()]));
+    assert_eq!(unread_of(&rooms, &a), 2);
+    assert_eq!(
+        shown(&rooms, &a).stored.last_read_message_id,
+        Some(ids[1].clone())
+    );
+
+    // The web UI, on the same node, read on to the third: the next read of the store takes it, and
+    // the unread count follows. Reading back to an older one is not taken.
+    let mut web = a.stored();
+    web.last_read_message_id = Some(ids[2].clone());
+    rooms.replace(loaded(vec![web]));
+    assert_eq!(unread_of(&rooms, &a), 1);
+    let mut older = a.stored();
+    older.last_read_message_id = Some(ids[0].clone());
+    rooms.replace(loaded(vec![older]));
+    assert_eq!(unread_of(&rooms, &a), 1);
+    // And a mark at or behind what is held asks for no write.
+    assert!(!rooms.list_command(
+        &key_of(&a),
+        Action::MarkRead {
+            up_to: message_key(&ids[1]),
+        }
+    ));
+}
+
+#[test]
+fn a_busy_room_read_by_the_user_causes_one_write_not_one_per_message() {
+    let (a, ids) = room_read_by_others(1, 40);
+    let mut rooms = Rooms::default();
+    rooms.replace(loaded(vec![a.stored()]));
+    let mut writes_before_the_interval = 0;
+    for id in &ids[1..] {
+        assert!(rooms.list_command(
+            &key_of(&a),
+            Action::MarkRead {
+                up_to: message_key(id),
+            }
+        ));
+        // Taking the request is what starts a write.
+        let started = rooms
+            .outbox
+            .work
+            .next_request(false, Instant::now())
+            .is_some();
+        if started {
+            writes_before_the_interval += 1;
+        }
+    }
+    assert_eq!(writes_before_the_interval, 1, "the first goes out at once");
+    assert!(rooms.outbox.work.read_held(&a.vk()), "the rest is one held");
+}

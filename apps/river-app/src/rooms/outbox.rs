@@ -345,10 +345,9 @@ impl std::fmt::Debug for Action {
                 .debug_struct("SetNotificationMode")
                 .field("mode", mode)
                 .finish(),
-            Action::MoveRoom { before } => f
-                .debug_struct("MoveRoom")
-                .field("before", before)
-                .finish(),
+            Action::MoveRoom { before } => {
+                f.debug_struct("MoveRoom").field("before", before).finish()
+            }
             Action::MarkRead { up_to } => f.debug_struct("MarkRead").field("up_to", up_to).finish(),
             Action::LeaveRoom => f.write_str("LeaveRoom"),
             Action::Viewing => f.write_str("Viewing"),

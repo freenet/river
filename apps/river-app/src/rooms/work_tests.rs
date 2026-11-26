@@ -3262,3 +3262,294 @@ fn an_error_naming_a_key_given_up_on_and_a_followed_key() {
     assert!(!w.on_error(&named, false, &|id| *id == *earlier[0].id()));
     assert!(w.has_late());
 }
+
+// Room order -------------------------------------------------------------------------------------
+
+#[test]
+fn an_order_is_stored_by_reading_rooms_meta_then_a_cas_store_that_keeps_the_rest() {
+    use crate::rooms::order::decode_order;
+    let mut w = Work::default();
+    w.set_order(vec![room_vk(1), room_vk(2), room_vk(3)]);
+    // Holds no room and shows no row while it works.
+    assert!(w.busy());
+    assert!(!w.holds(&room_vk(1)));
+    assert!(w.views().is_empty(), "too quick for a row");
+    assert_eq!(
+        w.pending_order(),
+        Some(vec![room_vk(1), room_vk(2), room_vk(3)])
+    );
+    expect_read(&mut w, ROOMS_META_KEY);
+    assert!(w.on_delegate(&read_answer(ROOMS_META_KEY, Some(web_meta_bytes()), 4)));
+    let value = expect_store(&mut w, ROOMS_META_KEY, 4);
+    assert_eq!(
+        decode_order(&value),
+        vec![room_vk(1), room_vk(2), room_vk(3)]
+    );
+    // The open room and the other room's mode are as the web UI left them.
+    let meta = decode_rooms_meta(&value).unwrap();
+    assert_eq!(meta.current_room_key, Some(room_vk(1)));
+    assert_eq!(
+        crate::rooms::modes::decode_modes(&value)[&room_vk(2)],
+        NotificationMode::Muted
+    );
+    assert!(w.on_delegate(&store_answer(
+        ROOMS_META_KEY,
+        CasStoreResult::Stored { generation: 5 }
+    )));
+    assert!(!w.busy());
+    assert!(w.views().is_empty());
+    assert!(!w.take_reload());
+    assert_eq!(w.pending_order(), None);
+}
+
+#[test]
+fn an_order_conflict_reads_again_and_merges_what_the_web_ui_stored() {
+    use crate::rooms::order::decode_order;
+    let mut w = Work::default();
+    w.set_order(vec![room_vk(1), room_vk(2)]);
+    expect_read(&mut w, ROOMS_META_KEY);
+    assert!(w.on_delegate(&read_answer(ROOMS_META_KEY, None, 0)));
+    let first = expect_store(&mut w, ROOMS_META_KEY, 0);
+    assert_eq!(decode_order(&first), vec![room_vk(1), room_vk(2)]);
+    // The web UI stored first: a room this app has not read yet (9), between 2 and 1.
+    let mut web = Vec::new();
+    ciborium::ser::into_writer(
+        &ciborium::Value::Map(vec![(
+            ciborium::Value::Text("room_order".into()),
+            ciborium::Value::serialized(&vec![room_vk(2), room_vk(9), room_vk(1)]).unwrap(),
+        )]),
+        &mut web,
+    )
+    .unwrap();
+    assert!(w.on_delegate(&store_answer(
+        ROOMS_META_KEY,
+        CasStoreResult::Conflict {
+            current_generation: 3,
+            current_value: None,
+        }
+    )));
+    expect_read(&mut w, ROOMS_META_KEY);
+    assert!(w.on_delegate(&read_answer(ROOMS_META_KEY, Some(web), 3)));
+    let second = expect_store(&mut w, ROOMS_META_KEY, 3);
+    // Not clobbered: room 9 is still there, next to the room it followed (2).
+    assert_eq!(
+        decode_order(&second),
+        vec![room_vk(1), room_vk(2), room_vk(9)]
+    );
+}
+
+#[test]
+fn an_order_the_store_already_holds_writes_nothing_and_moving_quickly_writes_the_last() {
+    let mut w = Work::default();
+    w.set_order(vec![room_vk(2), room_vk(1)]);
+    expect_read(&mut w, ROOMS_META_KEY);
+    assert!(w.on_delegate(&read_answer(ROOMS_META_KEY, Some(web_meta_bytes()), 4)));
+    assert!(!w.busy(), "web_meta_bytes already holds [2, 1]");
+
+    let mut w = Work::default();
+    w.set_order(vec![room_vk(1), room_vk(2), room_vk(3)]);
+    w.set_order(vec![room_vk(3), room_vk(2), room_vk(1)]);
+    expect_read(&mut w, ROOMS_META_KEY);
+    assert!(w.on_delegate(&read_answer(ROOMS_META_KEY, None, 0)));
+    let value = expect_store(&mut w, ROOMS_META_KEY, 0);
+    assert_eq!(
+        crate::rooms::order::decode_order(&value),
+        vec![room_vk(3), room_vk(2), room_vk(1)]
+    );
+    assert!(w.on_delegate(&store_answer(
+        ROOMS_META_KEY,
+        CasStoreResult::Stored { generation: 1 }
+    )));
+    assert!(!w.busy(), "one write for both moves");
+}
+
+#[test]
+fn an_order_that_cannot_be_stored_is_said_and_is_no_longer_pending() {
+    let mut w = Work::default();
+    w.set_order(vec![room_vk(1)]);
+    expect_read(&mut w, ROOMS_META_KEY);
+    let mut text = Vec::new();
+    ciborium::ser::into_writer(&"not a map", &mut text).unwrap();
+    assert!(w.on_delegate(&read_answer(ROOMS_META_KEY, Some(text), 1)));
+    let WorkState::Failed { why, retry } = state(&w) else {
+        panic!("failed");
+    };
+    assert!(!retry);
+    assert!(why.contains("room order was not saved"), "{why}");
+    assert_eq!(w.pending_order(), None, "the store's word stands");
+}
+
+// Read position ----------------------------------------------------------------------------------
+
+fn place(n: i64) -> MessageOrderKey {
+    MessageOrderKey {
+        time: (SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000 + n as u64)).into(),
+        id: river_core::room_state::message::MessageId(freenet_scaffold::util::FastHash(n)),
+    }
+}
+
+/// The slot of room 1 as the web UI stores it, and what a marker write of it reads back as.
+fn marker_of(slot: &[u8]) -> Option<river_core::room_state::message::MessageId> {
+    match decode_room_slot(slot) {
+        Ok(StoredRoomSlot::Present(r)) => r.last_read_message_id,
+        _ => panic!("present"),
+    }
+}
+
+/// Write the marker task's slot: read it, answer with `slot` at `generation`, and take the store.
+fn write_marker(w: &mut Work, key: &[u8], slot: &[u8], generation: u64) -> Vec<u8> {
+    expect_read(w, key);
+    assert!(w.on_delegate(&read_answer(key, Some(slot.to_vec()), generation)));
+    let value = expect_store(w, key, generation);
+    assert!(w.on_delegate(&store_answer(
+        key,
+        CasStoreResult::Stored {
+            generation: generation + 1
+        }
+    )));
+    value
+}
+
+#[test]
+fn a_read_marker_is_stored_in_the_rooms_slot_by_read_then_cas_without_holding_the_room() {
+    let (owner, slot) = present_room(1);
+    let key = room_storage_key(&owner);
+    let mut w = Work::default();
+    let t0 = Instant::now();
+    w.mark_read(owner, place(5), vec![place(5)], t0);
+    assert!(w.busy() || w.next_request(false, t0).is_some());
+    // Never a row, and the room stays open to everything else.
+    assert!(w.views().is_empty());
+    assert!(!w.holds(&owner));
+    expect_read_after_start(&mut w, &key, &slot);
+}
+
+/// The marker task has been started by `next_request` already: answer its slot read and store.
+fn expect_read_after_start(w: &mut Work, key: &[u8], slot: &[u8]) {
+    assert!(w.on_delegate(&read_answer(key, Some(slot.to_vec()), 3)));
+    let value = expect_store(w, key, 3);
+    assert_eq!(
+        marker_of(&value),
+        Some(place(5).id),
+        "only the marker is set"
+    );
+    assert!(w.on_delegate(&store_answer(key, CasStoreResult::Stored { generation: 4 })));
+    assert!(!w.busy());
+    assert!(w.views().is_empty());
+    assert!(!w.take_reload(), "the screen already shows it");
+}
+
+#[test]
+fn read_marker_writes_are_bounded_one_per_interval_and_never_backwards() {
+    let (owner, slot) = present_room(1);
+    let key = room_storage_key(&owner);
+    let mut w = Work::default();
+    let t0 = Instant::now();
+    // The first goes out at once.
+    w.mark_read(owner, place(1), vec![place(1)], t0);
+    let first = write_marker(&mut w, &key, &slot, 3);
+    assert_eq!(marker_of(&first), Some(place(1).id));
+    w.forget_done(&|_| false);
+
+    // A hundred more marks within the interval (messages arriving in a room being read, then an
+    // older one reported late) cause no request at all.
+    for i in 2..=100 {
+        let at = t0 + std::time::Duration::from_millis(50 * i as u64);
+        w.mark_read(owner, place(i), (1..=i).map(place).collect(), at);
+        assert!(w.next_request(false, at).is_none(), "mark {i} waits");
+    }
+    w.mark_read(
+        owner,
+        place(7),
+        vec![place(7)],
+        t0 + std::time::Duration::from_secs(6),
+    );
+    assert!(
+        w.next_request(
+            false,
+            t0 + READ_WRITE_INTERVAL - std::time::Duration::from_millis(1)
+        )
+        .is_none()
+    );
+    assert!(w.read_held(&owner));
+
+    // When the interval has passed, one write carries the furthest mark. (The first write
+    // started a moment after `t0`: the interval counts from there.)
+    let due = Instant::now() + READ_WRITE_INTERVAL;
+    let req = w.next_request(false, due).expect("due");
+    assert!(matches!(
+        delegate_msg(&req),
+        Some(ChatDelegateRequestMsg::GetVersionedRequest { .. })
+    ));
+    assert!(w.on_delegate(&read_answer(&key, Some(first.clone()), 4)));
+    let second = expect_store(&mut w, &key, 4);
+    assert_eq!(marker_of(&second), Some(place(100).id));
+    assert!(w.on_delegate(&store_answer(
+        &key,
+        CasStoreResult::Stored { generation: 5 }
+    )));
+    assert!(!w.read_held(&owner));
+    assert!(
+        w.next_request(false, due).is_none(),
+        "nothing left to write"
+    );
+}
+
+/// A marker write that lost the compare-and-swap: the slot the web UI stored instead, read again.
+fn marker_conflict(web_marker: i64) -> (Work, Vec<u8>, Option<Vec<u8>>) {
+    let (owner, slot) = present_room(1);
+    let key = room_storage_key(&owner);
+    let mut w = Work::default();
+    let t0 = Instant::now();
+    w.mark_read(owner, place(5), vec![place(2), place(5)], t0);
+    w.next_request(false, t0).expect("a read");
+    assert!(w.on_delegate(&read_answer(&key, Some(slot.clone()), 3)));
+    let _ = expect_store(&mut w, &key, 3);
+    assert!(w.on_delegate(&store_answer(
+        &key,
+        CasStoreResult::Conflict {
+            current_generation: 4,
+            current_value: None,
+        }
+    )));
+    expect_read(&mut w, &key);
+    let web = crate::rooms::read::slot_with_marker(
+        Some(&slot),
+        &place(web_marker),
+        &[place(2), place(5)],
+    )
+    .unwrap()
+    .unwrap();
+    assert!(w.on_delegate(&read_answer(&key, Some(web), 4)));
+    let second = w
+        .next_request(false, Instant::now())
+        .and_then(|r| match delegate_msg(&r) {
+            Some(ChatDelegateRequestMsg::CasStoreRequest { value, .. }) => Some(value),
+            _ => None,
+        });
+    (w, key, second)
+}
+
+#[test]
+fn a_read_marker_conflict_reads_again_and_stores_over_an_older_marker_the_web_ui_wrote() {
+    let (_, _, second) = marker_conflict(2);
+    assert_eq!(marker_of(&second.expect("stored")), Some(place(5).id));
+}
+
+#[test]
+fn a_read_marker_conflict_stores_nothing_when_the_web_ui_wrote_one_as_far_or_further() {
+    let (w, _, second) = marker_conflict(5);
+    assert_eq!(second, None);
+    assert!(!w.busy(), "done without a store");
+}
+
+#[test]
+fn a_marker_held_for_a_room_that_is_left_is_dropped() {
+    let (owner, _) = present_room(1);
+    let mut w = Work::default();
+    let t0 = Instant::now();
+    w.mark_read(owner, place(1), vec![place(1)], t0);
+    assert!(w.read_held(&owner));
+    assert!(w.leave(owner, "Book club".into(), None));
+    assert!(!w.read_held(&owner));
+}

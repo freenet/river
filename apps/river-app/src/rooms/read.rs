@@ -30,12 +30,12 @@ pub const MARKER_FIELD: &str = "last_read_message_id";
 pub type Known = Vec<MessageOrderKey>;
 
 /// Where `id` stands in the room: from the messages this app holds, else from the slot's copy.
-fn place(id: &MessageId, known: &[MessageOrderKey], slot: &[MessageOrderKey]) -> Option<MessageOrderKey> {
-    known
-        .iter()
-        .chain(slot)
-        .find(|k| &k.id == id)
-        .cloned()
+fn place(
+    id: &MessageId,
+    known: &[MessageOrderKey],
+    slot: &[MessageOrderKey],
+) -> Option<MessageOrderKey> {
+    known.iter().chain(slot).find(|k| &k.id == id).cloned()
 }
 
 /// Whether `candidate` is strictly further along than `held`, as the web UI's

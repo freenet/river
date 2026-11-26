@@ -99,7 +99,13 @@ fn a_marker_moves_forward_and_only_it_changes() {
         Some(Value::from(7u32)),
         "unknown field kept"
     );
-    for name in ["owner_vk", "room_state", "self_sk", "contract_key", "self_nickname"] {
+    for name in [
+        "owner_vk",
+        "room_state",
+        "self_sk",
+        "contract_key",
+        "self_nickname",
+    ] {
         assert_eq!(field(&after, name), field(&before, name), "{name}");
     }
 }
@@ -157,7 +163,10 @@ fn a_stored_marker_found_nowhere_loses_to_one_that_is() {
 #[test]
 fn a_room_that_is_not_stored_or_was_left_is_not_written() {
     let ms = messages();
-    assert_eq!(slot_with_marker(None, &ms[0].order_key(), &keys(&ms)), Ok(None));
+    assert_eq!(
+        slot_with_marker(None, &ms[0].order_key(), &keys(&ms)),
+        Ok(None)
+    );
     let mut tomb = Vec::new();
     ciborium::ser::into_writer(&"Tombstone", &mut tomb).unwrap();
     assert_eq!(

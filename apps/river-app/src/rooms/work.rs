@@ -122,8 +122,8 @@ use super::leave::{meta_without_room, tombstone_write};
 use super::modes::{NotificationMode, meta_with_mode};
 use super::order::meta_with_order;
 use super::read::{Known, slot_with_marker};
-use river_core::room_state::message::MessageOrderKey;
 use super::rekey::{self, Found, Policy, Probe};
+use river_core::room_state::message::MessageOrderKey;
 
 /// How many times a write is worked out again after another writer got in first. The web UI's
 /// `ROOMS_CAS_MAX_ATTEMPTS`.
@@ -1156,6 +1156,8 @@ impl Work {
         if self.leaving(&room) {
             return false;
         }
+        // A read marker held for the room has no use any more.
+        self.held_reads.remove(&room);
         // An earlier leave that failed is replaced by this one, not shown beside it.
         self.tasks
             .retain(|t| !(t.is_leave() && t.owner() == Some(room) && t.failed.is_some()));
@@ -1375,7 +1377,7 @@ impl Work {
 
     /// Whether a read marker is held for `room`, or being written.
     #[cfg(test)]
-    fn read_held(&self, room: &VerifyingKey) -> bool {
+    pub(super) fn read_held(&self, room: &VerifyingKey) -> bool {
         self.held_reads.contains_key(room)
     }
 
@@ -2320,9 +2322,9 @@ impl Work {
             .into_iter()
             .chain(background)
             .filter(|t| !t.is_dm() && !t.is_read())
-            .filter(|t| {
-                !((t.is_mode() || t.is_order() || t.is_leave()) && t.step == Step::Done)
-            })
+            .filter(|t| !((t.is_mode() || t.is_order() || t.is_leave()) && t.step == Step::Done))
+            // A room order is stored too quickly to be worth a row; one that failed is said.
+            .filter(|t| !(t.is_order() && t.failed.is_none()))
             .filter(|t| match &t.kind {
                 // Carrying rooms over is shown while it works, and when it failed with something
                 // to try again. Not once done (the rooms show), and not when River moved on

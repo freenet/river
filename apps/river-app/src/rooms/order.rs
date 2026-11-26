@@ -110,10 +110,7 @@ pub fn meta_with_order(
         .position(|(k, _)| k.as_text() == Some(ORDER_FIELD));
     let stored: Vec<VerifyingKey> = match at {
         Some(i) => match &entries[i].1 {
-            Value::Array(items) => items
-                .iter()
-                .filter_map(|v| v.deserialized().ok())
-                .collect(),
+            Value::Array(items) => items.iter().filter_map(|v| v.deserialized().ok()).collect(),
             _ => return Err("rooms_meta: room_order is not a list".into()),
         },
         None => Vec::new(),
