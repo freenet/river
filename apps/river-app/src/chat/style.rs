@@ -287,3 +287,65 @@ pub fn avatar_colors(id: u32) -> (Color, Color) {
         (oklch(0.90, 0.05, h), oklch(0.37, 0.045, h))
     }
 }
+
+// Not in `settings_tests.rs`: the dialog-kit scan there bans the notice colours' names outside
+// this file.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// WCAG relative luminance: a `Color` holds linear light, which is what it is computed from.
+    fn luminance(c: rune::Color) -> f32 {
+        c.luminance()
+    }
+
+    fn contrast(a: rune::Color, b: rune::Color) -> f32 {
+        let (la, lb) = (luminance(a), luminance(b));
+        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+    }
+
+    #[test]
+    fn the_light_and_dark_palettes_are_the_web_uis_values() {
+        let (l, d) = (palette_for(false), palette_for(true));
+        assert_eq!(l.bg, rune::color::hex("#ffffff").unwrap());
+        assert_eq!(l.rail, rune::color::hex("#f4f4f6").unwrap());
+        assert_eq!(l.text, rune::color::hex("#1a1a1a").unwrap());
+        assert_eq!(l.warning_text, rune::color::hex("#8a5800").unwrap());
+        assert_eq!(d.bg, rune::color::hex("#141416").unwrap());
+        assert_eq!(d.text, rune::color::hex("#f0f0f2").unwrap());
+    }
+
+    #[test]
+    fn text_is_readable_on_the_surfaces_it_sits_on_in_both_themes() {
+        for dark in [false, true] {
+            let p = palette_for(dark);
+            let min = 4.5;
+            for (name, fg) in [
+                ("text", p.text),
+                ("text_secondary", p.text_secondary),
+                ("text_muted", p.text_muted),
+                ("quote", p.quote),
+                ("accent", p.accent),
+                ("danger", p.danger),
+                ("warning_text", p.warning_text),
+            ] {
+                for (surface, bg) in [("bg", p.bg), ("rail", p.rail), ("surface", p.surface)] {
+                    let c = contrast(fg, bg);
+                    // The web UI's own muted and secondary inks are 4.47:1 and 4.48:1 on the
+                    // lifted surface (light and dark); everything else clears 4.5:1.
+                    let min = if surface == "surface" { 4.4 } else { min };
+                    assert!(c >= min, "dark={dark}: {name} on {surface} is {c:.2}:1");
+                }
+            }
+            for (name, fg, bg) in [
+                ("warning_text on warning_bg", p.warning_text, p.warning_bg),
+                ("danger on danger_bg", p.danger, p.danger_bg),
+                ("accent on accent_soft", p.accent, p.accent_soft),
+                ("accent on own_row", p.accent, p.own_row),
+            ] {
+                let c = contrast(fg, bg);
+                assert!(c >= min, "dark={dark}: {name} is {c:.2}:1");
+            }
+        }
+    }
+}
