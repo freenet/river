@@ -177,10 +177,11 @@ pub(crate) fn invitation_code_to_intercept(
         .split('&')
         .next()
         .unwrap_or("");
-    if code.is_empty() {
-        return None;
-    }
-    Some(code.to_string())
+    // An empty code is still an invitation link for this River, just a broken
+    // one: intercept it so the damaged-link message shows in place, as it
+    // does when the same link is opened from the address bar. Percent-decode
+    // like the address-bar path (`URLSearchParams`) does.
+    Some(crate::invite_qr::percent_decode(code))
 }
 
 #[cfg(test)]
@@ -222,8 +223,6 @@ mod tests {
             format!("https://gw.example/v1/contract/web/{RIVER}/?invitation=abc"),
             // Only in the fragment, which the page's router owns.
             format!("{ORIGIN}/v1/contract/web/{RIVER}/#?invitation=abc"),
-            // No code.
-            format!("{ORIGIN}/v1/contract/web/{RIVER}/?invitation="),
             // Not an invite at all.
             format!("{ORIGIN}/v1/contract/web/{RIVER}/?x=1"),
         ] {
@@ -233,6 +232,22 @@ mod tests {
                 "{href}"
             );
         }
+    }
+
+    /// An empty code is intercepted (the damaged-link message then shows in
+    /// place), and a code is percent-decoded like the address-bar path.
+    #[test]
+    fn empty_and_percent_encoded_codes_are_intercepted() {
+        let empty = format!("{ORIGIN}/v1/contract/web/{RIVER}/?invitation=");
+        assert_eq!(
+            invitation_code_to_intercept(&empty, ORIGIN, &page()),
+            Some(String::new())
+        );
+        let encoded = format!("{ORIGIN}/v1/contract/web/{RIVER}/?invitation=ab%43d");
+        assert_eq!(
+            invitation_code_to_intercept(&encoded, ORIGIN, &page()),
+            Some("abCd".to_string())
+        );
     }
 
     #[test]

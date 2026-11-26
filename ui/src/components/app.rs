@@ -31,7 +31,7 @@ use crate::invites::PendingInvites;
 use crate::room_data::{CurrentRoom, Rooms};
 use crate::util::BUILD_TIMESTAMP_ISO;
 use dioxus::document::{Link, Stylesheet};
-use dioxus::logger::tracing::{debug, error, info, warn};
+use dioxus::logger::tracing::{debug, error, info};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
 use freenet_stdlib::client_api::WebApi;
@@ -276,12 +276,9 @@ pub fn App() -> Element {
     // `dm_thread_modal.rs`.
     let invitation_resume_fired = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(false)));
 
-    // Open while an invitation link's code could not be decoded (typically a
-    // link cut short when copied). The URL check below runs on every render
-    // and the sandboxed iframe cannot strip `?invitation=`, so a one-shot
-    // flag keeps a dismissed message from reopening on the next render.
-    let mut damaged_invitation = use_signal(|| false);
-    let damaged_invitation_reported = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(false)));
+    // Holds an invitation link's code while it could not be decoded (typically
+    // a link cut short when copied), which opens `DamagedInvitationModal`.
+    let mut damaged_invitation = use_signal(|| None::<String>);
 
     // Bridge the click interceptor's `INTERCEPTED_INVITATION_CODE` global
     // into the local `receive_invitation` signal that drives
@@ -338,8 +335,9 @@ pub fn App() -> Element {
                 }
             }
             InvitationCode::Damaged => {
-                warn!("Intercepted invite click had an undecodable code");
-                damaged_invitation.set(true);
+                // A click is a fresh request, so show it even if this link
+                // was dismissed before.
+                damaged_invitation.set(Some(code));
             }
         }
     });
@@ -407,8 +405,16 @@ pub fn App() -> Element {
                             }
                         }
                         InvitationCode::Damaged => {
-                            if take_resume_once(&damaged_invitation_reported) {
-                                damaged_invitation.set(true);
+                            // This block runs on every render and the sandboxed
+                            // iframe cannot strip `?invitation=`, so skip a code
+                            // the user already dismissed (in this session or,
+                            // via the processed hash, before a reload), and
+                            // one already showing.
+                            if !is_invitation_processed(&invitation_code)
+                                && damaged_invitation.peek().as_deref()
+                                    != Some(invitation_code.as_str())
+                            {
+                                damaged_invitation.set(Some(invitation_code.clone()));
                             }
                         }
                     }
@@ -781,7 +787,7 @@ pub fn App() -> Element {
         ReceiveInvitationModal {
             invitation: receive_invitation
         }
-        DamagedInvitationModal { open: damaged_invitation }
+        DamagedInvitationModal { code: damaged_invitation }
         DocumentTitleUpdater {}
         update_banner::UpdateBanner {}
         // Last, so it paints above the ordinary modals and the banner.

@@ -719,32 +719,74 @@ pub(crate) fn classify_invitation_code(code: &str) -> InvitationCode {
 /// Tells the user an invitation link could not be read. Same layout and
 /// error styling as the "Failed to retrieve room" state of
 /// [`ReceiveInvitationModal`].
+///
+/// `code` holds the undecodable code while the message is open. Dismissing
+/// records its fingerprint like a dismissed valid invitation, so the same
+/// link does not bring the message back on a reload (the sandboxed iframe
+/// cannot strip `?invitation=` from its own address).
 #[component]
-pub fn DamagedInvitationModal(open: Signal<bool>) -> Element {
-    if !*open.read() {
+pub fn DamagedInvitationModal(code: Signal<Option<String>>) -> Element {
+    let Some(current) = code.read().clone() else {
         return rsx! {};
-    }
+    };
+    // Deferred per the signal-safety rules for event handlers.
+    let dismiss = move || {
+        let current = current.clone();
+        crate::util::defer(move || {
+            mark_invitation_processed(&current);
+            code.set(None);
+        });
+    };
+    let dismiss_on_key = dismiss.clone();
+    let dismiss_on_backdrop = dismiss.clone();
 
     rsx! {
         div {
             class: "fixed inset-0 z-50 flex items-center justify-center",
-            div { class: "absolute inset-0 bg-black/50" }
+            // Nothing is lost by closing this one, so the backdrop dismisses.
+            div {
+                "data-testid": "damaged-invitation-backdrop",
+                class: "absolute inset-0 bg-black/50",
+                onclick: move |_| dismiss_on_backdrop(),
+            }
             div {
                 "data-testid": "damaged-invitation-modal",
+                role: "alertdialog",
+                "aria-modal": "true",
+                "aria-labelledby": "damaged-invitation-title",
+                "aria-describedby": "damaged-invitation-text",
                 class: "relative z-10 w-full max-w-md mx-4 bg-panel rounded-xl shadow-xl border border-border",
+                onkeydown: move |evt: KeyboardEvent| {
+                    if evt.key() == Key::Escape {
+                        evt.prevent_default();
+                        dismiss_on_key();
+                    }
+                },
                 div {
                     class: "p-6",
-                    h1 { class: "text-[16px] font-semibold text-text mb-4", "Invitation Received" }
+                    h1 {
+                        id: "damaged-invitation-title",
+                        class: "text-[16px] font-semibold text-text mb-4",
+                        "Can't open this invitation"
+                    }
                     div {
                         class: "bg-error-bg border-l-[3px] border-danger rounded-lg p-4",
-                        p { class: "mb-4 text-text", "{DAMAGED_INVITATION_MESSAGE}" }
+                        p {
+                            id: "damaged-invitation-text",
+                            class: "mb-4 text-[15px] text-text",
+                            "{DAMAGED_INVITATION_MESSAGE}"
+                        }
                         button {
                             "data-testid": "damaged-invitation-dismiss-button",
-                            class: "px-4 py-2 bg-surface hover:bg-surface-hover border border-border-hover text-text font-medium rounded-lg transition-colors",
-                            // Deferred per the signal-safety rules for event handlers.
-                            onclick: move |_| {
-                                crate::util::defer(move || open.set(false));
+                            class: "min-h-[44px] px-4 py-2 bg-surface hover:bg-surface-hover border border-border-hover text-text font-medium rounded-lg transition-colors",
+                            // Focus starts here so Escape and Enter work at once.
+                            onmounted: move |cx| {
+                                let element = cx.data();
+                                crate::util::safe_spawn_local(async move {
+                                    let _ = element.set_focus(true).await;
+                                });
                             },
+                            onclick: move |_| dismiss(),
                             "Dismiss"
                         }
                     }

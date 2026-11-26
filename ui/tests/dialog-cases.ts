@@ -93,6 +93,12 @@ export const DIALOG_CASES: DialogCase[] = [
     primary: (p) => p.getByTestId("receive-invitation-accept-button"),
   },
   {
+    name: "damaged invitation",
+    path: "/?invitation=notarealinvitation",
+    open: async () => {},
+    title: (p) => p.getByRole("heading", { name: "Can't open this invitation", exact: true }),
+  },
+  {
     name: "confirm ban",
     room: "Your Private Room",
     open: async (p) => {
