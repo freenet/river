@@ -79,10 +79,10 @@ pub async fn handle_put_response(
                 });
             } else {
                 // Update sync status in a separate block to avoid nested borrows
+                // Also requests a sync pass for a change held back while the room
+                // was subscribing (the first message of a fresh join).
                 crate::util::defer(move || {
-                    SYNC_INFO
-                        .write()
-                        .update_sync_status(&owner_vk, RoomSyncStatus::Subscribed);
+                    crate::components::app::sync_info::mark_room_subscribed(owner_vk);
                 });
             }
 
