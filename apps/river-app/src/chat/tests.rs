@@ -6710,7 +6710,6 @@ fn open_room_menu(rt: &mut Runtime<RiverApp>, key: &str) {
 #[test]
 fn the_room_menu_moves_a_room_up_or_down_and_sends_where_to() {
     let mut rt = node_rooms(|_| {});
-    sent_all(&mut rt); // the open room's read position
     let keys = keys_in_order(&rt);
     assert!(keys.len() >= 3, "the example has rooms to move");
     // Down from the top: before the room two below the top one (the room after the next).
@@ -6755,7 +6754,6 @@ fn the_room_menu_moves_a_room_up_or_down_and_sends_where_to() {
 #[test]
 fn moving_a_room_down_to_the_end_names_no_room() {
     let mut rt = node_rooms(|_| {});
-    sent_all(&mut rt);
     let keys = keys_in_order(&rt);
     let n = keys.len();
     rt.update({
@@ -6779,8 +6777,9 @@ fn example_rooms_move_on_the_screen_and_send_nothing() {
 }
 
 fn read_reports(rt: &mut Runtime<RiverApp>) -> Vec<String> {
-    sent_all(rt)
+    std::mem::take(&mut rt.state.chat.reported)
         .into_iter()
+        .map(|c| c.action)
         .filter_map(|a| match a {
             Action::MarkRead { up_to } => Some(up_to),
             _ => None,
@@ -6801,7 +6800,7 @@ fn the_open_room_is_reported_read_up_to_its_newest_message_once() {
         .unwrap()
         .key
         .clone();
-    assert_eq!(read_reports(&mut rt), [newest.clone()]);
+    assert_eq!(read_reports(&mut rt), [newest]);
     // The same newest message is not reported again, whatever redraws or refreshes the list.
     let rooms = rt.state.chat.rooms().to_vec();
     rt.update(move |s, _| {

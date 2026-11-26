@@ -305,6 +305,9 @@ pub struct Chat {
     window_front: bool,
     /// The newest message (`Message::key`) reported read for each room, so each is reported once.
     read_sent: HashMap<String, String>,
+    /// Read positions reported with no sink to take them (tests): kept apart from `outgoing`,
+    /// which holds what the user asked for.
+    pub reported: Vec<Command>,
     /// The composer's emoji picker is open, and on which category.
     pub emoji_open: bool,
     pub emoji_category: usize,
@@ -592,7 +595,15 @@ impl Chat {
         }
         let (room_key, up_to) = (room.key.clone(), newest.key.clone());
         self.read_sent.insert(room_key.clone(), up_to.clone());
-        self.emit(room_key, Action::MarkRead { up_to });
+        // Not something the user asked for: it goes beside `outgoing`, not in it.
+        let command = Command {
+            room: room_key,
+            action: Action::MarkRead { up_to },
+        };
+        match &self.sink {
+            Some(sink) => sink(command),
+            None => self.reported.push(command),
+        }
     }
 
     /// Open the notification dialog of the open room.
@@ -639,6 +650,7 @@ impl Chat {
             room_menu: None,
             window_front: true,
             read_sent: HashMap::new(),
+            reported: Vec::new(),
             emoji_open: false,
             emoji_category: 0,
             mention_sel: (String::new(), 0),
