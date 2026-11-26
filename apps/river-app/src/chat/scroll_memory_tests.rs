@@ -168,3 +168,21 @@ fn each_room_keeps_its_own_place() {
     let again = y_of(&rt, &row).expect("drawn");
     assert!((again - y).abs() < 1.0, "twice over: {y} -> {again}");
 }
+
+#[test]
+fn a_place_whose_message_is_gone_falls_back_to_the_offset() {
+    let mut rt = long_room(|_| {});
+    scroll_up(&mut rt, 500.0);
+    let (row, _) = reading_row(&rt);
+    let gone = row.trim_start_matches("row-").to_owned();
+    select(&mut rt, B);
+    rt.update(move |s, _| {
+        s.chat.edit_rooms(|rooms| {
+            let r = rooms.iter_mut().find(|r| r.key == A).unwrap();
+            r.messages.retain(|m| m.key != gone);
+        });
+    });
+    select(&mut rt, A);
+    assert!(!rt.state.chat.at_bottom, "still away from the end");
+    assert_eq!(rt.scroll_at_bottom(WINDOW), Some(false));
+}

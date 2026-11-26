@@ -233,6 +233,11 @@ impl Chat {
     /// Scroll a pending [`Reveal`] into view once its room's history is laid out. Called every
     /// frame; true while it is still waiting, so the caller asks for another frame.
     pub fn apply_reveal(&mut self, tx: &mut Tx) -> bool {
+        let restoring = self.apply_restore(tx);
+        self.apply_staged_reveal(tx) || restoring
+    }
+
+    fn apply_staged_reveal(&mut self, tx: &mut Tx) -> bool {
         let Some(r) = &mut self.reveal else {
             return false;
         };

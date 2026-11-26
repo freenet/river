@@ -92,6 +92,7 @@ pub fn view(chat: &Chat, logo: Option<&Pixels>, cx: &mut Cx<RiverApp>) -> El {
     if let Some(form) = &chat.details {
         super::details::details_modal(chat, room, form, narrow, win_h, &k, &mut layer);
     }
+    chat.note_reading_place(room, cx);
     screen = screen.child(conversation(chat, room, narrow, win_h, field_h, &p, &k));
     picker_overlay(chat, room, &p, &k, &mut layer);
     mention_overlay(chat, &k, &mut layer);

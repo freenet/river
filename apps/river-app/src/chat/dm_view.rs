@@ -807,6 +807,8 @@ impl Chat {
         if let Some(key) = self.room().map(|r| r.key.clone()) {
             self.mark_read(&key);
         }
+        // The room's history is drawn afresh: back where it was left.
+        self.stage_restore();
         if restore
             && self.actionable().is_some()
             && !self.modal_dialog_open()

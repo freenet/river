@@ -52,6 +52,7 @@ pub mod overview;
 mod quick_reply;
 #[cfg(test)]
 mod reply_jump_tests;
+mod scroll_memory;
 #[cfg(test)]
 mod scroll_memory_tests;
 #[cfg(test)]
@@ -442,6 +443,11 @@ pub struct Chat {
     pub overview: bool,
     /// A message to scroll to once the room it is in is on screen.
     reveal: Option<overview::Reveal>,
+    /// Where each room's history was scrolled to when last left away from its end.
+    scroll_memory:
+        std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, scroll_memory::Place>>>,
+    /// A remembered place waiting for its room's history to be laid out.
+    restore: Option<scroll_memory::Restore>,
     /// Why a reply typed into a notification was not sent, shown above the composer.
     reply_notices: std::collections::BTreeMap<String, String>,
     /// When the switcher's chord last arrived, for [`switcher::chord_gate`].
@@ -618,6 +624,11 @@ impl Chat {
 
     /// The open history now shows its newest message, or does not.
     pub fn set_at_bottom(&mut self, at: bool) {
+        // A room reopened at a remembered place first lays out at its end, before it is
+        // scrolled away: that is not the reader reaching the end.
+        if at && self.restoring() {
+            return;
+        }
         self.at_bottom = at;
         self.report_read();
     }
@@ -770,6 +781,8 @@ impl Chat {
             reply_dragged: false,
             overview: false,
             reveal: None,
+            scroll_memory: Default::default(),
+            restore: None,
             reply_notices: Default::default(),
             chord_at: None,
             node: Default::default(),
@@ -1075,8 +1088,12 @@ impl Chat {
             self.read.insert(key.to_owned(), mark);
         }
         // Choosing a room shows its conversation, whatever thread was open.
-        self.leave_dm();
+        let from_thread = self.leave_dm().is_some();
         if key == self.selected {
+            // The room's history is drawn afresh under the thread that covered it.
+            if from_thread {
+                self.stage_restore();
+            }
             return;
         }
         // A reply, edit or deletion belongs to the room it was started in.
@@ -1105,6 +1122,7 @@ impl Chat {
                 self.composer = draft;
             }
             self.selected = key.to_owned();
+            self.stage_restore();
             self.opened_room();
             return;
         }
@@ -1113,6 +1131,7 @@ impl Chat {
         outgoing.focused = false;
         self.park_draft(self.selected.clone(), outgoing);
         self.selected = key.to_owned();
+        self.stage_restore();
         self.opened_room();
     }
     /// Send what the composer holds to the open room. Blank text sends nothing; otherwise the
