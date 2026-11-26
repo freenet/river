@@ -413,13 +413,78 @@ fn attachment_for_status(
     }
 }
 
-/// Open-member count a new public room starts with. Below the ceiling
-/// (`MAX_PROVISIONAL_CEILING`, 24): every extra open member adds to the cost of
-/// each message, so an owner opts in to more with `--max-provisional`.
-const DEFAULT_MAX_PROVISIONAL: u32 = 16;
-/// Provisional-ban count a new public room starts with (see
-/// [`DEFAULT_MAX_PROVISIONAL`]).
+/// Open-member count an ordinary public room starts with. Well below the
+/// ceiling (`MAX_PROVISIONAL_CEILING`, 24): every extra open member adds to the
+/// cost of each message, and an unwatched room needs conservative settings, so
+/// an owner opts in to more with `--max-provisional`.
+const DEFAULT_MAX_PROVISIONAL: u32 = 8;
+/// Provisional-ban count a new public room starts with. Unused slots cost
+/// nothing, so this is higher than the open-member count.
 const DEFAULT_MAX_PROVISIONAL_BANS: u32 = 16;
+/// Proof-of-work difficulty (leading zero bits) a new public room starts with.
+const DEFAULT_DIFFICULTY_BITS: u8 = 20;
+/// Share of the room's message window open members may fill, in percent.
+const DEFAULT_MESSAGE_SHARE_PERCENT: usize = 10;
+
+/// Open-member message slots for a room with the given message window: 10% of
+/// it, at least 1, within the contract's ceiling.
+fn default_max_provisional_messages(max_recent_messages: usize) -> u32 {
+    ((max_recent_messages * DEFAULT_MESSAGE_SHARE_PERCENT / 100) as u32)
+        .clamp(1, MAX_PROVISIONAL_MESSAGES_CEILING)
+}
+
+/// Shown, and required to be accepted, before an ordinary public room opens.
+pub const UNATTENDED_WARNING: &str = "Anyone can post here after a few seconds of computing. \
+If nobody watches the room, someone can fill the newcomer slots with spam and keep real \
+newcomers out until you turn this off. Members keep their rights and most of their history.";
+
+/// Require the owner's acknowledgement that an open room may be left
+/// unattended. `flag` is `--unattended-ok`; `interactive` says stdin is a
+/// terminal; `ask` shows the warning and returns the owner's answer.
+pub fn require_unattended_ack(
+    flag: bool,
+    interactive: bool,
+    ask: impl FnOnce(&str) -> Result<bool>,
+) -> Result<()> {
+    if flag {
+        return Ok(());
+    }
+    if interactive {
+        if ask(UNATTENDED_WARNING)? {
+            return Ok(());
+        }
+        bail!("Not opening the room: public admission needs your acknowledgement.");
+    }
+    bail!(
+        "Refusing to open public admission without an acknowledgement. {UNATTENDED_WARNING}\n\
+         If nobody watches the room, you accept that; pass --unattended-ok to say so."
+    )
+}
+
+/// Ask on the terminal, defaulting to no.
+pub fn confirm_on_terminal(text: &str) -> Result<bool> {
+    eprintln!("{text}");
+    Ok(dialoguer::Confirm::new()
+        .with_prompt("Open this room to newcomers anyway?")
+        .default(false)
+        .interact()?)
+}
+
+/// The gate `room config` applies: an edit that opens admission on a room with
+/// none needs the owner's acknowledgement (flag, or a terminal answer);
+/// anything else passes untouched. Closing is never gated.
+pub fn gate_unattended(
+    edit: &PolicyEdit,
+    config: &river_core::room_state::configuration::Configuration,
+    flag: bool,
+    interactive: bool,
+    ask: impl FnOnce(&str) -> Result<bool>,
+) -> Result<()> {
+    if edit.needs_unattended_ack(config) {
+        require_unattended_ack(flag, interactive, ask)?;
+    }
+    Ok(())
+}
 
 /// Apply `--public-admission` and friends to a configuration copy.
 pub struct PolicyEdit {
@@ -441,6 +506,16 @@ impl PolicyEdit {
             && self.max_provisional_messages.is_none()
             && self.max_provisional_bans.is_none()
             && self.listed.is_none()
+    }
+
+    /// Whether this edit opens admission on a room that has none, which is
+    /// what needs the owner's acknowledgement. Changing a policy that is
+    /// already open, or closing one, does not.
+    pub fn needs_unattended_ack(
+        &self,
+        config: &river_core::room_state::configuration::Configuration,
+    ) -> bool {
+        self.enable == Some(true) && config.public_admission.is_none()
     }
 
     pub fn apply(&self, config: &mut river_core::room_state::configuration::Configuration) {
@@ -482,22 +557,22 @@ impl PolicyEdit {
                 // Editing a policy the room does not have is a no-op.
                 return;
             }
-            // Defaults follow the design: the open-member quota is half the
-            // message window, and the open-member and ban counts start at
-            // DEFAULT_MAX_PROVISIONAL (16), below their ceilings (24): a
-            // higher count costs every member more per message (#982), so
-            // the owner opts in to it with `--max-provisional`.
+            // Conservative defaults for an ordinary room: 20 bits, 8 open
+            // members, 10% of the message window for them, 16 bans. A higher
+            // open-member count costs every member more per message (#982),
+            // so the owner opts in to it with `--max-provisional`.
             config.public_admission = Some(PublicRoomPolicy {
                 listed: false,
                 max_provisional: DEFAULT_MAX_PROVISIONAL,
-                max_provisional_messages: (config.max_recent_messages as u32 / 2)
-                    .clamp(1, MAX_PROVISIONAL_MESSAGES_CEILING),
+                max_provisional_messages: default_max_provisional_messages(
+                    config.max_recent_messages,
+                ),
                 max_provisional_bans: DEFAULT_MAX_PROVISIONAL_BANS,
                 // A random epoch: a fixed one would let proofs for any room be
                 // computed in advance, and would revive old proofs when
                 // admission is disabled and enabled again.
                 pow: Some(PowPolicy {
-                    difficulty_bits: 20,
+                    difficulty_bits: DEFAULT_DIFFICULTY_BITS,
                     epoch: next_epoch(),
                 }),
             });
@@ -517,7 +592,7 @@ impl PolicyEdit {
         }
         if self.difficulty_bits.is_some() || self.new_epoch {
             let held = policy.pow.clone().unwrap_or(PowPolicy {
-                difficulty_bits: 20,
+                difficulty_bits: DEFAULT_DIFFICULTY_BITS,
                 epoch: next_epoch(),
             });
             let mut epoch = held.epoch;
@@ -788,11 +863,12 @@ mod tests {
         e.enable = Some(true);
         e.apply(&mut c);
         let p = c.public_admission.unwrap();
-        assert_eq!(p.max_provisional_messages, 50);
         assert_eq!(
-            p.max_provisional, 16,
-            "the default stays 16, not the ceiling"
+            p.max_provisional_messages, 10,
+            "10% of a 100-message window"
         );
+        assert_eq!(p.max_provisional, 8, "the default is 8, not the ceiling");
+        assert_eq!(p.pow.as_ref().unwrap().difficulty_bits, 20);
         assert_eq!(p.max_provisional_bans, 16);
         assert_eq!(MAX_PROVISIONAL_CEILING, 24);
         assert_eq!(MAX_PROVISIONAL_BANS_CEILING, 24);
@@ -1031,5 +1107,129 @@ mod tests {
         assert!(bits >= 10);
         let h = river_core::room_state::provisional::pow_hash(&owner, &member, 3, nonce);
         assert!(river_core::room_state::provisional::leading_zero_bits(&h) >= 10);
+    }
+
+    #[test]
+    fn default_message_share_is_ten_percent_of_the_window() {
+        for (window, want) in [
+            (1usize, 1u32),
+            (5, 1),
+            (9, 1),
+            (10, 1),
+            (19, 1),
+            (20, 2),
+            (100, 10),
+            (200, 20),
+            (1000, 100),
+            (100_000, MAX_PROVISIONAL_MESSAGES_CEILING),
+        ] {
+            let mut c = Configuration {
+                max_recent_messages: window,
+                ..Configuration::default()
+            };
+            let mut e = edit();
+            e.enable = Some(true);
+            e.apply(&mut c);
+            assert_eq!(
+                c.public_admission.unwrap().max_provisional_messages,
+                want,
+                "window {window}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_flags_override_the_new_defaults() {
+        // The Official room's settings stay expressible: 20 bits, pool 16,
+        // 20 message slots, 16 bans.
+        let mut c = Configuration {
+            max_recent_messages: 200,
+            ..Configuration::default()
+        };
+        let mut e = edit();
+        e.enable = Some(true);
+        e.difficulty_bits = Some(20);
+        e.max_provisional = Some(16);
+        e.max_provisional_messages = Some(20);
+        e.max_provisional_bans = Some(16);
+        e.apply(&mut c);
+        let p = c.public_admission.unwrap();
+        assert_eq!(p.max_provisional, 16);
+        assert_eq!(p.max_provisional_messages, 20);
+        assert_eq!(p.max_provisional_bans, 16);
+        assert_eq!(p.pow.unwrap().difficulty_bits, 20);
+        // One override leaves the other defaults alone.
+        let mut c2 = Configuration {
+            max_recent_messages: 200,
+            ..Configuration::default()
+        };
+        let mut one = edit();
+        one.enable = Some(true);
+        one.max_provisional_messages = Some(40);
+        one.apply(&mut c2);
+        let p2 = c2.public_admission.unwrap();
+        assert_eq!(p2.max_provisional_messages, 40);
+        assert_eq!(p2.max_provisional, 8);
+    }
+
+    #[test]
+    fn ack_flag_passes_without_asking() {
+        let r = require_unattended_ack(true, true, |_| panic!("must not prompt"));
+        assert!(r.is_ok());
+        let r = require_unattended_ack(true, false, |_| panic!("must not prompt"));
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn ack_without_flag_on_a_terminal_asks_and_obeys_the_answer() {
+        let mut shown = String::new();
+        let r = require_unattended_ack(false, true, |text| {
+            shown = text.to_string();
+            Ok(true)
+        });
+        assert!(r.is_ok());
+        assert!(shown.contains("Anyone can post here after a few seconds of computing"));
+        let r = require_unattended_ack(false, true, |_| Ok(false));
+        assert!(r.is_err(), "answering no must refuse");
+    }
+
+    #[test]
+    fn ack_without_flag_off_a_terminal_refuses_and_names_the_flag() {
+        let r = require_unattended_ack(false, false, |_| panic!("must not prompt"));
+        let msg = r.unwrap_err().to_string();
+        assert!(msg.contains("--unattended-ok"), "{msg}");
+        assert!(msg.contains("nobody watches"), "{msg}");
+    }
+
+    #[test]
+    fn ack_is_needed_only_when_a_policy_is_being_created() {
+        let mut e = edit();
+        assert!(!e.needs_unattended_ack(&Configuration::default()));
+        e.enable = Some(true);
+        assert!(e.needs_unattended_ack(&Configuration::default()));
+        let mut on = Configuration::default();
+        e.apply(&mut on);
+        assert!(!e.needs_unattended_ack(&on), "already open: nothing new");
+        e.enable = Some(false);
+        assert!(!e.needs_unattended_ack(&on));
+    }
+
+    /// The gate the `config` command applies, end to end: opening needs the
+    /// acknowledgement, closing and tuning an open room do not.
+    #[test]
+    fn gate_unattended_applies_to_opening_only() {
+        use river_core::room_state::configuration::Configuration;
+        let mut open = edit();
+        open.enable = Some(true);
+        let closed = Configuration::default();
+        let refused = gate_unattended(&open, &closed, false, false, |_| panic!("no prompt"));
+        assert!(refused.is_err(), "no flag, no terminal: refused");
+        assert!(gate_unattended(&open, &closed, true, false, |_| panic!("no prompt")).is_ok());
+        assert!(gate_unattended(&open, &closed, false, true, |_| Ok(true)).is_ok());
+        assert!(gate_unattended(&open, &closed, false, true, |_| Ok(false)).is_err());
+
+        let mut close = edit();
+        close.enable = Some(false);
+        assert!(gate_unattended(&close, &closed, false, false, |_| panic!("no prompt")).is_ok());
     }
 }
