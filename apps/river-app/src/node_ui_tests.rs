@@ -852,3 +852,29 @@ fn what_a_node_the_app_has_left_still_delivers_is_dropped() {
     rt.update(late(now));
     assert!(!rt.state.chat.rooms().is_empty());
 }
+
+/// What the person set for this device (appearance, size, do not disturb, private previews)
+/// is not the node's: switching node keeps it, and a change not yet saved is still saved.
+#[test]
+fn switching_node_keeps_this_devices_settings() {
+    let mut app = RiverApp::detached();
+    app.chat.set_theme(chat::style::Mode::Light);
+    app.chat.zoom.set(125);
+    app.chat.dnd.settings.manual = true;
+    app.chat.private_previews = true;
+    app.apply_node(NodeChoice::saved(
+        NodeAddress::parse("other.example:7509").unwrap(),
+    ));
+    assert_eq!(app.chat.theme(), chat::style::Mode::Light);
+    assert_eq!(app.chat.zoom.percent(), 125);
+    assert!(app.chat.dnd.settings.manual);
+    assert!(app.chat.private_previews);
+    // The theme choice had not been saved yet; it still is.
+    assert_eq!(
+        app.chat.take_theme_dirty(),
+        Some(chat::style::Mode::Light.name())
+    );
+    app.apply_node(NodeChoice::local());
+    assert_eq!(app.chat.theme(), chat::style::Mode::Light);
+    assert_eq!(app.chat.zoom.percent(), 125);
+}

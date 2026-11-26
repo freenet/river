@@ -511,6 +511,18 @@ impl Chat {
         }
     }
 
+    /// Take this device's settings (appearance, size, do not disturb, private previews) from
+    /// `old`, the chat being replaced for another node: they belong to the device, not to the
+    /// node. A change `old` had not saved yet is still saved.
+    pub fn keep_device_settings(&mut self, old: &mut Chat) {
+        std::mem::swap(&mut self.theme, &mut old.theme);
+        std::mem::swap(&mut self.theme_dirty, &mut old.theme_dirty);
+        std::mem::swap(&mut self.zoom, &mut old.zoom);
+        std::mem::swap(&mut self.dnd, &mut old.dnd);
+        std::mem::swap(&mut self.private_previews, &mut old.private_previews);
+        std::mem::swap(&mut self.previews_dirty, &mut old.previews_dirty);
+    }
+
     /// The appearance to save, once, if it changed since the last call.
     pub fn take_theme_dirty(&mut self) -> Option<&'static str> {
         std::mem::take(&mut self.theme_dirty).then_some(self.theme.name())

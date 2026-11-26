@@ -999,6 +999,7 @@ impl RiverApp {
             0,
         );
         chat.node.choice = choice;
+        chat.keep_device_settings(&mut self.chat);
         if let Some(link) = &self.link {
             let sink = link.clone();
             chat.set_sink(Box::new(move |command| sink.send(command)));
