@@ -170,6 +170,12 @@ pub enum RoomCommands {
         /// List the room for discovery (no effect on admission)
         #[arg(long)]
         admission_listed: Option<bool>,
+
+        /// Acknowledge that an open room may be left unattended and can be
+        /// spammed. Required to open public admission without a prompt;
+        /// without it a terminal asks y/N and a script is refused
+        #[arg(long)]
+        unattended_ok: bool,
     },
 }
 
@@ -557,6 +563,7 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
             max_provisional_messages,
             max_provisional_bans,
             admission_listed,
+            unattended_ok,
         } => {
             let policy_edit = crate::admission::PolicyEdit {
                 enable: public_admission,
@@ -675,6 +682,13 @@ pub async fn execute(command: RoomCommands, api: ApiClient, format: OutputFormat
             if !policy_edit.is_empty() {
                 let state = api.get_room(&owner_key, false).await?;
                 policy_edit.check_room(&state.configuration.configuration.privacy_mode)?;
+                crate::admission::gate_unattended(
+                    &policy_edit,
+                    &state.configuration.configuration,
+                    unattended_ok,
+                    atty::is(atty::Stream::Stdin),
+                    crate::admission::confirm_on_terminal,
+                )?;
             }
 
             match api
@@ -830,5 +844,75 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("room join ROOMOWNERKEY --pow"));
+    }
+
+    #[derive(clap::Parser)]
+    struct Harness {
+        #[command(subcommand)]
+        cmd: RoomCommands,
+    }
+
+    fn config_help() -> String {
+        use clap::CommandFactory;
+        let mut cmd = Harness::command();
+        cmd.build();
+        let sub = cmd
+            .find_subcommand_mut("config")
+            .expect("config subcommand");
+        sub.render_long_help().to_string()
+    }
+
+    #[test]
+    fn config_help_states_the_real_ceilings() {
+        use river_core::room_state::provisional::{
+            MAX_PROVISIONAL_BANS_CEILING, MAX_PROVISIONAL_CEILING,
+        };
+        let help = config_help().replace('\n', " ");
+        let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            help.contains(&format!(
+                "Most provisional bans the room holds (0 to {MAX_PROVISIONAL_BANS_CEILING})"
+            )),
+            "{help}"
+        );
+        assert!(
+            help.contains(&format!("at once (1 to {MAX_PROVISIONAL_CEILING})")),
+            "{help}"
+        );
+    }
+
+    #[test]
+    fn config_accepts_unattended_ok() {
+        use clap::Parser;
+        let h = Harness::try_parse_from([
+            "t",
+            "config",
+            "ROOM",
+            "--public-admission",
+            "true",
+            "--unattended-ok",
+        ])
+        .expect("parses");
+        match h.cmd {
+            RoomCommands::Config { unattended_ok, .. } => assert!(unattended_ok),
+            _ => panic!("not config"),
+        }
+        assert!(config_help().contains("--unattended-ok"));
+    }
+
+    /// The `config` command must put an admission-opening edit through the
+    /// acknowledgement gate. The handler needs a live node, so this pins the
+    /// call itself: removing it leaves every other test green.
+    #[test]
+    fn config_command_applies_the_unattended_gate() {
+        let source = include_str!("room.rs");
+        let production = source.split_once("#[cfg(test)]").map(|(p, _)| p).unwrap();
+        let squashed: String = production.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            squashed.contains(
+                "crate::admission::gate_unattended(&policy_edit,&state.configuration.configuration,unattended_ok,"
+            ),
+            "room config must call the unattended-room gate with the --unattended-ok flag"
+        );
     }
 }

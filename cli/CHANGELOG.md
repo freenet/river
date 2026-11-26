@@ -19,6 +19,15 @@ one.)
   has a cap on provisional messages, and when a room is over its provisional
   ban cap the newest bans are kept (freenet/river#982, #1037, #1041).
 
+- Opening public admission with `room config --public-admission true` now
+  starts from conservative defaults: 8 open members (was 16) and 10% of the
+  room's message window for their messages (was half the window); difficulty
+  stays 20 bits and bans 16. It needs an acknowledgement that an unattended
+  open room can be spammed: a y/N on a terminal, or `--unattended-ok` in a
+  script (without a terminal and without the flag it refuses). This applies to
+  every re-open as well, since closing clears the policy; explicit flags still
+  win. Closing is never gated. (freenet/river#1052)
+
 ### Fixed
 - The chat delegate reports a failed secret write during key rotation instead
   of dropping it (freenet/river#1006, #1038).

@@ -78,7 +78,7 @@ fn invitation_query_param(text: &str) -> Option<String> {
     None
 }
 
-fn percent_decode(input: &str) -> String {
+pub(crate) fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
