@@ -1081,6 +1081,47 @@ fn a_message_that_stops_being_cheap_after_its_line_breaks_is_plain_text() {
     assert!(shows(&rt, "](https://evil.example/)"), "{:?}", texts(&rt));
 }
 
+/// Images are not displayed in messages or room descriptions: every way of writing one is
+/// drawn as words, never as an image (nothing is fetched, and no placeholder stands in).
+#[test]
+fn no_image_is_drawn_in_a_message_or_description() {
+    for src in super::markdown::IMAGE_VARIANTS {
+        let mut rt = node_rooms(|rooms| {
+            rooms[0].description = (*src).to_owned();
+            let m = rooms[0].messages.last_mut().unwrap();
+            m.text = (*src).to_owned();
+            m.md = (*src).to_owned();
+        });
+        // The room details dialog draws the whole description.
+        rt.update(|s, _| s.chat.open_details());
+        rt.frame(0.5);
+        assert!(rt.state.chat.details.is_some(), "details open");
+        let images: Vec<_> = rt
+            .elements()
+            .into_iter()
+            .filter(|e| e.role == "image")
+            .map(|e| e.label)
+            .collect();
+        assert!(images.is_empty(), "{src:?} drew {images:?}");
+    }
+    let rt = node_rooms(|rooms| {
+        let m = rooms[0].messages.last_mut().unwrap();
+        m.text = "see ![a cat](https://example.com/cat.png) here".into();
+        m.md = m.text.clone();
+    });
+    // The address is drawn isolated from the text around it, as any URL in prose is.
+    let drawn: Vec<String> = texts(&rt)
+        .iter()
+        .map(|t| t.replace(['\u{2066}', '\u{2069}'], ""))
+        .collect();
+    assert!(
+        drawn
+            .iter()
+            .any(|t| t == "see a cat (https://example.com/cat.png) here"),
+        "{drawn:?}"
+    );
+}
+
 #[test]
 fn dragging_over_a_message_selects_it_and_copy_takes_the_text() {
     let board = rune::clipboard::memory();

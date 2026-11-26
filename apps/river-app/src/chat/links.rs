@@ -57,7 +57,7 @@ const MAX_CANDIDATE_LEN: usize = share_link::MAX_SHARE_LINK_LEN + 128;
 
 /// The options the widget parses with (`rune_kit`'s markdown parser), so both see the same
 /// links.
-fn options() -> Options {
+pub(super) fn options() -> Options {
     Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS
 }
 
