@@ -27,7 +27,10 @@
 //!
 //! A new key is a new release, because the key is compiled into each build: run
 //! `update_tool keygen <file>`, commit the printed public key to `update-pubkey.hex` in a
-//! reviewed PR, then cut a release. Installed versions keep trusting the old key.
+//! reviewed PR, then cut a release. Installed versions keep trusting the old key until they see
+//! a signed update-key record naming the new one (`scripts/sign-update-key-record.sh`,
+//! `apps/desktop/update-authority.toml`): publish that record BEFORE the old key is retired, and
+//! pin it into the release. An install that cannot reach its node keeps the key it has.
 //!
 //! # Publishing a release
 //!

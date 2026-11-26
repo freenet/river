@@ -24,28 +24,48 @@
 # `authority_verifying_key` is itself a new release that old builds never see.
 #
 # PUBLISHING A ROTATION (the record's version must be higher than every earlier one; start
-# at 1). With the author key file on stdin, as scripts/sign-pointer-records.sh does:
+# at 1). Sign offline with the author key (RIVER_POINTER_KEY_FILE, else
+# ~/.config/river/web-container-keys.toml):
 #
-#   pointer-record sign --author-vk <authority_verifying_key> \
-#       --app-id river-desktop-update-key --version <N> \
-#       --code-hash <NEW update-signing public key, 64 hex digits> < ~/.config/river/web-container-keys.toml
+#   scripts/sign-update-key-record.sh --version <N> --key <NEW update-signing public key, hex>
 #
-# then publish the printed `state=` to the printed `key=` address the way
-# scripts/publish-pointer-records.sh publishes the other records. Check it with
-# `pointer-record verify --author-vk ... --app-id river-desktop-update-key --state <state>`.
-# Also commit the new key to apps/desktop/update-pubkey.hex and cut a release signed by it,
-# so fresh installs start on it.
+# It prints the record's `state` and address, and checks the address equals `pointer_key` below.
+# Publish it through your own node (NOT the production gateway), from main, the way
+# scripts/publish-pointer-records.sh publishes the other records. The pointer contract WASM is
+# the committed pointer-v1.wasm whose code hash is `pointer_code_hash` in pointer-records.toml:
 #
-# WITHDRAWING (a leak with no replacement yet): the same command with
-# `--code-hash 0000000000000000000000000000000000000000000000000000000000000000`. Every build
-# that sees it refuses all updates and tells the person to download a new build. Publish a
-# higher-version record naming a new key to re-enable updates.
+#   first publish:  fdev -p <port> execute put --timeout 180 --code <pointer-v1.wasm> \
+#                       --parameters <params.bin> contract --state <state.bin>
+#   later versions: fdev -p <port> execute update --timeout 180 <pointer_key> <state.bin>
+#
+# (<params.bin> is the `params=` hex from `pointer-record key --author-vk <authority key>
+# --app-id river-desktop-update-key`, through `xxd -r -p`; <state.bin> is the printed state
+# through `xxd -r -p`.) Then read it back with `fdev execute get` and check it with
+# `pointer-record verify`: a PUT at an already-used version is silently ignored.
+# Also commit the new key to apps/desktop/update-pubkey.hex and cut a release signed by it, so
+# fresh installs start on it, and PIN the record into that release: set `pinned_record` below
+# to the printed state. A build seeds its floor from the pin, so a fresh install of it cannot
+# adopt an older genuine record (one naming a leaked key) that a node has not yet replaced.
+# After publishing record vN, the next release pins vN.
+#
+# WITHDRAWING (a leak with no replacement yet): `scripts/sign-update-key-record.sh --version
+# <N> --withdraw`. Every build that sees it refuses all updates and tells the person to
+# download a new build. A withdrawal is lifted only by a record with a HIGHER version, signed
+# by the authority key. If the authority key itself is compromised, whoever holds it can
+# withdraw updates for every install that sees the record, and nothing lifts that but a
+# reinstall of a build with a new authority key.
 #
 # WHAT IT CANNOT DO. It cannot remove an update that is already installed. It acts only on a
-# build that can reach its node at check time, and not at all on a build that has never seen
-# the record and cannot reach the node (a fresh install offline trusts its compiled-in key).
-# It is independent of freenet.org: serving files from the update address does not let anyone
-# change or silence it.
+# build that can reach its node at check time. A fresh install that has never seen the record
+# and cannot reach its node trusts the key compiled into it (the newest one, if its release
+# pinned the record); that is the behaviour freenet/river#927 chose. A person who deletes
+# River's update notes (update-state.json) also forgets every record kept, and starts again
+# from the build's compiled-in key and pin. The record is independent of freenet.org:
+# serving files from the update address does not let anyone change or silence it.
+#
+# Optional. The newest record this build knows (hex of its 100 signed bytes), checked when the
+# build starts; none yet because no record has been published.
+# pinned_record = "<state printed by scripts/sign-update-key-record.sh>"
 authority_verifying_key = "river:v1:vk:9Ebskq4y7NvJpTQTrF1FAxU8g6bR4Rhe4TRikXba55EJ"
 app_id = "river-desktop-update-key"
 # The fixed address the record is published at: derived from the pointer contract's frozen

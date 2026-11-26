@@ -31,28 +31,44 @@
 //! signed by the authority key (River's author key, never the update-signing key), carrying a
 //! version that only rises and, as its payload, the trusted update-signing public key. An
 //! all-zero payload is a tombstone. [`keyrecord`] judges it with [`freenet_migrate::PointerResolver`],
-//! seeded with the floor rebuilt from the record the last check kept in the state file
+//! seeded with the higher of two floors: the record the last check kept in the state file
 //! (`key_record`, the raw bytes, verified again on every load, so a file someone else wrote
-//! changes nothing). The key in force is [`Updater::key`], and check, download and the second
-//! look at apply time all use it, so a build staged under a key revoked since is refused at
-//! restart.
+//! cannot name a key) and the record the release pinned in `update-authority.toml`
+//! (`pinned_record`, checked when the build starts), so a fresh install cannot adopt a record
+//! older than the one its build knew. The key in force is [`Updater::key`], and check, download
+//! (which verifies the cached offer again) and the second look at apply time all use it, so a
+//! build staged under a key revoked since is refused at restart. Before each check, both the
+//! app and `river --self-update` read the record from the node with the app's saved grant.
 //!
 //! | What the node gave | Effect |
 //! |---|---|
-//! | Verified record above the kept one, naming a usable key | That key is trusted from now on; the record is kept. |
-//! | Verified tombstone above the kept one | No key is trusted: every check, download and apply is refused ([`keyrecord::WITHDRAWN`]). A higher record naming a key lifts it. |
+//! | Verified record above the kept/pinned one, naming a usable key | That key is trusted from now on; the record is kept. |
+//! | Verified tombstone above the kept/pinned one | No key is trusted: every check, download and apply is refused ([`keyrecord::WITHDRAWN`]). Only a record with a higher version, signed by the authority key, lifts it. |
 //! | Older record, or the kept one again | Ignored: the kept record stands. A node holding no copy yet can serve an older record, so this is routine. |
 //! | Competing record at the kept version | The lower key wins, as on the network; the higher is ignored. |
 //! | Record signed by another key, for another app id, malformed, or naming a weak, non-canonical or all-zero key | Ignored. All zero is the tombstone encoding, so it withdraws; it is never adopted as a key. |
-//! | Absent, unreachable, no grant yet, or no answer within a few seconds | Ignored: the check goes on with the key the kept record names, or the compiled-in key if none was ever kept. It never goes back to the compiled-in key once a record has been kept, so making the node quiet is not a downgrade. |
-//! | Kept record that no longer verifies (file damaged or written by someone else) | Ignored as if nothing were kept, until the next served record replaces it. |
+//! | Absent, unreachable, no grant yet, or no answer within a few seconds | Ignored: the check goes on with the key the kept (or pinned) record names, or the compiled-in key if there is none. |
+//! | Kept record that no longer verifies (file damaged or edited) | Nobody is trusted ([`keyrecord::DAMAGED`]), neither the compiled-in key nor the file's, until a served record above the pin replaces it. |
 //!
-//! What it cannot do: undo an update that is already installed; act on a build that has never
-//! seen the record and cannot reach its node (a fresh offline install trusts the compiled-in key;
-//! `river --self-update` has no node connection and uses only what an earlier run kept); or help
-//! if the authority key itself leaks (that is a new release carrying a new `update-authority.toml`).
-//! It is independent of freenet.org: whoever controls the update address cannot change or silence
-//! it. To publish a rotation or a withdrawal, see `update-authority.toml`.
+//! What it cannot do:
+//! - Undo an update that is already installed.
+//! - Act on a build that has never seen the record and cannot reach its node: a fresh install
+//!   offline trusts its compiled-in key (the newest one, if its release pinned the record).
+//!   This is the behaviour #927 chose.
+//! - Survive deleting `update-state.json`. The damaged-file message tells a person to remove
+//!   the file, and removing it (or any deletion of it) forgets every kept record, the highest
+//!   manifest sequence and version too; the build then starts again from its compiled-in key
+//!   and pin, and learns the record at its next check if it can reach the node.
+//! - Help if the authority key itself leaks (that needs a release carrying a new
+//!   `update-authority.toml`), and a withdrawal published by a stolen authority key stops every
+//!   install that sees it until reinstall, since only a higher record lifts it.
+//! - Stop a second River from keeping a withdrawal between this one's load of the state and its
+//!   swap: that window is milliseconds and the next check sees it.
+//!
+//! It is independent of freenet.org: whoever controls the update address cannot change or
+//! silence it. To publish a rotation or a withdrawal, see `update-authority.toml`. The state
+//! file's schema is 2 so that a build from before the record, which would drop `key_record` when
+//! it rewrote the file, instead treats the file as written by a newer build and leaves it alone.
 //!
 //! The private key never touches the app or this repository. `examples/update_tool.rs`
 //! generates a pair and signs manifests; the key is Ian's.

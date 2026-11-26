@@ -20,8 +20,13 @@
 //!   [`KeyRecord::Unavailable`]: the check goes ahead, never delayed past that wait, and the
 //!   host falls back on what an earlier check kept.
 //! - The node's own answer that it has no such contract is [`KeyRecord::Absent`].
+//! - `river --self-update` has no link: it reads the record with [`NodeRecordSource::saved`] (the
+//!   grant the app saved for the node it would use), and without one goes on with what an
+//!   earlier check kept.
+//! - The fetch has its own deadline (connect included); a source that hangs or panics costs the
+//!   check at most that wait.
 //! - This module cannot undo an installed update and cannot act while the node is unreachable on
-//!   a fresh install.
+//!   a fresh install. Deleting the host's update notes forgets every record kept.
 //!
 //! # What the person sees
 //!
@@ -1412,7 +1417,7 @@ mod tests {
         let (release, held) = std::sync::mpsc::channel::<()>();
         let held = Mutex::new(held);
         let stuck = FakeSource(Box::new(move || {
-            drop(held.lock().unwrap().recv());
+            let _ = held.lock().unwrap().recv();
             KeyRecord::Absent
         }));
         assert_unavailable_fast(Some(Arc::new(stuck)), "stuck");
@@ -1434,7 +1439,7 @@ mod tests {
         let (ctl, rx) = controller(host.clone(), false);
         let ctl = ctl.with_record_wait(Duration::from_millis(1), Duration::from_millis(20));
         ctl.set_record_source(Arc::new(FakeSource(Box::new(move || {
-            drop(held.lock().unwrap().recv());
+            let _ = held.lock().unwrap().recv();
             KeyRecord::Absent
         }))));
         ctl.check_now();
