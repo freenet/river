@@ -93,7 +93,7 @@
 //! owns each time it loads, `hydrate_loaded_rooms_with_authority` in
 //! `freenet_api/response_handler.rs`.)
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::VerifyingKey;
@@ -918,8 +918,10 @@ pub struct Work {
     /// Read markers waiting their turn, by room: the furthest one asked for since the room's last
     /// write, and when it may be written ([`Work::mark_read`]).
     held_reads: HashMap<VerifyingKey, HeldRead>,
-    /// When each room's last read marker write was started.
+    /// When each room's last read marker write was dispatched (its first request went out).
     last_read_write: HashMap<VerifyingKey, Instant>,
+    /// Rooms whose queued read marker task has not sent a request yet.
+    read_unsent: HashSet<VerifyingKey>,
     /// How many times in a row each room's read marker could not be stored. A new marker, or a
     /// store that works, starts the count again.
     read_failures: HashMap<VerifyingKey, u32>,
@@ -943,6 +945,8 @@ struct HeldRead {
     known: Known,
     state: Option<Box<ChatRoomStateV1>>,
     due: Instant,
+    /// The window went away: written without waiting out the interval since the last write.
+    flush: bool,
 }
 
 impl Work {
@@ -1380,6 +1384,7 @@ impl Work {
                         known,
                         state,
                         due,
+                        flush: false,
                     },
                 );
             }
@@ -1388,10 +1393,29 @@ impl Work {
 
     /// Start the writes of the held read markers that are due.
     fn release_reads(&mut self, now: Instant) {
+        // One read task per room, queued or working: a newer marker stays held (and is folded
+        // into by [`Work::mark_read`]) until that one has ended, and the interval counts from
+        // when the last write was dispatched.
+        let busy: HashSet<VerifyingKey> = self
+            .tasks
+            .iter()
+            .filter_map(|t| match &t.kind {
+                Kind::Read { room, .. } => Some(*room),
+                _ => None,
+            })
+            .collect();
         let due: Vec<VerifyingKey> = self
             .held_reads
             .iter()
-            .filter(|(_, h)| h.due <= now)
+            .filter(|(room, h)| {
+                h.due <= now
+                    && !busy.contains(*room)
+                    && (h.flush
+                        || self
+                            .last_read_write
+                            .get(*room)
+                            .is_none_or(|at| *at + READ_WRITE_INTERVAL <= now))
+            })
             .map(|(room, _)| *room)
             .collect();
         for room in due {
@@ -1401,7 +1425,7 @@ impl Work {
             else {
                 continue;
             };
-            self.last_read_write.insert(room, now);
+            self.read_unsent.insert(room);
             self.push(
                 Kind::Read {
                     room,
@@ -1422,6 +1446,7 @@ impl Work {
     pub fn release_all_reads(&mut self, now: Instant) {
         for held in self.held_reads.values_mut() {
             held.due = now;
+            held.flush = true;
         }
     }
 
@@ -1723,6 +1748,23 @@ impl Work {
     /// The working task's next request, if it has none out. `reading` says the stored rooms
     /// are being read: no task request goes out until that is done.
     pub fn next_request(&mut self, reading: bool, now: Instant) -> Option<ClientRequest<'static>> {
+        let request = self.next_request_inner(reading, now);
+        if request.is_some()
+            && let Some(Kind::Read { room, .. }) = self.active_ref().map(|t| &t.kind)
+        {
+            let room = *room;
+            if self.read_unsent.remove(&room) {
+                self.last_read_write.insert(room, now);
+            }
+        }
+        request
+    }
+
+    fn next_request_inner(
+        &mut self,
+        reading: bool,
+        now: Instant,
+    ) -> Option<ClientRequest<'static>> {
         if reading {
             return None;
         }
@@ -2457,6 +2499,7 @@ impl Work {
                                 known,
                                 state,
                                 due,
+                                flush: false,
                             },
                         );
                     }

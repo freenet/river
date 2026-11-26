@@ -3687,3 +3687,104 @@ fn held_read_markers_are_released_at_once_when_the_window_goes_away() {
     w.next_request(false, now).expect("written at once");
     assert!(!w.read_held(&owner));
 }
+
+fn read_tasks_of(w: &Work, room: &VerifyingKey) -> usize {
+    w.tasks
+        .iter()
+        .filter(|t| matches!(&t.kind, Kind::Read { room: r, .. } if r == room))
+        .count()
+}
+
+#[test]
+fn a_slow_request_spanning_intervals_keeps_one_read_task_per_room_with_the_furthest_mark() {
+    let (owner, slot) = room_with_messages(100);
+    let key = room_storage_key(&owner);
+    let mut w = Work::default();
+    let t0 = Instant::now();
+    w.mark_read(owner, place(1), vec![place(1)], None, t0);
+    w.next_request(false, t0).expect("leading edge write");
+    assert_eq!(read_tasks_of(&w, &owner), 1);
+    // The slot read stays unanswered across several intervals while newer marks arrive.
+    for i in 2..=5i64 {
+        let at = t0 + READ_WRITE_INTERVAL * (i as u32) + std::time::Duration::from_secs(1);
+        w.mark_read(owner, place(i), vec![place(i)], None, at);
+        assert!(w.next_request(false, at).is_none(), "request {i} waits");
+        assert_eq!(read_tasks_of(&w, &owner), 1, "one read task at tick {i}");
+        assert!(w.read_held(&owner), "newer mark {i} held, not queued");
+    }
+    // The slow request finishes; the next tick queues exactly one write, of the furthest mark.
+    assert!(w.on_delegate(&read_answer(&key, Some(slot.clone()), 3)));
+    let first = expect_store(&mut w, &key, 3);
+    assert_eq!(marker_of(&first), Some(place(1).id));
+    assert!(w.on_delegate(&store_answer(
+        &key,
+        CasStoreResult::Stored { generation: 4 }
+    )));
+    let end = t0 + READ_WRITE_INTERVAL * 6;
+    w.forget_done(&|_| false, end);
+    assert_eq!(read_tasks_of(&w, &owner), 0);
+    w.next_request(false, end).expect("one write");
+    assert_eq!(read_tasks_of(&w, &owner), 1);
+    assert!(w.on_delegate(&read_answer(&key, Some(first), 4)));
+    let second = expect_store(&mut w, &key, 4);
+    assert_eq!(marker_of(&second), Some(place(5).id));
+    assert!(!w.read_held(&owner));
+}
+
+#[test]
+fn the_read_write_interval_counts_from_dispatch_not_from_queueing() {
+    let (a, slot_a) = room_with_messages(100);
+    let (b, slot_b) = {
+        let mut plan = crate::rooms::create::new_room(
+            SigningKey::from_bytes(&[2; 32]),
+            "Chess club",
+            "Bea",
+            false,
+        )
+        .unwrap();
+        plan.room.room_state.recent_messages.messages = (1..=100).map(message_n).collect();
+        (
+            plan.room.owner_vk,
+            river_core::stored_rooms::encode_new_room(&plan.room).unwrap(),
+        )
+    };
+    let key_a = room_storage_key(&a);
+    let key_b = room_storage_key(&b);
+    let mut w = Work::default();
+    let t0 = Instant::now();
+    let s = std::time::Duration::from_secs;
+    // Both are released at t0, but only the first task works: the other waits its turn.
+    w.mark_read(b, place(1), vec![place(1)], None, t0);
+    w.mark_read(a, place(1), vec![place(1)], None, t0);
+    w.next_request(false, t0).expect("first task goes out");
+    let b_first = w
+        .active_ref()
+        .is_some_and(|t| matches!(&t.kind, Kind::Read { room, .. } if *room == b));
+    let (first, second) = if b_first {
+        ((b, key_b, slot_b), (a, key_a, slot_a))
+    } else {
+        ((a, key_a, slot_a), (b, key_b, slot_b))
+    };
+    assert!(w.on_delegate(&read_answer(&first.1, Some(first.2.clone()), 3)));
+    let _ = expect_store(&mut w, &first.1, 3);
+    assert!(w.on_delegate(&store_answer(
+        &first.1,
+        CasStoreResult::Stored { generation: 4 }
+    )));
+    w.forget_done(&|_| false, t0 + s(8));
+    // The second room's write is dispatched only now, at t0 + 8.
+    w.next_request(false, t0 + s(8)).expect("second dispatched");
+    assert!(w.on_delegate(&read_answer(&second.1, Some(second.2.clone()), 3)));
+    let _ = expect_store(&mut w, &second.1, 3);
+    assert!(w.on_delegate(&store_answer(
+        &second.1,
+        CasStoreResult::Stored { generation: 4 }
+    )));
+    w.forget_done(&|_| false, t0 + s(9));
+    w.mark_read(second.0, place(2), vec![place(2)], None, t0 + s(9));
+    // Ten seconds from queueing (t0) have passed, but not from dispatch (t0 + 8).
+    assert!(w.next_request(false, t0 + s(17)).is_none());
+    assert_eq!(read_tasks_of(&w, &second.0), 0);
+    assert!(w.next_request(false, t0 + s(18)).is_some());
+    assert_eq!(read_tasks_of(&w, &second.0), 1);
+}
