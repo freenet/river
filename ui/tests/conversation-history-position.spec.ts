@@ -60,9 +60,11 @@ test.describe("Reading position when content above changes (A02)", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
 
   // freenet/river#507. Browser scroll anchoring is off on the history, and the
-  // app compensates only for window-head swaps, so an image that loads
-  // above a parked reader pushes their text down by its height.
-  test("an image loading above a parked reader keeps their row in place", async ({ page }) => {
+  // app compensates only for window-head swaps, so a row that grows above a
+  // parked reader pushes their text down by the growth. Its main real-world
+  // trigger, an image loading late, is gone: messages no longer render images.
+  // The test makes the growth by adding an image to the row.
+  test("a row growing above a parked reader keeps their row in place", async ({ page }) => {
     const heldImage = await holdTestImage(page);
     await openRoomAtBottom(page, "Team Chat Room");
     await callRiverTest(page, "appendMessage", "image fixture above the reader");
@@ -103,7 +105,7 @@ test.describe("Reading position when content above changes (A02)", () => {
       .toBeGreaterThan(heightBefore + 50);
 
     knownFailure(ALL_PROJECTS, "freenet/river#507");
-    await expectRowHeld(page, row!.key, row!.top, "an image loading above the reader moved their row");
+    await expectRowHeld(page, row!.key, row!.top, "a row growing above the reader moved their row");
   });
 
   // freenet/river#507: a ban purge or bulk delete removing rows above a parked

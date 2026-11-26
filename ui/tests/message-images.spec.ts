@@ -20,6 +20,10 @@ const VARIANTS: [string, string][] = [
   ["object", `<object data="${URL_OF("object")}"></object>`],
   ["embed", `<embed src="${URL_OF("embed")}">`],
   ["iframe", `<iframe src="${URL_OF("iframe")}"></iframe>`],
+  ["video poster", `<video poster="${URL_OF("poster")}"></video>`],
+  ["input image", `<input type="image" src="${URL_OF("input")}">`],
+  ["link preload", `<link rel="preload" as="image" href="${URL_OF("link")}">`],
+  ["raw srcset", `<img srcset="${URL_OF("srcset")} 2x">`],
   ["css background", `<div style="background-image:url(${URL_OF("css")})">styled</div>`],
   ["autolink", `<${URL_OF("autolink")}>`],
   ["bare url", `bare ${URL_OF("bare")} link`],
@@ -52,7 +56,7 @@ async function noImagesFor(page: import("@playwright/test").Page, send: (text: s
   await page.waitForTimeout(500);
   expect(requested, "no request is made for an image URL").toEqual([]);
   await expect(history.locator("img")).toHaveCount(0);
-  await expect(history.locator("picture, object, embed, iframe, svg image, [style*='background']")).toHaveCount(0);
+  await expect(history.locator("picture, object, embed, iframe, video, input, link, svg image, [style*='background']")).toHaveCount(0);
 }
 
 test.describe("Images in messages", () => {

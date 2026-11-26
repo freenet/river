@@ -869,14 +869,10 @@ fn label_contradicts_destination(
     title: Option<&str>,
     dest_id: Option<String>,
 ) -> bool {
-    // The label, the link's tooltip, and any tooltip of an image inside it.
+    // The label and the link's tooltip.
     let mut claims = label_claimed_ids(inner);
-    let img_titles = inner
-        .split("<img")
-        .skip(1)
-        .filter_map(|rest| extract_attr(&format!("<img{}", rest.split('>').next()?), "title"));
-    for text in title.map(str::to_string).into_iter().chain(img_titles) {
-        claims.extend(label_claimed_ids(&text));
+    if let Some(title) = title {
+        claims.extend(label_claimed_ids(title));
     }
     if claims.is_empty() {
         return false;
@@ -894,7 +890,7 @@ fn label_claimed_ids(inner: &str) -> Vec<String> {
     // not (the whitespace and joining rules below). This is a comparison, not
     // rendering, so joining too much can only unlink more, never link
     // something new.
-    let decoded = decode_html_text(&visible_text_with_alt(inner));
+    let decoded = decode_html_text(&visible_text(inner));
     // Visible, full-width spaces separate, like an ASCII space. Every other
     // whitespace character is dropped: line and paragraph breaks (an id
     // wrapping looks the same), narrow and hair spaces, and controls a
@@ -1096,10 +1092,8 @@ fn extract_attr(tag: &str, name: &str) -> Option<String> {
     Some(tag[start..start + end].to_string())
 }
 
-/// An anchor's inner HTML reduced to what a reader sees: tags dropped, except
-/// that an image contributes its `alt` text (which the browser shows when the
-/// image does not load).
-fn visible_text_with_alt(html: &str) -> String {
+/// An anchor's inner HTML reduced to what a reader sees: tags dropped.
+fn visible_text(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
     let mut rest = html;
     while let Some(pos) = rest.find('<') {
@@ -1108,14 +1102,6 @@ fn visible_text_with_alt(html: &str) -> String {
             rest = "";
             break;
         };
-        let tag = &rest[pos..pos + end + 1];
-        // No padding: a broken image shows its alt inline, and an empty one
-        // shows nothing, so neither must split what the reader sees as one id.
-        if tag.starts_with("<img") {
-            if let Some(alt) = extract_attr(tag, "alt") {
-                out.push_str(&alt);
-            }
-        }
         rest = &rest[pos + end + 1..];
     }
     out.push_str(rest);
@@ -1757,6 +1743,10 @@ mod tests {
             "<svg><image href=\"https://example.com/a.png\"/></svg>",
             "<object data=\"https://example.com/a.png\"></object>",
             "<embed src=\"https://example.com/a.png\">",
+            "<video poster=\"https://example.com/a.png\"></video>",
+            "<input type=\"image\" src=\"https://example.com/a.png\">",
+            "<link rel=\"preload\" as=\"image\" href=\"https://example.com/a.png\">",
+            "<img srcset=\"https://example.com/a.png 2x\">",
             "<iframe src=\"https://example.com/a.png\"></iframe>",
             "<div style=\"background-image:url(https://example.com/a.png)\">x</div>",
             "<https://example.com/a.png>",
@@ -1768,7 +1758,7 @@ mod tests {
         ];
         let forbidden = [
             "<img", "<picture", "<source", "<svg", "<image", "<object", "<embed", "<iframe",
-            "<video", "<audio",
+            "<video", "<audio", "<input", "<link",
         ];
         for text in variants {
             let outputs = [
@@ -2845,6 +2835,30 @@ mod tests {
                 && html.contains("title=\"Atlas search engine\""),
             "{html}"
         );
+    }
+
+    /// An image inside a link label is shown as text, so what the reader sees
+    /// is the label with the image's alt text and address in it: an id split by
+    /// that text is not one id, and the title is not shown at all.
+    #[test]
+    fn image_in_a_link_label_is_visible_text() {
+        let (head, tail) = RIVER_ID.split_at(20);
+        let dest = format!("/v1/contract/web/{SAMPLE_ID}/");
+        for label in [
+            format!("{head}![]({dest}x.png){tail}"),
+            format!("{head}![Q](x.png){tail}"),
+        ] {
+            let html = message_to_html(&format!("[{label}]({dest})"));
+            assert!(!html.contains("<img"), "{label:?}: {html}");
+            assert!(
+                html.contains("x.png"),
+                "the address is shown: {label:?}: {html}"
+            );
+            assert!(
+                !html.contains(&format!("{head}{tail}")),
+                "the id is split by visible text: {label:?}: {html}"
+            );
+        }
     }
 
     #[test]
