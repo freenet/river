@@ -173,16 +173,201 @@ fn each_room_keeps_its_own_place() {
 fn a_place_whose_message_is_gone_falls_back_to_the_offset() {
     let mut rt = long_room(|_| {});
     scroll_up(&mut rt, 500.0);
-    let (row, _) = reading_row(&rt);
-    let gone = row.trim_start_matches("row-").to_owned();
     select(&mut rt, B);
+    // Every message the anchor could be (the sampled ones) goes.
     rt.update(move |s, _| {
         s.chat.edit_rooms(|rooms| {
             let r = rooms.iter_mut().find(|r| r.key == A).unwrap();
-            r.messages.retain(|m| m.key != gone);
+            let mut i = 0;
+            r.messages.retain(|_| {
+                i += 1;
+                (i - 1) % 8 != 0
+            });
         });
     });
     select(&mut rt, A);
     assert!(!rt.state.chat.at_bottom, "still away from the end");
     assert_eq!(rt.scroll_at_bottom(WINDOW), Some(false));
+    assert!(
+        (offset(&rt) - 500.0).abs() < 1.0,
+        "the saved offset came back: {}",
+        offset(&rt)
+    );
+}
+
+fn offset(rt: &Runtime<RiverApp>) -> f32 {
+    rt.state.chat.history_pos.borrow().offset
+}
+
+fn max_offset(rt: &Runtime<RiverApp>) -> f32 {
+    rt.state.chat.history_pos.borrow().max
+}
+
+/// A member of room A other than you, as a thread's peer key.
+fn peer(rt: &Runtime<RiverApp>) -> String {
+    let r = rt.state.chat.rooms().iter().find(|r| r.key == A).unwrap();
+    r.members
+        .iter()
+        .find(|m| m.id != r.me)
+        .unwrap()
+        .full_id
+        .to_string()
+}
+
+#[test]
+fn several_separate_scrolls_before_leaving_are_all_remembered() {
+    let mut rt = long_room(|_| {});
+    // Scrolls with no other commit between them: only the first one flips "at the end".
+    for y in [60.0, 400.0, 900.0, 640.0] {
+        scroll_up(&mut rt, y);
+    }
+    let (row, y) = reading_row(&rt);
+    let at = offset(&rt);
+    select(&mut rt, B);
+    select(&mut rt, A);
+    let again = y_of(&rt, &row).unwrap_or_else(|| panic!("{row} is drawn after reopening"));
+    assert!((again - y).abs() < 1.0, "{row} moved from {y} to {again}");
+    assert!((offset(&rt) - at).abs() < 1.0);
+}
+
+#[test]
+fn reading_inside_a_tall_last_message_is_remembered() {
+    let mut rt = long_room(|rooms| {
+        let r = rooms.iter_mut().find(|r| r.key == A).unwrap();
+        let m = r.messages.last_mut().unwrap();
+        m.md = (0..120)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        m.text = m.md.clone();
+    });
+    rt.update(|_, tx| tx.scroll_to_bottom_instant(WINDOW));
+    settle(&mut rt);
+    let to = max_offset(&rt) - 700.0;
+    scroll_up(&mut rt, to);
+    scroll_up(&mut rt, to - 37.0);
+    let at = offset(&rt);
+    select(&mut rt, B);
+    select(&mut rt, A);
+    assert!(!rt.state.chat.at_bottom);
+    assert!((offset(&rt) - at).abs() < 1.0, "{at} -> {}", offset(&rt));
+}
+
+#[test]
+fn a_thread_over_a_scrolled_room_gives_it_back_where_it_was() {
+    let mut rt = long_room(|_| {});
+    rt.update(|s, _| s.chat.set_window_front(true));
+    scroll_up(&mut rt, 500.0);
+    scroll_up(&mut rt, 700.0);
+    let (row, y) = reading_row(&rt);
+    let peer = peer(&rt);
+    arrive_in_a(&mut rt);
+    read_reports(&mut rt);
+    rt.update(move |s, _| assert!(s.chat.open_dm(A, &peer)));
+    settle(&mut rt);
+    run_frames(&mut rt);
+    rt.update(|s, _| s.chat.close_dm());
+    settle(&mut rt);
+    run_frames(&mut rt);
+    let again = y_of(&rt, &row).unwrap_or_else(|| panic!("{row} is drawn after the thread"));
+    assert!((again - y).abs() < 1.0, "{row} moved from {y} to {again}");
+    assert!(read_reports(&mut rt).is_empty(), "nothing unseen was read");
+}
+
+#[test]
+fn a_thread_that_goes_away_gives_the_room_back_where_it_was() {
+    let mut rt = long_room(|_| {});
+    rt.update(|s, _| s.chat.set_window_front(true));
+    scroll_up(&mut rt, 700.0);
+    let (row, y) = reading_row(&rt);
+    let peer = peer(&rt);
+    arrive_in_a(&mut rt);
+    read_reports(&mut rt);
+    rt.update(move |s, _| assert!(s.chat.open_dm(A, &peer)));
+    settle(&mut rt);
+    // The peer leaves the room: the empty thread has nothing to show.
+    rt.update(|s, _| {
+        s.chat.edit_rooms(|rooms| {
+            let r = rooms.iter_mut().find(|r| r.key == A).unwrap();
+            let me = r.me;
+            r.members.retain(|m| m.id == me);
+        });
+    });
+    settle(&mut rt);
+    run_frames(&mut rt);
+    assert!(!rt.state.chat.dm.is_open());
+    let again = y_of(&rt, &row).unwrap_or_else(|| panic!("{row} is drawn again"));
+    assert!((again - y).abs() < 1.0, "{row} moved from {y} to {again}");
+    assert!(read_reports(&mut rt).is_empty(), "nothing unseen was read");
+}
+
+#[test]
+fn a_room_reopened_at_a_place_keeps_what_is_below_it_unread_until_the_end() {
+    let mut rt = long_room(|_| {});
+    rt.update(|s, _| s.chat.set_window_front(true));
+    scroll_up(&mut rt, 500.0);
+    select(&mut rt, B);
+    arrive_in_a(&mut rt);
+    rt.update(|s, _| {
+        s.chat.edit_rooms(|rooms| {
+            rooms.iter_mut().find(|r| r.key == A).unwrap().unread = 1;
+        });
+    });
+    read_reports(&mut rt);
+    select(&mut rt, A);
+    let unread = |rt: &Runtime<RiverApp>| {
+        rt.state
+            .chat
+            .rooms()
+            .iter()
+            .find(|r| r.key == A)
+            .unwrap()
+            .unread
+    };
+    assert_eq!(unread(&rt), 1, "the arrival below the place is unread");
+    let marked = rt.state.chat.read.get(A).cloned();
+    assert!(
+        marked.is_none_or(|m| Some(m) != super::ReadMark::of(rt.state.chat.room().unwrap())),
+        "the local mark has not moved to the newest message"
+    );
+    rt.update(|_, tx| tx.scroll_to_bottom_instant(WINDOW));
+    settle(&mut rt);
+    run_frames(&mut rt);
+    assert_eq!(unread(&rt), 0, "reaching the end reads it");
+    assert_eq!(read_reports(&mut rt), ["arrival".to_owned()]);
+}
+
+#[test]
+fn a_place_is_dropped_with_its_room() {
+    let mut rt = long_room(|_| {});
+    scroll_up(&mut rt, 500.0);
+    select(&mut rt, B);
+    assert!(rt.state.chat.scroll_memory.borrow().contains_key(A));
+    rt.update(|s, _| {
+        s.chat.full_list = true;
+        s.chat.edit_rooms(|rooms| rooms.retain(|r| r.key != A));
+    });
+    settle(&mut rt);
+    assert!(!rt.state.chat.scroll_memory.borrow().contains_key(A));
+    assert_eq!(rt.state.chat.room().unwrap().key, B);
+}
+
+#[test]
+fn a_room_opened_while_its_history_cannot_draw_is_not_read() {
+    let mut rt = long_room(|_| {});
+    rt.update(|s, _| s.chat.set_window_front(true));
+    scroll_up(&mut rt, 500.0);
+    select(&mut rt, B);
+    arrive_in_a(&mut rt);
+    read_reports(&mut rt);
+    // Chosen, then covered by a thread before any frame ran: the history never draws.
+    let peer = peer(&rt);
+    rt.update(move |s, _| {
+        s.chat.select(A);
+        assert!(s.chat.open_dm(A, &peer));
+    });
+    settle(&mut rt);
+    run_frames(&mut rt);
+    assert!(read_reports(&mut rt).is_empty());
+    assert!(!rt.state.chat.at_bottom);
 }

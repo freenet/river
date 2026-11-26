@@ -703,6 +703,8 @@ impl Chat {
             });
             if !known {
                 self.leave_dm();
+                // The room's history is drawn afresh, if the room is still there.
+                self.stage_restore();
             }
         }
         self.dm_forget_gone();
@@ -750,6 +752,8 @@ impl Chat {
         if !known {
             return false;
         }
+        // The room's history leaves the screen under the thread.
+        self.leave_room_history();
         // A thread left for another gets what a notification reply left for it.
         if let Some(prev) = self.dm.open.clone()
             && (prev.0 != room || prev.1 != uid)
@@ -804,11 +808,14 @@ impl Chat {
         // now. (A thread that another room or a dialog closes gives nothing back: they took
         // the keyboard on purpose.)
         let restore = std::mem::take(&mut self.dm.restore_focus);
-        if let Some(key) = self.room().map(|r| r.key.clone()) {
+        // The room's history is drawn afresh: back where it was left, and read only once the end
+        // has been reached.
+        self.stage_restore();
+        if !self.restoring()
+            && let Some(key) = self.room().map(|r| r.key.clone())
+        {
             self.mark_read(&key);
         }
-        // The room's history is drawn afresh: back where it was left.
-        self.stage_restore();
         if restore
             && self.actionable().is_some()
             && !self.modal_dialog_open()
