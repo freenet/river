@@ -622,6 +622,8 @@ struct World {
     ensures: Vec<([u8; 32], u64, [u8; 32], bool)>,
     /// The delegate refuses every `EnsureRoomSubscription`.
     refuse_ensure: bool,
+    /// The delegate never answers `EnsureRoomSubscription`.
+    silent_ensure: bool,
     /// How the delegate answers the signing key requests.
     key_play: KeyPlay,
     /// The connection a key request was left unanswered on, until another connection.
@@ -1347,6 +1349,9 @@ fn answer(world: &Mutex<World>, n: usize, bytes: &[u8]) -> Vec<Vec<u8>> {
                         let held = w.signing_keys.contains_key(&room_owner_vk);
                         w.ensures
                             .push((room_owner_vk, request_id, contract_id, held));
+                        if w.silent_ensure {
+                            continue;
+                        }
                         ChatDelegateResponseMsg::EnsureRoomSubscriptionResponse {
                             room_owner_vk,
                             request_id,
@@ -4433,6 +4438,32 @@ fn a_refused_registration_is_not_repeated_and_does_not_reconnect() {
     node.with(|w| {
         assert_eq!(w.ensures.len(), 2, "{:?}", w.ensures);
         assert_eq!(w.connections.len(), 1, "no reconnect for a refusal");
+    });
+}
+
+/// An ask the delegate never answers retires the connection once (a late error would name no
+/// request), and each room is asked once in all: the reconnect does not repeat it.
+#[test]
+fn an_unanswered_registration_retires_the_connection_once_and_is_not_repeated() {
+    let node = fake_node(vec![]);
+    node.with(|w| w.silent_ensure = true);
+    let a = TestRoom::new(1, "A", 1, &["a1"]);
+    let source = Arc::new(FakePointers::default());
+    let (session, _dir) = following_watched(
+        &node,
+        &[&a],
+        "key-ensure-silent",
+        Outbox::default(),
+        watched(&source, Some(1)),
+    );
+    session.wait_until(
+        "the ask went unanswered and the connection was replaced",
+        || node.with(|w| !w.ensures.is_empty() && w.connections.len() >= 2),
+    );
+    std::thread::sleep(Duration::from_millis(1500));
+    node.with(|w| {
+        assert_eq!(w.ensures.len(), 1, "asked again: {:?}", w.ensures);
+        assert_eq!(w.connections.len(), 2, "a reconnect loop");
     });
 }
 

@@ -137,7 +137,8 @@ pub struct KeySweep {
     ensured: HashSet<Key>,
     /// Owned rooms whose ask failed (it went unanswered, could not be sent, or the delegate
     /// answered it with an error): not asked again for the rest of the run. An ask is best
-    /// effort, so one that fails never drops the connection and never repeats.
+    /// effort: one that fails is never repeated, and one that times out retires the connection
+    /// (a late host-level error carries no room or request id) but is not asked again after.
     gave_up: HashSet<Key>,
     /// Whether an ask may go out now: the session sets it when the generation watch has
     /// confirmed that this build's room contract is the current one. The delegate keeps one
@@ -405,19 +406,18 @@ impl KeySweep {
     }
 
     /// Whether the awaited request has gone unanswered past `wait`, so the connection must be
-    /// dropped (its answer must not arrive late and be taken for another request's). An ask to
-    /// follow a room is the exception: its answer names the room and the ask, so a late one is
-    /// taken for nothing; it is given up on (never asked again this run) and the connection
-    /// stays, so a delegate that never answers it cannot drive a reconnect loop.
+    /// dropped (its answer, or a host-level error that names no request, must not arrive late
+    /// and be taken for another request's). An ask to follow a room is dropped too; it is also
+    /// given up on (kept in `gave_up`), so the next connection does not ask it again and a
+    /// delegate that never answers cannot drive a reconnect loop.
     pub fn expire(&mut self, wait: Duration, pace: Pace, now: Instant) -> bool {
         let Some(cur) = self.current else {
             return false;
         };
         match cur.sent {
             Some(at) if now.saturating_duration_since(at) >= wait => {
-                let drop_connection = cur.phase != Phase::Ensure;
                 self.ensure_over(cur.room, cur.phase, pace, now);
-                drop_connection
+                true
             }
             _ => false,
         }
@@ -1009,26 +1009,37 @@ mod tests {
     }
 
     /// An ask that fails is never repeated this run, whatever follows: the sequences are the
-    /// session's (an unanswered ask is expired and the connection kept; a failed send is
+    /// session's (an unanswered ask is expired and the connection retired; a failed send is
     /// followed by the connection's loss; an error answer, then a loss).
     #[test]
-    fn a_failed_ask_is_never_repeated_and_never_drops_the_connection() {
+    fn a_timed_out_ask_retires_the_connection_and_is_never_repeated() {
         let now = Instant::now();
         let later = now + Duration::from_secs(3600);
         let rooms = [room_of(9, 9)];
         let wait = Duration::from_secs(20);
 
-        // Unanswered: expired without dropping the connection; nothing repeats it.
+        // Unanswered: expiry retires the connection; after the reconnect nothing repeats it.
         let mut sweep = allowed();
         ensure_of(&owned_to_ensure(&mut sweep, &rooms, now)).unwrap();
         assert!(
-            !sweep.expire(wait, PACE, now + wait),
-            "the connection stays"
+            sweep.expire(wait, PACE, now + wait),
+            "the connection is retired"
         );
         assert!(!sweep.busy());
         assert!(sweep.next_request(&rooms, true, later).is_none());
         sweep.connection_lost(PACE, later);
         assert!(sweep.next_request(&rooms, true, later).is_none());
+
+        // Several drop-and-reconnect cycles: the room is never asked again, so no cycle starts.
+        let mut sweep = allowed();
+        ensure_of(&owned_to_ensure(&mut sweep, &rooms, now)).unwrap();
+        assert!(sweep.expire(wait, PACE, now + wait));
+        for i in 1..=5u64 {
+            let t = later + Duration::from_secs(i * 100);
+            sweep.connection_lost(PACE, t);
+            assert!(sweep.next_request(&rooms, true, t).is_none(), "cycle {i}");
+            assert!(!sweep.expire(wait, PACE, t + wait), "cycle {i}");
+        }
 
         // Unsendable, then the connection goes.
         let mut sweep = allowed();
@@ -1058,7 +1069,8 @@ mod tests {
             if let Some(r) = sweep.next_request(&rooms, true, t) {
                 if ensure_of(&r).is_some() {
                     asks += 1;
-                    sweep.expire(wait, PACE, t + wait);
+                    assert!(sweep.expire(wait, PACE, t + wait));
+                    sweep.connection_lost(PACE, t + wait);
                 } else {
                     sweep.on_answer(
                         &got(
