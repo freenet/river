@@ -703,8 +703,6 @@ impl Chat {
             });
             if !known {
                 self.leave_dm();
-                // The room's history is drawn afresh, if the room is still there.
-                self.stage_restore();
             }
         }
         self.dm_forget_gone();
@@ -718,6 +716,8 @@ impl Chat {
     /// the thread's stash always reaches its draft ([`Chat::merge_stash`]). Returns the thread.
     pub(super) fn leave_dm(&mut self) -> Option<(String, String)> {
         let closed = self.dm.open.take()?;
+        // The room's history is drawn afresh, back where it was left.
+        self.stage_restore();
         self.merge_stash(&closed);
         self.dm.purge.keep_confirm_for(None);
         Some(closed)
@@ -752,8 +752,7 @@ impl Chat {
         if !known {
             return false;
         }
-        // The room's history leaves the screen under the thread.
-        self.leave_room_history();
+        self.remember_scroll();
         // A thread left for another gets what a notification reply left for it.
         if let Some(prev) = self.dm.open.clone()
             && (prev.0 != room || prev.1 != uid)
@@ -808,12 +807,7 @@ impl Chat {
         // now. (A thread that another room or a dialog closes gives nothing back: they took
         // the keyboard on purpose.)
         let restore = std::mem::take(&mut self.dm.restore_focus);
-        // The room's history is drawn afresh: back where it was left, and read only once the end
-        // has been reached.
-        self.stage_restore();
-        if !self.restoring()
-            && let Some(key) = self.room().map(|r| r.key.clone())
-        {
+        if let Some(key) = self.room().map(|r| r.key.clone()) {
             self.mark_read(&key);
         }
         if restore

@@ -443,13 +443,8 @@ pub struct Chat {
     pub overview: bool,
     /// A message to scroll to once the room it is in is on screen.
     reveal: Option<overview::Reveal>,
-    /// Where each room's history was scrolled to when last left away from its end.
-    scroll_memory:
-        std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, scroll_memory::Place>>>,
-    /// A remembered place waiting for its room's history to be laid out.
-    restore: Option<scroll_memory::Restore>,
-    /// Places to take from rows that rune still holds after their history left the screen.
-    captures: std::cell::RefCell<Vec<scroll_memory::Capture>>,
+    /// Each room's scroll offset when it was left away from its end, and the one being restored.
+    scroll_memory: scroll_memory::ScrollMemory,
     /// Why a reply typed into a notification was not sent, shown above the composer.
     reply_notices: std::collections::BTreeMap<String, String>,
     /// When the switcher's chord last arrived, for [`switcher::chord_gate`].
@@ -477,7 +472,7 @@ pub struct HistoryPos {
     /// The furthest offset the view reports it can scroll to.
     max: f32,
     /// How many reports the history has made, so a wait can tell a new one from an old one.
-    pub(super) reports: u64,
+    reports: u64,
     pending: Option<f32>,
 }
 
@@ -628,17 +623,7 @@ impl Chat {
 
     /// The open history now shows its newest message, or does not.
     pub fn set_at_bottom(&mut self, at: bool) {
-        // A room reopened at a remembered place first lays out at its end, before it is
-        // scrolled away: that is not the reader reaching the end.
-        if at && self.restoring() {
-            return;
-        }
         self.at_bottom = at;
-        // The same rule as the node's report: the end reached is what reads the room, here too.
-        if at && !self.dm.is_open() && !self.selected.is_empty() {
-            let key = self.selected.clone();
-            self.mark_read(&key);
-        }
         self.report_read();
     }
 
@@ -791,8 +776,6 @@ impl Chat {
             overview: false,
             reveal: None,
             scroll_memory: Default::default(),
-            restore: None,
-            captures: Default::default(),
             reply_notices: Default::default(),
             chord_at: None,
             node: Default::default(),
@@ -886,13 +869,9 @@ impl Chat {
     /// all of them), and a room missing from one step may be in the next; a draft costs a few
     /// bytes, and losing typed text costs the user.
     pub fn set_rooms(&mut self, rooms: Vec<Room>) {
-        // The open room's history is about to go when it is not in the new list.
-        if !self.selected.is_empty() && !rooms.iter().any(|r| r.key == self.selected) {
-            self.leave_room_history();
-        }
         self.rooms = rooms;
         if self.full_list {
-            self.forget_places_of_gone_rooms();
+            self.scroll_memory.retain_rooms(&self.rooms);
         }
         // An export dialog is about one room: when that room leaves the list, the dialog and its
         // token go with it. Only a FULL list says so: a partial one while reconnecting or
@@ -1016,9 +995,7 @@ impl Chat {
         // The open room is being read, so nothing in it is unread (a window that is away
         // counts what it missed itself, see `RiverApp::unread`). Not while a direct-message
         // thread covers it.
-        // Only with the history at its end: what arrives below the reader stays unread until
-        // reached, as in the web UI.
-        if !self.dm.is_open() && self.at_bottom {
+        if !self.dm.is_open() {
             if let Some(room) = self.room_mut() {
                 room.unread = 0;
             }
@@ -1099,30 +1076,19 @@ impl Chat {
     }
 
     fn select_room(&mut self, key: &str) {
-        if !self.rooms.iter().any(|r| r.key == key) {
-            return;
-        }
-        // The history of the room that was open leaves the screen.
         if key != self.selected {
-            self.leave_room_history();
+            self.remember_scroll();
         }
-        // A room whose history comes back at a remembered place is not read by opening it: what
-        // is below that place stays unread until the end is reached, as the node's report does.
-        let returns = (key != self.selected || self.dm.is_open())
-            && self.scroll_memory.borrow().contains_key(key);
-        if !returns && let Some(room) = self.rooms.iter_mut().find(|r| r.key == key) {
-            room.unread = 0;
-            if let Some(mark) = ReadMark::of(room) {
-                self.read.insert(key.to_owned(), mark);
-            }
+        let Some(room) = self.rooms.iter_mut().find(|r| r.key == key) else {
+            return;
+        };
+        room.unread = 0;
+        if let Some(mark) = ReadMark::of(room) {
+            self.read.insert(key.to_owned(), mark);
         }
         // Choosing a room shows its conversation, whatever thread was open.
-        let from_thread = self.leave_dm().is_some();
+        self.leave_dm();
         if key == self.selected {
-            // The room's history is drawn afresh under the thread that covered it.
-            if from_thread {
-                self.stage_restore();
-            }
             return;
         }
         // A reply, edit or deletion belongs to the room it was started in.

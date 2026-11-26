@@ -31,7 +31,6 @@ pub(super) const HEADER_H: f32 = 64.0;
 pub(super) const NOT_YET: &str = "Not available yet";
 
 pub fn view(chat: &Chat, logo: Option<&Pixels>, cx: &mut Cx<RiverApp>) -> El {
-    chat.read_reading_places(cx);
     let p = st::palette();
     let k = Kit::neutral(st::is_dark());
     let narrow = cx
