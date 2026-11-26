@@ -208,6 +208,19 @@ pub enum Action {
     SetNotificationMode {
         mode: super::modes::NotificationMode,
     },
+    /// Move the room to sit just before the room keyed `before` in the list (`None`: to the end),
+    /// and store the new order beside the web UI's ([`super::order`]).
+    MoveRoom {
+        before: Option<String>,
+    },
+    /// The user has read the room up to the message keyed `up_to` (a `Message::key`): store it as
+    /// the room's read position beside the web UI's, never moving it back ([`super::read`]).
+    MarkRead {
+        up_to: String,
+    },
+    /// The window went away or into the tray: store the read positions held back for pacing now,
+    /// since nothing else keeps them. Not about one room (the command's room is ignored).
+    FlushReads,
     /// Leave the room, as the web UI does ([`super::leave`]): it is removed from the stored
     /// rooms and does not come back.
     LeaveRoom,
@@ -335,6 +348,11 @@ impl std::fmt::Debug for Action {
                 .debug_struct("SetNotificationMode")
                 .field("mode", mode)
                 .finish(),
+            Action::MoveRoom { before } => {
+                f.debug_struct("MoveRoom").field("before", before).finish()
+            }
+            Action::MarkRead { up_to } => f.debug_struct("MarkRead").field("up_to", up_to).finish(),
+            Action::FlushReads => f.write_str("FlushReads"),
             Action::LeaveRoom => f.write_str("LeaveRoom"),
             Action::Viewing => f.write_str("Viewing"),
             Action::Resync => f.write_str("Resync"),
@@ -636,6 +654,9 @@ impl Action {
                 | Action::RetryWork { .. }
                 | Action::DismissWork { .. }
                 | Action::SetNotificationMode { .. }
+                | Action::MoveRoom { .. }
+                | Action::MarkRead { .. }
+                | Action::FlushReads
                 | Action::LeaveRoom
                 | Action::ImportId { .. }
         )
@@ -2975,6 +2996,9 @@ impl Outbox {
             | Action::RetryWork { .. }
             | Action::DismissWork { .. }
             | Action::SetNotificationMode { .. }
+            | Action::MoveRoom { .. }
+            | Action::MarkRead { .. }
+            | Action::FlushReads
             | Action::LeaveRoom
             | Action::ExportId
             | Action::ImportId { .. }

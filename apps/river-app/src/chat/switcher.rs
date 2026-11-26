@@ -225,7 +225,7 @@ impl Switcher {
 impl Chat {
     /// Whether a dialog the switcher must not open over is showing.
     pub(super) fn other_dialog_open(&self) -> bool {
-        self.modal_dialog_open() || self.link_menu.is_some()
+        self.modal_dialog_open() || self.link_menu.is_some() || self.room_menu.is_some()
     }
 
     /// Whether a dialog is showing, as opposed to a small popup such as the link menu. What

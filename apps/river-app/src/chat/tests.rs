@@ -530,6 +530,8 @@ fn node_chat() -> RiverApp {
 
 fn node_rooms(edit: impl FnOnce(&mut Vec<super::Room>)) -> Runtime<RiverApp> {
     let mut s = node_chat();
+    // A window the shell has reported in front, as most tests mean.
+    s.chat.set_window_front(true);
     let mut rooms = super::example::data().rooms;
     edit(&mut rooms);
     s.chat
@@ -6685,4 +6687,306 @@ mod rune_bump {
             "the next draft is still right to left"
         );
     }
+}
+
+// Room order and read position -----------------------------------------------------------------
+
+fn keys_in_order(rt: &Runtime<RiverApp>) -> Vec<String> {
+    rt.state
+        .chat
+        .rooms()
+        .iter()
+        .map(|r| r.key.clone())
+        .collect()
+}
+
+fn open_room_menu(rt: &mut Runtime<RiverApp>, key: &str) {
+    let key = key.to_owned();
+    rt.update(move |s, _| {
+        s.chat
+            .open_room_menu(&key, rune::PointerPress { x: 100.0, y: 200.0 })
+    });
+    settle(rt);
+}
+
+#[test]
+fn the_room_menu_moves_a_room_up_or_down_and_sends_where_to() {
+    let mut rt = node_rooms(|_| {});
+    let keys = keys_in_order(&rt);
+    assert!(keys.len() >= 3, "the example has rooms to move");
+    // Down from the top: before the room two below the top one (the room after the next).
+    open_room_menu(&mut rt, &keys[0]);
+    press(&mut rt, "room-menu-item1");
+    let mut want = keys.clone();
+    want.swap(0, 1);
+    assert_eq!(keys_in_order(&rt), want, "shown at once");
+    assert_eq!(
+        sent(&mut rt),
+        [Action::MoveRoom {
+            before: Some(keys[2].clone())
+        }]
+    );
+    assert!(rt.state.chat.room_menu.is_none(), "the menu closes");
+
+    // Up from the third: before the one above it.
+    open_room_menu(&mut rt, &keys[2]);
+    press(&mut rt, "room-menu-item0");
+    assert_eq!(
+        sent(&mut rt),
+        [Action::MoveRoom {
+            before: Some(keys[0].clone())
+        }]
+    );
+    assert_eq!(keys_in_order(&rt)[1], keys[2]);
+
+    // Down from the last goes to the end: there is no room below it, so the item is disabled and
+    // pressing it changes nothing.
+    let last = keys_in_order(&rt).last().unwrap().clone();
+    let before = keys_in_order(&rt);
+    rt.update({
+        let last = last.clone();
+        move |s, _| s.chat.move_room(&last, 1)
+    });
+    assert_eq!(keys_in_order(&rt), before);
+    assert!(sent(&mut rt).is_empty());
+    assert_eq!(rt.state.chat.can_move(&last), (true, false));
+    assert_eq!(rt.state.chat.can_move(&before[0]), (false, true));
+}
+
+/// The room menu's two items as drawn: whether each can be reached (a disabled item cannot).
+fn menu_items_reachable(rt: &Runtime<RiverApp>) -> (bool, bool) {
+    let reachable = |key: &str| {
+        rt.elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some(key))
+            .unwrap_or_else(|| panic!("no element {key}"))
+            .focusable
+    };
+    (reachable("room-menu-item0"), reachable("room-menu-item1"))
+}
+
+#[test]
+fn the_drawn_menu_disables_move_up_on_the_first_room_and_move_down_on_the_last() {
+    let mut rt = node_rooms(|_| {});
+    let keys = keys_in_order(&rt);
+    open_room_menu(&mut rt, &keys[0]);
+    assert_eq!(menu_items_reachable(&rt), (false, true), "first room");
+    open_room_menu(&mut rt, &keys[1]);
+    assert_eq!(menu_items_reachable(&rt), (true, true), "a room between");
+    open_room_menu(&mut rt, keys.last().unwrap());
+    assert_eq!(menu_items_reachable(&rt), (true, false), "last room");
+}
+
+#[test]
+fn the_menu_items_name_their_room_for_a_screen_reader() {
+    let mut rt = node_rooms(|_| {});
+    let room = rt.state.chat.rooms()[1].clone();
+    open_room_menu(&mut rt, &room.key);
+    let tree = rt.accessibility_json().to_string();
+    let named = tree
+        .matches(&format!("\"description\":\"{}\"", room.name))
+        .count();
+    assert!(named >= 2, "both items name {}: {tree}", room.name);
+}
+
+#[test]
+fn moving_a_room_down_to_the_end_names_no_room() {
+    let mut rt = node_rooms(|_| {});
+    let keys = keys_in_order(&rt);
+    let n = keys.len();
+    rt.update({
+        let k = keys[n - 2].clone();
+        move |s, _| s.chat.move_room(&k, 1)
+    });
+    assert_eq!(sent(&mut rt), [Action::MoveRoom { before: None }]);
+    assert_eq!(keys_in_order(&rt)[n - 1], keys[n - 2]);
+}
+
+#[test]
+fn example_rooms_move_on_the_screen_and_send_nothing() {
+    let mut rt = render(connected(), WINDOW_SIZE);
+    let keys = keys_in_order(&rt);
+    rt.update({
+        let k = keys[0].clone();
+        move |s, _| s.chat.move_room(&k, 1)
+    });
+    assert_eq!(keys_in_order(&rt)[1], keys[0]);
+    assert!(sent(&mut rt).is_empty());
+}
+
+fn read_reports(rt: &mut Runtime<RiverApp>) -> Vec<String> {
+    std::mem::take(&mut rt.state.chat.reported)
+        .into_iter()
+        .map(|c| c.action)
+        .filter_map(|a| match a {
+            Action::MarkRead { up_to } => Some(up_to),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn the_open_room_is_reported_read_up_to_its_newest_message_once() {
+    let mut rt = node_rooms(|_| {});
+    let newest = rt
+        .state
+        .chat
+        .room()
+        .unwrap()
+        .messages
+        .last()
+        .unwrap()
+        .key
+        .clone();
+    assert_eq!(read_reports(&mut rt), [newest]);
+    // The same newest message is not reported again, whatever redraws or refreshes the list.
+    let rooms = rt.state.chat.rooms().to_vec();
+    rt.update(move |s, _| {
+        s.chat
+            .show_node_rooms(rooms, None, super::LinkStatus::Live, 29_000_001);
+    });
+    assert!(read_reports(&mut rt).is_empty());
+    // A newer message that arrives while the history is at its end is reported.
+    let mut rooms = rt.state.chat.rooms().to_vec();
+    let open = rt.state.chat.room().unwrap().key.clone();
+    let room = rooms.iter_mut().find(|r| r.key == open).unwrap();
+    let mut next = room.messages.last().unwrap().clone();
+    next.key = "424242".into();
+    next.pending = None;
+    room.messages.push(next);
+    rt.update(move |s, _| {
+        s.chat
+            .show_node_rooms(rooms, None, super::LinkStatus::Live, 29_000_002);
+    });
+    assert_eq!(read_reports(&mut rt), ["424242".to_owned()]);
+}
+
+#[test]
+fn an_open_room_other_than_the_first_is_the_only_one_reported_on_the_first_load() {
+    let mut s = node_chat();
+    s.chat.set_window_front(true);
+    let rooms = super::example::data().rooms;
+    let (first, open) = (rooms[0].key.clone(), rooms[1].key.clone());
+    s.chat
+        .show_node_rooms(rooms, Some(&open), super::LinkStatus::Live, 29_000_000);
+    let reported: Vec<String> = s.chat.reported.iter().map(|c| c.room.clone()).collect();
+    assert_eq!(
+        reported,
+        std::slice::from_ref(&open),
+        "only the room finally shown, not {first}"
+    );
+    assert_eq!(s.chat.room().unwrap().key, open);
+}
+
+#[test]
+fn nothing_is_reported_read_before_the_window_has_reported_focus() {
+    // Started at login there is no window, so no focus event ever arrives: whatever arrives in
+    // the open room is not read.
+    let mut s = node_chat();
+    s.chat.show_node_rooms(
+        super::example::data().rooms,
+        None,
+        super::LinkStatus::Live,
+        29_000_000,
+    );
+    let mut rt = render(s, WINDOW_SIZE);
+    assert!(read_reports(&mut rt).is_empty(), "opening the room");
+    let mut rooms = rt.state.chat.rooms().to_vec();
+    let open = rt.state.chat.room().unwrap().key.clone();
+    let room = rooms.iter_mut().find(|r| r.key == open).unwrap();
+    let mut next = room.messages.last().unwrap().clone();
+    next.key = "555".into();
+    next.pending = None;
+    room.messages.push(next);
+    rt.update(move |s, _| {
+        s.chat
+            .show_node_rooms(rooms, None, super::LinkStatus::Live, 29_000_001);
+    });
+    assert!(read_reports(&mut rt).is_empty(), "an arrival");
+    // The window opens and is focused: now it is read.
+    rt.update(|s, _| s.focus_changed(true));
+    assert_eq!(read_reports(&mut rt), ["555".to_owned()]);
+}
+
+#[test]
+fn nothing_is_reported_read_while_the_newest_message_is_not_on_screen() {
+    let mut rt = node_rooms(|_| {});
+    read_reports(&mut rt);
+    let mut rooms = rt.state.chat.rooms().to_vec();
+    let open = rt.state.chat.room().unwrap().key.clone();
+    let room = rooms.iter_mut().find(|r| r.key == open).unwrap();
+    let mut next = room.messages.last().unwrap().clone();
+    next.key = "777".into();
+    room.messages.push(next);
+    // Scrolled up, or the window away: the arrival is not read.
+    rt.update(|s, _| s.chat.set_at_bottom(false));
+    rt.update({
+        let rooms = rooms.clone();
+        move |s, _| {
+            s.chat
+                .show_node_rooms(rooms, None, super::LinkStatus::Live, 29_000_001);
+        }
+    });
+    assert!(read_reports(&mut rt).is_empty(), "scrolled up");
+    rt.update(|s, _| s.chat.set_window_front(false));
+    rt.update(|s, _| s.chat.set_at_bottom(true));
+    assert!(read_reports(&mut rt).is_empty(), "window away");
+    // Back in front with the newest message on screen: read.
+    rt.update(|s, _| s.chat.set_window_front(true));
+    assert_eq!(read_reports(&mut rt), ["777".to_owned()]);
+}
+
+#[test]
+fn the_window_going_away_asks_for_held_read_positions_to_be_stored() {
+    let mut rt = node_rooms(|_| {});
+    read_reports(&mut rt);
+    let flushes = |rt: &mut Runtime<RiverApp>| {
+        std::mem::take(&mut rt.state.chat.reported)
+            .into_iter()
+            .filter(|c| matches!(c.action, Action::FlushReads))
+            .count()
+    };
+    rt.update(|s, _| s.chat.set_window_front(false));
+    assert_eq!(flushes(&mut rt), 1, "away");
+    rt.update(|s, _| s.chat.set_window_front(false));
+    assert_eq!(flushes(&mut rt), 0, "already away");
+    rt.update(|s, _| s.chat.set_window_front(true));
+    assert_eq!(flushes(&mut rt), 0, "coming back asks for nothing");
+}
+
+#[test]
+fn a_message_of_yours_still_on_its_way_and_example_rooms_are_not_reported() {
+    let mut rt = node_rooms(|_| {});
+    read_reports(&mut rt);
+    let mut rooms = rt.state.chat.rooms().to_vec();
+    let open = rt.state.chat.room().unwrap().key.clone();
+    let before = rooms
+        .iter()
+        .find(|r| r.key == open)
+        .unwrap()
+        .messages
+        .last()
+        .unwrap()
+        .key
+        .clone();
+    let room = rooms.iter_mut().find(|r| r.key == open).unwrap();
+    let mut mine = room.messages.last().unwrap().clone();
+    mine.key = "999".into();
+    mine.pending = Some(super::model::Pending {
+        entry: 1,
+        failed: None,
+        retry: false,
+    });
+    room.messages.push(mine);
+    rt.update(move |s, _| {
+        s.chat
+            .show_node_rooms(rooms, None, super::LinkStatus::Live, 29_000_001);
+    });
+    assert!(
+        read_reports(&mut rt).is_empty(),
+        "not yet on the node: {before}"
+    );
+    let mut ex = render(connected(), WINDOW_SIZE);
+    ex.update(|s, _| s.chat.set_at_bottom(true));
+    assert!(read_reports(&mut ex).is_empty());
 }

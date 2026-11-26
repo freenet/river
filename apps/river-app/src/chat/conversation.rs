@@ -263,7 +263,7 @@ fn history(chat: &Chat, room: &Room, p: &Palette, k: &Kit) -> El {
                 .focusable(true)
                 .label("Conversation history")
                 .scroll_edge_fade(40.0)
-                .on_at_bottom(|s: &mut RiverApp, at| s.chat.at_bottom = at)
+                .on_at_bottom(|s: &mut RiverApp, at| s.chat.set_at_bottom(at))
                 .on_scroll_offset(chat.history_probe(scroll_key.clone()))
                 // Room for the bar's track, so nothing at the right edge sits under it.
                 .pr(ScrollBarStyle::from_kit(k).strip())

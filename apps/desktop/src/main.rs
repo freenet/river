@@ -127,6 +127,9 @@ fn main() {
     }
     let for_app = updater.clone();
     let for_settings = settings.clone();
+    // Whether the start has no window (decided below, before `init` runs).
+    let windowless = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let windowless_in = windowless.clone();
     let app = river_app::app(move |handle| {
         // The tray icon is made here on Windows and macOS: init runs on the thread that handles
         // the window system's events, which they need. A failure leaves the window up.
@@ -165,7 +168,8 @@ fn main() {
             startup,
         )
         .with_notifier(Box::new(notifier))
-        .with_background(for_settings);
+        .with_background(for_settings)
+        .with_window_shown(!windowless_in.load(std::sync::atomic::Ordering::Acquire));
         let app = app.with_log(Arc::new(diagnostics::DesktopLog::new(log_state)));
         match updates {
             Some(updates) => app.with_updates(updates),
@@ -207,6 +211,7 @@ fn main() {
     // for closing to quit. Started at login, there is no window until the tray asks for one.
     let mut app = app.keep_running().on_close(background::on_close);
     if background_start && tray_expected {
+        windowless.store(true, std::sync::atomic::Ordering::Release);
         app = app.windowless();
     }
     app.run();

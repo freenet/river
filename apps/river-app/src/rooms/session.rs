@@ -102,7 +102,9 @@ use super::generation::{
 };
 use super::grant::{GrantOutcome, GrantPacing, GrantToken, NodeHttp, request_grant_with};
 use super::modes::{NotificationMode, decode_modes};
+use super::order::{merge_room_order, move_before};
 use super::outbox::{Action, Command, Outbox};
+use super::read::{Known, is_further};
 use super::resync::{ResyncPace, Resyncs};
 use super::room::{LiveRoom, NetworkMerge, local_minutes};
 use super::socket::{NodeSocket, SocketError, TokenVerdict, token_verdict};
@@ -2386,7 +2388,10 @@ impl Rooms {
             }
             let room = match old.remove(&vk) {
                 Some(mut kept) if same_room(&kept.stored, &slot) => {
-                    kept.stored.last_read_message_id = slot.last_read_message_id.clone();
+                    // The marker further along in the room wins, as the web UI merges two copies
+                    // ([`super::read`]): one this app moved and is still storing is not put back
+                    // by an older read, and one the web UI stored further on is taken.
+                    let held = kept.stored.last_read_message_id.take();
                     newer_self_cache(&mut kept.stored, &slot);
                     if let Err(e) = kept.merge_state(&slot.room_state) {
                         crate::diag!(
@@ -2395,6 +2400,12 @@ impl Rooms {
                         );
                         self.not_updated.insert(vk);
                     }
+                    kept.stored.last_read_message_id = furthest_marker(
+                        &kept.stored.room_state,
+                        &slot.room_state,
+                        held,
+                        slot.last_read_message_id.clone(),
+                    );
                     kept
                 }
                 Some(previous) => {
@@ -2429,7 +2440,15 @@ impl Rooms {
             };
             by_key.insert(vk, room);
         }
-        for vk in order(&loaded.meta.room_order, by_key.keys().copied().collect()) {
+        // An order chosen here and still being stored is the order, over the store's older one.
+        let stored_order = match self.outbox.work.pending_order() {
+            Some(mut pending) => {
+                merge_room_order(&mut pending, &loaded.meta.room_order);
+                pending
+            }
+            None => loaded.meta.room_order.clone(),
+        };
+        for vk in order(&stored_order, by_key.keys().copied().collect()) {
             if let Some(room) = by_key.remove(&vk) {
                 self.list.push(room);
             }
@@ -3304,7 +3323,7 @@ impl Rooms {
     /// Create, join, or try again or drop one that failed ([`super::work`]). True when it
     /// changed what shows.
     fn list_command(&mut self, room: &str, action: Action) -> bool {
-        let shown_owner = || {
+        let shown_key = |room: &str| {
             bs58::decode(room)
                 .into_vec()
                 .ok()
@@ -3312,6 +3331,7 @@ impl Rooms {
                 .and_then(|b| VerifyingKey::from_bytes(&b).ok())
                 .filter(|vk| self.list.iter().any(|r| &r.stored.owner_vk == vk))
         };
+        let shown_owner = || shown_key(room);
         match action {
             Action::LeaveRoom => {
                 let Some(owner) = shown_owner() else {
@@ -3333,6 +3353,76 @@ impl Rooms {
                     return false;
                 }
                 self.drop_leaving();
+                true
+            }
+            Action::MoveRoom { before } => {
+                let Some(owner) = shown_owner() else {
+                    crate::diag!("River: moving a room no longer shown was dropped");
+                    // The screen already moved it: say what the list is.
+                    return true;
+                };
+                let before = match before.as_deref().map(shown_key) {
+                    None => None,
+                    Some(Some(vk)) => Some(vk),
+                    Some(None) => {
+                        crate::diag!("River: moving a room before one no longer shown was dropped");
+                        return true;
+                    }
+                };
+                let current: Vec<VerifyingKey> =
+                    self.list.iter().map(|r| r.stored.owner_vk).collect();
+                let order = move_before(&current, &owner, before.as_ref());
+                if order == current {
+                    // Nothing moves, though the screen may have: it is told the list as it is.
+                    return true;
+                }
+                // Shown in the new order at once; a read of the store before it is stored keeps
+                // it (`replace`).
+                self.list.sort_by_key(|r| {
+                    order
+                        .iter()
+                        .position(|k| *k == r.stored.owner_vk)
+                        .unwrap_or(usize::MAX)
+                });
+                self.outbox.work.set_order(order);
+                true
+            }
+            Action::FlushReads => {
+                self.outbox.work.release_all_reads(Instant::now());
+                false
+            }
+            Action::MarkRead { up_to } => {
+                let Some(owner) = shown_owner() else {
+                    return false;
+                };
+                let Some(room) = self.list.iter_mut().find(|r| r.stored.owner_vk == owner) else {
+                    return false;
+                };
+                let Some(mark) = room.message_by_key(&up_to).map(|m| m.order_key()) else {
+                    return false;
+                };
+                let known: Known = room
+                    .stored
+                    .room_state
+                    .recent_messages
+                    .messages
+                    .iter()
+                    .map(|m| m.order_key())
+                    .collect();
+                // Already at or past it (here, or read from the store): nothing to move or write.
+                if !is_further(
+                    &mark.id,
+                    room.stored.last_read_message_id.as_ref(),
+                    &known,
+                    &[],
+                ) {
+                    return false;
+                }
+                room.stored.last_read_message_id = Some(mark.id.clone());
+                let state = Some(Box::new(room.stored.room_state.clone()));
+                self.outbox
+                    .work
+                    .mark_read(owner, mark, known, state, Instant::now());
                 true
             }
             Action::SetNotificationMode { mode } => {
@@ -3969,7 +4059,9 @@ impl Rooms {
         // A finished task is shown once its room is in the list (so the screen can open it),
         // then it is done with.
         let shown: HashSet<VerifyingKey> = self.list.iter().map(|r| r.stored.owner_vk).collect();
-        self.outbox.work.forget_done(&|vk| shown.contains(vk));
+        self.outbox
+            .work
+            .forget_done(&|vk| shown.contains(vk), Instant::now());
     }
 
     /// The connection is gone: keep showing the rooms if there are any, and say so.
@@ -4029,6 +4121,30 @@ fn newer_self_cache(kept: &mut StoredRoom, slot: &StoredRoom) {
     if adopt {
         kept.self_member_info = slot.self_member_info.clone();
         kept.self_nickname = slot.self_nickname.clone();
+    }
+}
+
+/// The read marker further along in the room: `incoming` (the store's) when it is further than
+/// `held` (this app's), else `held`; either when only one is set. Places are found in the room's
+/// messages as held, else in the store's copy.
+fn furthest_marker(
+    room: &ChatRoomStateV1,
+    stored: &ChatRoomStateV1,
+    held: Option<river_core::room_state::message::MessageId>,
+    incoming: Option<river_core::room_state::message::MessageId>,
+) -> Option<river_core::room_state::message::MessageId> {
+    let keys = |s: &ChatRoomStateV1| -> Known {
+        s.recent_messages
+            .messages
+            .iter()
+            .map(|m| m.order_key())
+            .collect()
+    };
+    match (&held, &incoming) {
+        (_, None) => held,
+        (None, _) => incoming,
+        (Some(_), Some(i)) if is_further(i, held.as_ref(), &keys(room), &keys(stored)) => incoming,
+        _ => held,
     }
 }
 
