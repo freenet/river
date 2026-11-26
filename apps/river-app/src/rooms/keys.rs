@@ -15,6 +15,18 @@
 //! whose key was not stored because the app ended first, with no state kept: a new run starts
 //! the sweep again.
 //!
+//! **Registering an owned room (`EnsureRoomSubscription`).** For a room the user owns, once its
+//! key is the delegate's (a check that found ours, or the check after a store), the sweep asks
+//! the delegate to follow the room, as the web UI does for owned rooms (`ensure_room_subscription`
+//! in `ui/src/components/app/freenet_api/chat_delegate.rs`), so the delegate can rotate a private
+//! room's secret when members leave. The delegate refuses it unless it holds the owner's key
+//! under this app's origin, which is why the key comes first. It is asked once per room per
+//! connection whatever the answer (a refusal or error is logged, never retried or shown, and
+//! holds nothing else back), and again after a reconnect, as the web UI re-arms; a room whose ask
+//! was out when the connection dropped is not asked on the very next one. Rooms the user does not
+//! own are never asked. A room created here reaches the sweep through the stored rooms like any
+//! other, so it is asked once its key is stored and verified.
+//!
 //! **A key that is there is never replaced, except after the user imported that room's identity**
 //! ([`KeySweep::authoritative`]): the web UI's import replaces it too.
 //! The rest of this paragraph is the rule without that exception. The delegate overwrites without comparing
@@ -87,6 +99,9 @@ enum Phase {
     Store,
     /// Stored: ask again.
     Verify,
+    /// The room's key is the delegate's, and the user owns the room: ask the delegate to
+    /// follow the room (`EnsureRoomSubscription`) so it can rotate a private room's secret.
+    Ensure,
 }
 
 /// What the sweep is doing now, for one room.
@@ -96,6 +111,8 @@ struct Current {
     phase: Phase,
     /// When the request for this phase went out, if it has.
     sent: Option<Instant>,
+    /// The `request_id` of the `EnsureRoomSubscription` out, in [`Phase::Ensure`].
+    request_id: u64,
 }
 
 /// Failures so far in a row, and when to try again.
@@ -110,6 +127,12 @@ pub struct KeySweep {
     current: Option<Current>,
     /// Rooms whose key the delegate holds, this run.
     verified: HashSet<Key>,
+    /// Owned rooms the delegate was asked to follow on this connection, whatever it answered:
+    /// asked once per room per connection, never again after a refusal or an error. Cleared
+    /// when the connection drops, as the web UI asks again after a reconnect.
+    ensured: HashSet<Key>,
+    /// The last `request_id` used.
+    last_request_id: u64,
     /// Rooms the delegate holds a different key for: left alone, named once.
     mismatched: HashSet<Key>,
     backoff: HashMap<Key, Backoff>,
@@ -127,6 +150,12 @@ pub fn wait_after(failures: u32, first: Duration, max: Duration) -> Duration {
     first
         .saturating_mul(1u32 << failures.saturating_sub(1).min(16))
         .min(max)
+}
+
+/// A room the user owns: its signing key is the owner's. The delegate's rotation of a private
+/// room's secret is the owner's act, so only these are registered.
+fn owned(k: &Key) -> bool {
+    k.0 == k.1
 }
 
 /// The waits: the first, and the most it doubles to.
@@ -150,16 +179,35 @@ impl KeySweep {
     /// The connection is gone, and with it whatever was out. A request that was out counts as
     /// a failure; whatever the sweep had decided starts again from its check.
     pub fn connection_lost(&mut self, pace: Pace, now: Instant) {
+        let asked = self
+            .current
+            .filter(|c| c.sent.is_some() && c.phase == Phase::Ensure)
+            .map(|c| c.room);
         if let Some(cur) = self.current.filter(|c| c.sent.is_some()) {
-            self.fail(cur.room, pace, now);
+            self.ensure_over(cur.room, cur.phase, pace, now);
         }
         self.current = None;
+        // Ask again on the next connection, except for a room whose ask was itself out when
+        // this one dropped: that may be why, so it is not asked a second time.
+        self.ensured.clear();
+        self.ensured.extend(asked);
+    }
+
+    /// A request of `phase` for `room` failed: the ask to follow a room is not repeated and
+    /// holds nothing else back; a key request backs off.
+    fn ensure_over(&mut self, room: Key, phase: Phase, pace: Pace, now: Instant) {
+        if phase == Phase::Ensure {
+            self.current = None;
+            self.ensured.insert(room);
+        } else {
+            self.fail(room, pace, now);
+        }
     }
 
     /// The request just returned by [`next_request`](Self::next_request) could not be sent.
     pub fn send_failed(&mut self, pace: Pace, now: Instant) {
         if let Some(cur) = self.current {
-            self.fail(cur.room, pace, now);
+            self.ensure_over(cur.room, cur.phase, pace, now);
         }
     }
 
@@ -175,6 +223,7 @@ impl KeySweep {
         self.verified.retain(|k| shown.contains(k));
         self.mismatched.retain(|k| shown.contains(k));
         self.backoff.retain(|k, _| shown.contains(k));
+        self.ensured.retain(|k| shown.contains(k));
         if self.current.is_some_and(|c| !shown.contains(&c.room)) {
             self.current = None;
         }
@@ -203,19 +252,30 @@ impl KeySweep {
                 .filter_map(key_of)
                 .filter(|k| {
                     self.backoff.get(k).is_none_or(|b| b.not_before <= now)
-                        && !self.verified.contains(k)
                         && !self.mismatched.contains(k)
+                        && (!self.verified.contains(k) || self.needs_ensure(k))
                 })
                 .min_by_key(|k| self.backoff.get(k).map(|b| b.not_before))?;
+            let phase = if self.verified.contains(&room) {
+                Phase::Ensure
+            } else {
+                Phase::Check
+            };
             self.current = Some(Current {
                 room,
-                phase: Phase::Check,
+                phase,
                 sent: None,
+                request_id: 0,
             });
         }
         let cur = self.current.as_mut()?;
         let (owner, _) = cur.room;
         let request = match cur.phase {
+            Phase::Ensure => {
+                self.last_request_id += 1;
+                cur.request_id = self.last_request_id;
+                delegate::ensure_room_subscription(&owner, cur.request_id)
+            }
             Phase::Check | Phase::Verify => delegate::public_key(&owner),
             Phase::Store => {
                 let sk = rooms
@@ -281,6 +341,25 @@ impl KeySweep {
                     self.fail(cur.room, pace, now)
                 }
             },
+            (
+                Phase::Ensure,
+                ChatDelegateResponseMsg::EnsureRoomSubscriptionResponse {
+                    room_owner_vk,
+                    request_id,
+                    result,
+                },
+            ) if *room_owner_vk == owner.to_bytes() && *request_id == cur.request_id => {
+                // Asked once; whatever the delegate said, it is not asked again. A refusal (it
+                // holds no key for this app under the room) is not shown: the web UI asks too.
+                if let Err(e) = result {
+                    crate::diag!(
+                        "River: the delegate did not follow a room: {}",
+                        crate::diag::scrub(e)
+                    );
+                }
+                self.current = None;
+                self.ensured.insert(cur.room);
+            }
             _ => return false,
         }
         true
@@ -296,7 +375,7 @@ impl KeySweep {
             "River: asking the delegate about a room's signing key failed: {}",
             crate::diag::scrub(why)
         );
-        self.fail(cur.room, pace, now);
+        self.ensure_over(cur.room, cur.phase, pace, now);
         true
     }
 
@@ -308,7 +387,7 @@ impl KeySweep {
         };
         match cur.sent {
             Some(at) if now.saturating_duration_since(at) >= wait => {
-                self.fail(cur.room, pace, now);
+                self.ensure_over(cur.room, cur.phase, pace, now);
                 true
             }
             _ => false,
@@ -328,6 +407,20 @@ impl KeySweep {
         self.verified.insert(room);
         self.authoritative.remove(&room);
         self.overall = None;
+        // The key is the delegate's: an owned room is next registered with it.
+        if self.needs_ensure(&room) {
+            self.current = Some(Current {
+                room,
+                phase: Phase::Ensure,
+                sent: None,
+                request_id: 0,
+            });
+        }
+    }
+
+    /// An owned room whose key the delegate holds and that was not yet asked about.
+    fn needs_ensure(&self, room: &Key) -> bool {
+        owned(room) && self.verified.contains(room) && !self.ensured.contains(room)
     }
 
     fn fail(&mut self, room: Key, (first, max): Pace, now: Instant) {
@@ -707,5 +800,178 @@ mod tests {
         let rooms = [LiveRoom::new(stored)];
         let mut sweep = KeySweep::default();
         assert!(sweep.next_request(&rooms, true, Instant::now()).is_none());
+    }
+
+    // EnsureRoomSubscription: an owned room is registered with the delegate once its key is
+    // the delegate's, once per room per connection.
+
+    fn ensure_of(r: &ClientRequest<'_>) -> Option<([u8; 32], u64, [u8; 32])> {
+        match msg(r) {
+            ChatDelegateRequestMsg::EnsureRoomSubscription {
+                room_owner_vk,
+                request_id,
+                contract_id,
+            } => Some((room_owner_vk, request_id, contract_id)),
+            _ => None,
+        }
+    }
+
+    fn ensure_ok(owner: &VerifyingKey, request_id: u64) -> ChatDelegateResponseMsg {
+        ChatDelegateResponseMsg::EnsureRoomSubscriptionResponse {
+            room_owner_vk: owner.to_bytes(),
+            request_id,
+            result: Ok(()),
+        }
+    }
+
+    /// Walk an owned room through its key check, as a delegate that already holds the key
+    /// answers, and return the request that follows.
+    fn owned_to_ensure(
+        sweep: &mut KeySweep,
+        rooms: &[LiveRoom],
+        now: Instant,
+    ) -> ClientRequest<'static> {
+        let owner = rooms[0].stored.owner_vk;
+        assert!(is_check(&sweep.next_request(rooms, true, now).unwrap()));
+        assert!(sweep.on_answer(&got(&owner, Some(owner.to_bytes())), PACE, now));
+        sweep
+            .next_request(rooms, true, now)
+            .expect("a request follows")
+    }
+
+    #[test]
+    fn an_owned_room_whose_key_is_the_delegates_is_asked_to_be_followed() {
+        let rooms = [room_of(9, 9)];
+        let owner = rooms[0].stored.owner_vk;
+        let mut sweep = KeySweep::default();
+        let req = owned_to_ensure(&mut sweep, &rooms, Instant::now());
+        let (vk, id, contract) = ensure_of(&req).expect("EnsureRoomSubscription");
+        assert_eq!(vk, owner.to_bytes());
+        assert_eq!(id, 1);
+        assert_eq!(
+            contract,
+            *crate::rooms::create::contract_key(&owner).id().as_bytes()
+        );
+        assert!(sweep.busy());
+    }
+
+    /// A key that had to be stored first is asked about only after the check that follows the
+    /// store confirmed it; a different key held means no ask.
+    #[test]
+    fn it_is_sent_only_after_the_key_is_verified() {
+        let rooms = [room_of(9, 9)];
+        let owner = rooms[0].stored.owner_vk;
+        let now = Instant::now();
+        let mut sweep = KeySweep::default();
+        let req = sweep.next_request(&rooms, true, now).unwrap();
+        assert!(is_check(&req));
+        assert!(sweep.on_answer(&got(&owner, None), PACE, now));
+        let req = sweep.next_request(&rooms, true, now).unwrap();
+        assert!(matches!(
+            msg(&req),
+            ChatDelegateRequestMsg::StoreSigningKey { .. }
+        ));
+        assert!(sweep.on_answer(&stored_ok(&owner), PACE, now));
+        let req = sweep.next_request(&rooms, true, now).unwrap();
+        assert!(is_check(&req), "verify first");
+        assert!(sweep.on_answer(&got(&owner, Some(owner.to_bytes())), PACE, now));
+        let req = sweep.next_request(&rooms, true, now).unwrap();
+        assert!(ensure_of(&req).is_some(), "ask after the verify");
+
+        // A different key held: no ask, and nothing more.
+        let mut sweep = KeySweep::default();
+        sweep.next_request(&rooms, true, now).unwrap();
+        assert!(sweep.on_answer(&got(&owner, Some([0xee; 32])), PACE, now));
+        assert!(sweep.next_request(&rooms, true, now).is_none());
+    }
+
+    #[test]
+    fn a_room_the_user_does_not_own_is_never_asked_to_be_followed() {
+        let (live, ours) = room();
+        let owner = live.stored.owner_vk;
+        let rooms = [live];
+        let mut sweep = KeySweep::default();
+        let now = Instant::now();
+        assert!(is_check(&sweep.next_request(&rooms, true, now).unwrap()));
+        assert!(sweep.on_answer(
+            &got(&owner, Some(ours.verifying_key().to_bytes())),
+            PACE,
+            now
+        ));
+        assert!(sweep.next_request(&rooms, true, now).is_none());
+        sweep.connection_lost(PACE, now);
+        assert!(sweep.next_request(&rooms, true, now).is_none());
+    }
+
+    #[test]
+    fn an_owned_room_is_asked_once_whatever_the_answer() {
+        let now = Instant::now();
+        let rooms = [room_of(9, 9)];
+        let owner = rooms[0].stored.owner_vk;
+        for end in 0..3 {
+            let mut sweep = KeySweep::default();
+            let req = owned_to_ensure(&mut sweep, &rooms, now);
+            let (_, id, _) = ensure_of(&req).unwrap();
+            match end {
+                0 => assert!(sweep.on_answer(&ensure_ok(&owner, id), PACE, now)),
+                1 => assert!(sweep.on_answer(
+                    &ChatDelegateResponseMsg::EnsureRoomSubscriptionResponse {
+                        room_owner_vk: owner.to_bytes(),
+                        request_id: id,
+                        result: Err("no key".into()),
+                    },
+                    PACE,
+                    now
+                )),
+                _ => assert!(sweep.on_error("boom", PACE, now)),
+            }
+            assert!(!sweep.busy());
+            // Not again, however long it waits, and a refusal does not hold the sweep back.
+            for s in [0, 60, 3600, 86_400] {
+                assert!(
+                    sweep
+                        .next_request(&rooms, true, now + Duration::from_secs(s))
+                        .is_none(),
+                    "end {end}, after {s}s"
+                );
+            }
+        }
+    }
+
+    /// An answer for another correlator or another room is not taken for the awaited one.
+    #[test]
+    fn another_rooms_or_requests_answer_is_not_taken() {
+        let now = Instant::now();
+        let rooms = [room_of(9, 9)];
+        let owner = rooms[0].stored.owner_vk;
+        let other = SigningKey::from_bytes(&[10; 32]).verifying_key();
+        let mut sweep = KeySweep::default();
+        let (_, id, _) = ensure_of(&owned_to_ensure(&mut sweep, &rooms, now)).unwrap();
+        assert!(!sweep.on_answer(&ensure_ok(&owner, id + 1), PACE, now));
+        assert!(!sweep.on_answer(&ensure_ok(&other, id), PACE, now));
+        assert!(sweep.busy());
+    }
+
+    /// After a reconnect the room is asked again (as the web UI re-arms), except when the ask
+    /// itself was out as the connection dropped.
+    #[test]
+    fn it_is_asked_again_on_the_next_connection() {
+        let now = Instant::now();
+        let rooms = [room_of(9, 9)];
+        let owner = rooms[0].stored.owner_vk;
+        let mut sweep = KeySweep::default();
+        let (_, id, _) = ensure_of(&owned_to_ensure(&mut sweep, &rooms, now)).unwrap();
+        assert!(sweep.on_answer(&ensure_ok(&owner, id), PACE, now));
+        assert!(sweep.next_request(&rooms, true, now).is_none());
+        sweep.connection_lost(PACE, now);
+        let again = sweep.next_request(&rooms, true, now).expect("asked again");
+        let (_, id2, _) = ensure_of(&again).expect("an ask, not a key check");
+        assert_eq!(id2, id + 1);
+        // Dropped with the ask out: not asked on the very next connection.
+        sweep.connection_lost(PACE, now);
+        assert!(sweep.next_request(&rooms, true, now).is_none());
+        // ...but on the one after that.
+        sweep.connection_lost(PACE, now);
+        assert!(sweep.next_request(&rooms, true, now).is_some());
     }
 }

@@ -162,6 +162,24 @@ pub fn store_signing_key(owner: &VerifyingKey, key: &SigningKey) -> ClientReques
     })
 }
 
+/// `EnsureRoomSubscription` for a room the user owns, as the web UI sends it
+/// (`ensure_room_subscription` in `ui/src/components/app/freenet_api/chat_delegate.rs`): the
+/// owner's key, the room contract's id (`create::contract_key`, the web UI's
+/// `owner_vk_to_contract_key`) and a correlator the delegate echoes. The delegate refuses
+/// unless it holds the room's signing key under this app's origin, so [`super::keys`] sends
+/// it only after the key is verified.
+pub fn ensure_room_subscription(owner: &VerifyingKey, request_id: u64) -> ClientRequest<'static> {
+    message(&ChatDelegateRequestMsg::EnsureRoomSubscription {
+        room_owner_vk: owner.to_bytes(),
+        request_id,
+        contract_id: super::create::contract_key(owner)
+            .id()
+            .as_bytes()
+            .try_into()
+            .expect("32 bytes"),
+    })
+}
+
 fn message(msg: &ChatDelegateRequestMsg) -> ClientRequest<'static> {
     let mut payload = Vec::new();
     ciborium::ser::into_writer(msg, &mut payload).expect("CBOR into a Vec cannot fail");
@@ -308,6 +326,39 @@ mod tests {
     /// `ApplicationMessage`, `enqueue_delegate_request_inner`), with the room named as
     /// `create_room_modal.rs` names it. Pinned as literal bytes too, so a change to the shared
     /// type that moves the encoding fails here, and decoded with the type the delegate decodes.
+    /// The ask to follow a room is the shared type, naming the owner and the contract id of
+    /// the room's contract key.
+    #[test]
+    fn the_ensure_room_subscription_request_names_the_owner_and_the_room_contract() {
+        let owner = SigningKey::from_bytes(&[7u8; 32]).verifying_key();
+        let ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages {
+            key, inbound, ..
+        }) = ensure_room_subscription(&owner, 5)
+        else {
+            panic!("not a delegate request");
+        };
+        assert_eq!(&key, chat_delegate_key());
+        let [InboundDelegateMsg::ApplicationMessage(m)] = inbound.as_slice() else {
+            panic!("one application message");
+        };
+        match ciborium::de::from_reader::<ChatDelegateRequestMsg, _>(m.payload.as_slice()).unwrap()
+        {
+            ChatDelegateRequestMsg::EnsureRoomSubscription {
+                room_owner_vk,
+                request_id,
+                contract_id,
+            } => {
+                assert_eq!(room_owner_vk, owner.to_bytes());
+                assert_eq!(request_id, 5);
+                assert_eq!(
+                    contract_id,
+                    *crate::rooms::create::contract_key(&owner).id().as_bytes()
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
     #[test]
     fn signing_key_requests_are_the_web_uis_bytes() {
         let sk = SigningKey::from_bytes(&[8u8; 32]);

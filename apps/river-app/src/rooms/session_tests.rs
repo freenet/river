@@ -617,6 +617,9 @@ struct World {
     key_stores: Vec<([u8; 32], [u8; 32], bool)>,
     /// Every `GetPublicKey` received.
     key_reads: Vec<[u8; 32]>,
+    /// Every `EnsureRoomSubscription` received: the room, the correlator, the contract id, and
+    /// whether the delegate held a key for the room when it arrived.
+    ensures: Vec<([u8; 32], u64, [u8; 32], bool)>,
     /// How the delegate answers the signing key requests.
     key_play: KeyPlay,
     /// The connection a key request was left unanswered on, until another connection.
@@ -1331,6 +1334,25 @@ fn answer(world: &Mutex<World>, n: usize, bytes: &[u8]) -> Vec<Vec<u8>> {
                                 room_key,
                                 result: Ok(()),
                             }
+                        }
+                    }
+                    // `handle_ensure_room_subscription`: refuses without the room's key.
+                    ChatDelegateRequestMsg::EnsureRoomSubscription {
+                        room_owner_vk,
+                        request_id,
+                        contract_id,
+                    } => {
+                        let held = w.signing_keys.contains_key(&room_owner_vk);
+                        w.ensures
+                            .push((room_owner_vk, request_id, contract_id, held));
+                        ChatDelegateResponseMsg::EnsureRoomSubscriptionResponse {
+                            room_owner_vk,
+                            request_id,
+                            result: if held {
+                                Ok(())
+                            } else {
+                                Err("no signing key".into())
+                            },
                         }
                     }
                     other => panic!("the app sent a request it must not: {other:?}"),
@@ -4333,6 +4355,31 @@ fn a_created_rooms_signing_key_is_stored_once_under_the_owner_key() {
     });
 }
 
+/// Both rooms here are the user's own (the created one, and "A", which holds its own key):
+/// once a room's key is stored and verified the delegate is asked to follow it, once, with the
+/// room's contract id and with the key already held.
+#[test]
+fn an_owned_room_is_registered_with_the_delegate_once_after_its_key() {
+    let node = fake_node(vec![]);
+    let (session, _dir) = create_and_wait(&node, "key-ensure");
+    session.wait_until("both rooms were registered", || {
+        node.with(|w| w.ensures.len() >= 2)
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    node.with(|w| {
+        assert_eq!(w.ensures.len(), 2, "{:?}", w.ensures);
+        assert_ne!(w.ensures[0].0, w.ensures[1].0, "one each");
+        for (room, _, contract, held) in &w.ensures {
+            assert!(held, "asked before the key was the delegate's");
+            let owner = VerifyingKey::from_bytes(room).unwrap();
+            assert_eq!(
+                *contract,
+                *super::super::create::contract_key(&owner).id().as_bytes()
+            );
+        }
+    });
+}
+
 /// A join's key is the invitee's own key, under the room owner's key.
 #[test]
 fn a_joined_rooms_signing_key_is_the_members_under_the_owner_key() {
@@ -4359,6 +4406,12 @@ fn a_joined_rooms_signing_key_is_the_members_under_the_owner_key() {
     });
     std::thread::sleep(Duration::from_millis(300));
     node.with(|w| {
+        // The joined room is not the user's own: the delegate is never asked to follow it.
+        assert!(
+            w.ensures.iter().all(|(r, ..)| *r != room.vk().to_bytes()),
+            "{:?}",
+            w.ensures
+        );
         let joined = key_stores_besides(w, &other.vk());
         assert_eq!(
             joined,
