@@ -17,6 +17,12 @@
 //! it (rooms the web UI has that this app has not read yet) are kept next to their old
 //! neighbours, so they do not drop to the bottom ([`merge_room_order`], the web UI's function
 //! of the same name; freenet/river#802).
+//!
+//! **A limit.** The order is shared as a stored value, not as a live one. The web UI reads it
+//! when it loads, and when it next saves `rooms_meta` it keeps its own tab order for every room
+//! it holds (`reconcile_meta`: this device wins, as for #802). So a move made here lasts in an
+//! open web tab only until that tab saves, and a drag in a web tab made meanwhile is overwritten
+//! by the order shown here at the next move. Nothing is lost beyond the order itself.
 
 use ciborium::Value;
 use ed25519_dalek::VerifyingKey;
@@ -115,8 +121,13 @@ pub fn meta_with_order(
         },
         None => Vec::new(),
     };
-    let mut order = shown.to_vec();
-    order.dedup();
+    // Each room once, at its first place (`shown` holds each once, but this does not rely on it).
+    let mut order: Vec<VerifyingKey> = Vec::with_capacity(shown.len());
+    for vk in shown {
+        if !order.contains(vk) {
+            order.push(*vk);
+        }
+    }
     merge_room_order(&mut order, &stored);
     if at.is_some() && order == stored {
         return Ok(None);

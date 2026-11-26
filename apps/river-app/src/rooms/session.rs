@@ -3358,21 +3358,23 @@ impl Rooms {
             Action::MoveRoom { before } => {
                 let Some(owner) = shown_owner() else {
                     crate::diag!("River: moving a room no longer shown was dropped");
-                    return false;
+                    // The screen already moved it: say what the list is.
+                    return true;
                 };
                 let before = match before.as_deref().map(shown_key) {
                     None => None,
                     Some(Some(vk)) => Some(vk),
                     Some(None) => {
                         crate::diag!("River: moving a room before one no longer shown was dropped");
-                        return false;
+                        return true;
                     }
                 };
                 let current: Vec<VerifyingKey> =
                     self.list.iter().map(|r| r.stored.owner_vk).collect();
                 let order = move_before(&current, &owner, before.as_ref());
                 if order == current {
-                    return false;
+                    // Nothing moves, though the screen may have: it is told the list as it is.
+                    return true;
                 }
                 // Shown in the new order at once; a read of the store before it is stored keeps
                 // it (`replace`).
@@ -3384,6 +3386,10 @@ impl Rooms {
                 });
                 self.outbox.work.set_order(order);
                 true
+            }
+            Action::FlushReads => {
+                self.outbox.work.release_all_reads(Instant::now());
+                false
             }
             Action::MarkRead { up_to } => {
                 let Some(owner) = shown_owner() else {
@@ -3413,9 +3419,10 @@ impl Rooms {
                     return false;
                 }
                 room.stored.last_read_message_id = Some(mark.id.clone());
+                let state = Some(Box::new(room.stored.room_state.clone()));
                 self.outbox
                     .work
-                    .mark_read(owner, mark, known, Instant::now());
+                    .mark_read(owner, mark, known, state, Instant::now());
                 true
             }
             Action::SetNotificationMode { mode } => {
@@ -4052,7 +4059,9 @@ impl Rooms {
         // A finished task is shown once its room is in the list (so the screen can open it),
         // then it is done with.
         let shown: HashSet<VerifyingKey> = self.list.iter().map(|r| r.stored.owner_vk).collect();
-        self.outbox.work.forget_done(&|vk| shown.contains(vk));
+        self.outbox
+            .work
+            .forget_done(&|vk| shown.contains(vk), Instant::now());
     }
 
     /// The connection is gone: keep showing the rooms if there are any, and say so.

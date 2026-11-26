@@ -582,10 +582,11 @@ impl RiverApp {
         self.chat.unread_total() + self.missed.1 + self.chat.dm_unread_counted()
     }
 
-    /// Whether the window is in front, counting a window that never reported focus as in front
-    /// (as the title does): what decides whether an open thread is being read.
+    /// Whether the window is known to be in front: what decides whether an open thread is being
+    /// read. A window that has not reported focus (none is shown when started at login) is not
+    /// in front, so what arrives in it still notifies.
     fn window_in_front(&self) -> bool {
-        self.focused || !self.focus_known
+        self.focused
     }
 
     /// Notify about the direct messages in `arrived`, as about mentions: the user is the one
@@ -663,8 +664,6 @@ impl RiverApp {
     fn sync_unread(&mut self, tx: &mut Tx) {
         self.sync_node_status(tx);
         self.sync_dnd(tx);
-        // An unknown focus counts as focused, as the title does: a window that never reports it
-        // must still let a thread be read.
         self.chat.dm_sync(self.window_in_front());
         // Both run every frame, so neither is short-circuited away.
         self.chat.close_search_under_dialog();

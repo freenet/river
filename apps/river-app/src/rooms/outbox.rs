@@ -218,6 +218,9 @@ pub enum Action {
     MarkRead {
         up_to: String,
     },
+    /// The window went away or into the tray: store the read positions held back for pacing now,
+    /// since nothing else keeps them. Not about one room (the command's room is ignored).
+    FlushReads,
     /// Leave the room, as the web UI does ([`super::leave`]): it is removed from the stored
     /// rooms and does not come back.
     LeaveRoom,
@@ -349,6 +352,7 @@ impl std::fmt::Debug for Action {
                 f.debug_struct("MoveRoom").field("before", before).finish()
             }
             Action::MarkRead { up_to } => f.debug_struct("MarkRead").field("up_to", up_to).finish(),
+            Action::FlushReads => f.write_str("FlushReads"),
             Action::LeaveRoom => f.write_str("LeaveRoom"),
             Action::Viewing => f.write_str("Viewing"),
             Action::Resync => f.write_str("Resync"),
@@ -652,6 +656,7 @@ impl Action {
                 | Action::SetNotificationMode { .. }
                 | Action::MoveRoom { .. }
                 | Action::MarkRead { .. }
+                | Action::FlushReads
                 | Action::LeaveRoom
                 | Action::ImportId { .. }
         )
@@ -2993,6 +2998,7 @@ impl Outbox {
             | Action::SetNotificationMode { .. }
             | Action::MoveRoom { .. }
             | Action::MarkRead { .. }
+            | Action::FlushReads
             | Action::LeaveRoom
             | Action::ExportId
             | Action::ImportId { .. }

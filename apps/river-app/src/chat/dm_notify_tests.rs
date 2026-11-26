@@ -733,7 +733,7 @@ fn the_thread_on_screen_in_a_window_in_front_is_not_announced() {
 }
 
 #[test]
-fn a_window_that_never_reported_focus_counts_as_in_front_for_the_open_thread() {
+fn a_window_that_never_reported_focus_still_notifies_for_the_open_thread() {
     let rec = Recorder::default();
     let mut w = world();
     w.s = RiverApp::detached().with_notifier(Box::new(rec.clone()));
@@ -744,8 +744,12 @@ fn a_window_that_never_reported_focus_counts_as_in_front_for_the_open_thread() {
         .show_node_rooms(rooms, None, LinkStatus::Live, 1000);
     w.give(snap(&[&w.room.clone()], vec![]));
     assert!(w.s.chat.open_dm(&w.room, &w.peer));
+    // Started at login there is no window, so no focus event ever comes: nobody is reading.
     w.arrive("m1", WORDS);
-    assert!(w.shown().is_empty(), "the same rule marks it read");
+    assert_eq!(w.shown().len(), 1, "a windowless app notifies");
+    w.s.focus_changed(true);
+    w.arrive("m2", WORDS);
+    assert_eq!(w.shown().len(), 1, "a window in front is reading it");
 }
 
 #[test]

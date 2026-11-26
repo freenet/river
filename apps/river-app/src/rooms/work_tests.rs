@@ -139,7 +139,7 @@ fn creating_stores_the_room_publishes_it_then_opens_it_in_the_web_ui() {
     assert!(w.take_reload(), "the stored rooms are read now");
     assert!(!w.take_reload());
     // Dropped once the room is shown.
-    w.forget_done(&|vk| *vk == owner);
+    w.forget_done(&|vk| *vk == owner, Instant::now());
     assert!(w.views().is_empty());
 }
 
@@ -944,7 +944,7 @@ fn a_mode_is_stored_by_reading_rooms_meta_then_a_cas_store_that_keeps_the_rest()
         vec![(room_vk(1), NotificationMode::MentionsAndReplies, true)]
     );
     assert!(w.settle_modes().is_empty());
-    w.forget_done(&|_| false);
+    w.forget_done(&|_| false, Instant::now());
     assert!(w.next_request(false, Instant::now()).is_none());
 }
 
@@ -3381,11 +3381,38 @@ fn an_order_that_cannot_be_stored_is_said_and_is_no_longer_pending() {
 
 // Read position ----------------------------------------------------------------------------------
 
+/// The `n`th message of the room (1 to 100), oldest first. Real messages: the slot's own copy of
+/// the room must hold the message a marker names, or the marker is not written as asked.
+fn message_n(n: i64) -> river_core::room_state::message::AuthorizedMessageV1 {
+    use river_core::room_state::member::MemberId;
+    use river_core::room_state::message::{AuthorizedMessageV1, MessageV1, RoomMessageBody};
+    let key = SigningKey::from_bytes(&[9; 32]);
+    AuthorizedMessageV1::new(
+        MessageV1 {
+            room_owner: MemberId::from(&SigningKey::from_bytes(&[1; 32]).verifying_key()),
+            author: MemberId::from(&key.verifying_key()),
+            time: (SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000 + n as u64))
+                .into(),
+            content: RoomMessageBody::public(format!("m{n}")),
+        },
+        &key,
+    )
+}
+
 fn place(n: i64) -> MessageOrderKey {
-    MessageOrderKey {
-        time: (SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000 + n as u64)).into(),
-        id: river_core::room_state::message::MessageId(freenet_scaffold::util::FastHash(n)),
-    }
+    message_n(n).order_key()
+}
+
+/// Room 1's slot as the web UI stores it, holding the first `stored` messages of [`message_n`].
+fn room_with_messages(stored: i64) -> (VerifyingKey, Vec<u8>) {
+    let mut plan =
+        crate::rooms::create::new_room(SigningKey::from_bytes(&[1; 32]), "Book club", "Ada", false)
+            .unwrap();
+    plan.room.room_state.recent_messages.messages = (1..=stored).map(message_n).collect();
+    (
+        plan.room.owner_vk,
+        river_core::stored_rooms::encode_new_room(&plan.room).unwrap(),
+    )
 }
 
 /// The slot of room 1 as the web UI stores it, and what a marker write of it reads back as.
@@ -3412,11 +3439,11 @@ fn write_marker(w: &mut Work, key: &[u8], slot: &[u8], generation: u64) -> Vec<u
 
 #[test]
 fn a_read_marker_is_stored_in_the_rooms_slot_by_read_then_cas_without_holding_the_room() {
-    let (owner, slot) = present_room(1);
+    let (owner, slot) = room_with_messages(100);
     let key = room_storage_key(&owner);
     let mut w = Work::default();
     let t0 = Instant::now();
-    w.mark_read(owner, place(5), vec![place(5)], t0);
+    w.mark_read(owner, place(5), vec![place(5)], None, t0);
     assert!(w.busy() || w.next_request(false, t0).is_some());
     // Never a row, and the room stays open to everything else.
     assert!(w.views().is_empty());
@@ -3441,27 +3468,28 @@ fn expect_read_after_start(w: &mut Work, key: &[u8], slot: &[u8]) {
 
 #[test]
 fn read_marker_writes_are_bounded_one_per_interval_and_never_backwards() {
-    let (owner, slot) = present_room(1);
+    let (owner, slot) = room_with_messages(100);
     let key = room_storage_key(&owner);
     let mut w = Work::default();
     let t0 = Instant::now();
     // The first goes out at once.
-    w.mark_read(owner, place(1), vec![place(1)], t0);
+    w.mark_read(owner, place(1), vec![place(1)], None, t0);
     let first = write_marker(&mut w, &key, &slot, 3);
     assert_eq!(marker_of(&first), Some(place(1).id));
-    w.forget_done(&|_| false);
+    w.forget_done(&|_| false, Instant::now());
 
     // A hundred more marks within the interval (messages arriving in a room being read, then an
     // older one reported late) cause no request at all.
     for i in 2..=100 {
         let at = t0 + std::time::Duration::from_millis(50 * i as u64);
-        w.mark_read(owner, place(i), (1..=i).map(place).collect(), at);
+        w.mark_read(owner, place(i), (1..=i).map(place).collect(), None, at);
         assert!(w.next_request(false, at).is_none(), "mark {i} waits");
     }
     w.mark_read(
         owner,
         place(7),
         vec![place(7)],
+        None,
         t0 + std::time::Duration::from_secs(6),
     );
     assert!(
@@ -3497,11 +3525,11 @@ fn read_marker_writes_are_bounded_one_per_interval_and_never_backwards() {
 
 /// A marker write that lost the compare-and-swap: the slot the web UI stored instead, read again.
 fn marker_conflict(web_marker: i64) -> (Work, Vec<u8>, Option<Vec<u8>>) {
-    let (owner, slot) = present_room(1);
+    let (owner, slot) = room_with_messages(100);
     let key = room_storage_key(&owner);
     let mut w = Work::default();
     let t0 = Instant::now();
-    w.mark_read(owner, place(5), vec![place(2), place(5)], t0);
+    w.mark_read(owner, place(5), vec![place(2), place(5)], None, t0);
     w.next_request(false, t0).expect("a read");
     assert!(w.on_delegate(&read_answer(&key, Some(slot.clone()), 3)));
     let _ = expect_store(&mut w, &key, 3);
@@ -3517,6 +3545,7 @@ fn marker_conflict(web_marker: i64) -> (Work, Vec<u8>, Option<Vec<u8>>) {
         Some(&slot),
         &place(web_marker),
         &[place(2), place(5)],
+        None,
     )
     .unwrap()
     .unwrap();
@@ -3545,11 +3574,80 @@ fn a_read_marker_conflict_stores_nothing_when_the_web_ui_wrote_one_as_far_or_fur
 
 #[test]
 fn a_marker_held_for_a_room_that_is_left_is_dropped() {
-    let (owner, _) = present_room(1);
+    let (owner, _) = room_with_messages(100);
     let mut w = Work::default();
     let t0 = Instant::now();
-    w.mark_read(owner, place(1), vec![place(1)], t0);
+    w.mark_read(owner, place(1), vec![place(1)], None, t0);
     assert!(w.read_held(&owner));
     assert!(w.leave(owner, "Book club".into(), None));
+    assert!(!w.read_held(&owner));
+}
+
+#[test]
+fn a_read_marker_that_could_not_be_stored_is_held_again_and_tried_after_the_interval() {
+    let (owner, slot) = room_with_messages(100);
+    let key = room_storage_key(&owner);
+    let mut w = Work::default();
+    let t0 = Instant::now();
+    w.mark_read(owner, place(5), vec![place(5)], None, t0);
+    expect_read(&mut w, &key);
+    assert!(w.on_delegate(&read_answer(&key, Some(slot.clone()), 3)));
+    let _ = expect_store(&mut w, &key, 3);
+    // The store refuses.
+    assert!(w.on_delegate(&store_answer(
+        &key,
+        CasStoreResult::Failed("disk full".into())
+    )));
+    let now = Instant::now();
+    w.forget_done(&|_| false, now);
+    assert!(w.read_held(&owner), "kept for another try");
+    assert!(
+        w.next_request(false, now).is_none(),
+        "not at once: no tight loop"
+    );
+    assert!(w.views().is_empty(), "still no row");
+    // After the interval it goes out again, and this time it is stored.
+    let later = now + READ_WRITE_INTERVAL;
+    w.next_request(false, later).expect("tried again");
+    assert!(w.on_delegate(&read_answer(&key, Some(slot), 3)));
+    let value = expect_store(&mut w, &key, 3);
+    assert_eq!(marker_of(&value), Some(place(5).id));
+}
+
+#[test]
+fn a_failed_read_marker_gives_way_to_a_further_one_held_meanwhile() {
+    let (owner, slot) = room_with_messages(100);
+    let key = room_storage_key(&owner);
+    let mut w = Work::default();
+    let t0 = Instant::now();
+    w.mark_read(owner, place(5), vec![place(5)], None, t0);
+    expect_read(&mut w, &key);
+    assert!(w.on_delegate(&read_answer(&key, Some(slot), 3)));
+    let _ = expect_store(&mut w, &key, 3);
+    assert!(w.on_delegate(&store_answer(&key, CasStoreResult::Failed("x".into()))));
+    // A later message was read while the write ran.
+    w.mark_read(owner, place(9), vec![place(9)], None, t0);
+    w.forget_done(&|_| false, Instant::now());
+    let held = w.held_reads.get(&owner).expect("held");
+    assert_eq!(held.mark, place(9), "the further one is kept");
+}
+
+#[test]
+fn held_read_markers_are_released_at_once_when_the_window_goes_away() {
+    let (owner, slot) = room_with_messages(100);
+    let key = room_storage_key(&owner);
+    let mut w = Work::default();
+    let t0 = Instant::now();
+    w.mark_read(owner, place(1), vec![place(1)], None, t0);
+    let first = write_marker(&mut w, &key, &slot, 3);
+    assert_eq!(marker_of(&first), Some(place(1).id));
+    w.forget_done(&|_| false, Instant::now());
+    // The next one is held for the rest of the interval.
+    let now = Instant::now();
+    w.mark_read(owner, place(4), vec![place(4)], None, now);
+    assert!(w.next_request(false, now).is_none(), "held");
+    // The window goes away: it is due now.
+    w.release_all_reads(now);
+    w.next_request(false, now).expect("written at once");
     assert!(!w.read_held(&owner));
 }

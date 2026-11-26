@@ -530,6 +530,8 @@ fn node_chat() -> RiverApp {
 
 fn node_rooms(edit: impl FnOnce(&mut Vec<super::Room>)) -> Runtime<RiverApp> {
     let mut s = node_chat();
+    // A window the shell has reported in front, as most tests mean.
+    s.chat.set_window_front(true);
     let mut rooms = super::example::data().rooms;
     edit(&mut rooms);
     s.chat
@@ -6751,6 +6753,42 @@ fn the_room_menu_moves_a_room_up_or_down_and_sends_where_to() {
     assert_eq!(rt.state.chat.can_move(&before[0]), (false, true));
 }
 
+/// The room menu's two items as drawn: whether each can be reached (a disabled item cannot).
+fn menu_items_reachable(rt: &Runtime<RiverApp>) -> (bool, bool) {
+    let reachable = |key: &str| {
+        rt.elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some(key))
+            .unwrap_or_else(|| panic!("no element {key}"))
+            .focusable
+    };
+    (reachable("room-menu-item0"), reachable("room-menu-item1"))
+}
+
+#[test]
+fn the_drawn_menu_disables_move_up_on_the_first_room_and_move_down_on_the_last() {
+    let mut rt = node_rooms(|_| {});
+    let keys = keys_in_order(&rt);
+    open_room_menu(&mut rt, &keys[0]);
+    assert_eq!(menu_items_reachable(&rt), (false, true), "first room");
+    open_room_menu(&mut rt, &keys[1]);
+    assert_eq!(menu_items_reachable(&rt), (true, true), "a room between");
+    open_room_menu(&mut rt, keys.last().unwrap());
+    assert_eq!(menu_items_reachable(&rt), (true, false), "last room");
+}
+
+#[test]
+fn the_menu_items_name_their_room_for_a_screen_reader() {
+    let mut rt = node_rooms(|_| {});
+    let room = rt.state.chat.rooms()[1].clone();
+    open_room_menu(&mut rt, &room.key);
+    let tree = rt.accessibility_json().to_string();
+    let named = tree
+        .matches(&format!("\"description\":\"{}\"", room.name))
+        .count();
+    assert!(named >= 2, "both items name {}: {tree}", room.name);
+}
+
 #[test]
 fn moving_a_room_down_to_the_end_names_no_room() {
     let mut rt = node_rooms(|_| {});
@@ -6824,6 +6862,36 @@ fn the_open_room_is_reported_read_up_to_its_newest_message_once() {
 }
 
 #[test]
+fn nothing_is_reported_read_before_the_window_has_reported_focus() {
+    // Started at login there is no window, so no focus event ever arrives: whatever arrives in
+    // the open room is not read.
+    let mut s = node_chat();
+    s.chat.show_node_rooms(
+        super::example::data().rooms,
+        None,
+        super::LinkStatus::Live,
+        29_000_000,
+    );
+    let mut rt = render(s, WINDOW_SIZE);
+    assert!(read_reports(&mut rt).is_empty(), "opening the room");
+    let mut rooms = rt.state.chat.rooms().to_vec();
+    let open = rt.state.chat.room().unwrap().key.clone();
+    let room = rooms.iter_mut().find(|r| r.key == open).unwrap();
+    let mut next = room.messages.last().unwrap().clone();
+    next.key = "555".into();
+    next.pending = None;
+    room.messages.push(next);
+    rt.update(move |s, _| {
+        s.chat
+            .show_node_rooms(rooms, None, super::LinkStatus::Live, 29_000_001);
+    });
+    assert!(read_reports(&mut rt).is_empty(), "an arrival");
+    // The window opens and is focused: now it is read.
+    rt.update(|s, _| s.focus_changed(true));
+    assert_eq!(read_reports(&mut rt), ["555".to_owned()]);
+}
+
+#[test]
 fn nothing_is_reported_read_while_the_newest_message_is_not_on_screen() {
     let mut rt = node_rooms(|_| {});
     read_reports(&mut rt);
@@ -6849,6 +6917,24 @@ fn nothing_is_reported_read_while_the_newest_message_is_not_on_screen() {
     // Back in front with the newest message on screen: read.
     rt.update(|s, _| s.chat.set_window_front(true));
     assert_eq!(read_reports(&mut rt), ["777".to_owned()]);
+}
+
+#[test]
+fn the_window_going_away_asks_for_held_read_positions_to_be_stored() {
+    let mut rt = node_rooms(|_| {});
+    read_reports(&mut rt);
+    let flushes = |rt: &mut Runtime<RiverApp>| {
+        std::mem::take(&mut rt.state.chat.reported)
+            .into_iter()
+            .filter(|c| matches!(c.action, Action::FlushReads))
+            .count()
+    };
+    rt.update(|s, _| s.chat.set_window_front(false));
+    assert_eq!(flushes(&mut rt), 1, "away");
+    rt.update(|s, _| s.chat.set_window_front(false));
+    assert_eq!(flushes(&mut rt), 0, "already away");
+    rt.update(|s, _| s.chat.set_window_front(true));
+    assert_eq!(flushes(&mut rt), 0, "coming back asks for nothing");
 }
 
 #[test]

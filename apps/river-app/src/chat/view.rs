@@ -158,6 +158,13 @@ fn room_menu(chat: &Chat, k: &Kit, layer: &mut Vec<El>) -> El {
         None => (String::new(), None),
     };
     let (can_up, can_down) = chat.can_move(&key);
+    // Each item names its room, so the target is said as well as the move.
+    let name = chat
+        .rooms()
+        .iter()
+        .find(|r| r.key == key)
+        .map(|r| r.name.clone())
+        .unwrap_or_default();
     let (up_key, down_key) = (key.clone(), key);
     rune_kit::context_menu(
         "room-menu",
@@ -166,11 +173,13 @@ fn room_menu(chat: &Chat, k: &Kit, layer: &mut Vec<El>) -> El {
     )
     .item(
         rune_kit::MenuItem::new("Move up")
+            .description(name.clone())
             .disabled(!can_up)
             .on_select(move |s: &mut RiverApp| s.chat.move_room(&up_key, -1)),
     )
     .item(
         rune_kit::MenuItem::new("Move down")
+            .description(name)
             .disabled(!can_down)
             .on_select(move |s: &mut RiverApp| s.chat.move_room(&down_key, 1)),
     )

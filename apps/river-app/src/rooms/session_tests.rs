@@ -11283,16 +11283,24 @@ fn a_move_is_shown_at_once_stored_beside_the_web_uis_order_and_kept_over_an_olde
     rooms.replace(stale);
     assert_eq!(order(&rooms), vec![c.vk(), a.vk(), b.vk()]);
 
-    // To the end; a move that changes nothing, or names a room not shown, queues nothing new.
+    // To the end. A move that changes nothing, or names a room not shown, queues nothing new,
+    // and says so (true): the screen already moved the room and is told the list as it is.
     assert!(rooms.list_command(&key_of(&c), Action::MoveRoom { before: None }));
     assert_eq!(order(&rooms), vec![a.vk(), b.vk(), c.vk()]);
-    assert!(!rooms.list_command(&key_of(&c), Action::MoveRoom { before: None }));
-    assert!(!rooms.list_command(
+    let queued = rooms.outbox.work.pending_order();
+    assert!(rooms.list_command(&key_of(&c), Action::MoveRoom { before: None }));
+    assert!(rooms.list_command(
         &key_of(&a),
         Action::MoveRoom {
             before: Some(key_of(&TestRoom::new(9, "Z", 1, &[]))),
         }
     ));
+    assert!(rooms.list_command(
+        &key_of(&TestRoom::new(9, "Z", 1, &[])),
+        Action::MoveRoom { before: None }
+    ));
+    assert_eq!(order(&rooms), vec![a.vk(), b.vk(), c.vk()]);
+    assert_eq!(rooms.outbox.work.pending_order(), queued);
 }
 
 #[test]

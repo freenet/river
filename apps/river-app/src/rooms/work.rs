@@ -264,12 +264,15 @@ enum Kind {
         order: Vec<VerifyingKey>,
     },
     /// Move `room`'s read marker to `mark` in its slot (the one step, `Slot`), never backwards
-    /// ([`super::read`]). `known` are the places of the room's messages as this app holds them.
-    /// Holds no room and is never shown: a marker that could not be stored is not worth a row.
+    /// ([`super::read`]). `known` are the places of the room's messages as this app holds them,
+    /// and `state` its copy of the room, merged into the slot's when the marker is not in the
+    /// slot's copy. Holds no room and is never shown: a marker that could not be stored is not
+    /// worth a row (it is held again, [`Work::forget_done`]).
     Read {
         room: VerifyingKey,
         mark: MessageOrderKey,
         known: Known,
+        state: Option<Box<ChatRoomStateV1>>,
     },
     /// Leave `room` (named `name` on the screen): tombstone its key (the step `Slot`), then take
     /// it out of `rooms_meta` (`Meta`), as the web UI's leave does ([`super::leave`]).
@@ -820,8 +823,11 @@ impl Task {
                 )
             });
         }
-        if let Kind::Read { mark, known, .. } = &self.kind {
-            return slot_with_marker(value, mark, known).map_err(|e| {
+        if let Kind::Read {
+            mark, known, state, ..
+        } = &self.kind
+        {
+            return slot_with_marker(value, mark, known, state.as_deref()).map_err(|e| {
                 format!(
                     "The read position was not saved: the room in River's storage can't be \
                      read by this app ({e}), so it stays as it was."
@@ -924,6 +930,7 @@ pub const READ_WRITE_INTERVAL: Duration = Duration::from_secs(10);
 struct HeldRead {
     mark: MessageOrderKey,
     known: Known,
+    state: Option<Box<ChatRoomStateV1>>,
     due: Instant,
 }
 
@@ -1336,6 +1343,7 @@ impl Work {
         room: VerifyingKey,
         mark: MessageOrderKey,
         known: Known,
+        state: Option<Box<ChatRoomStateV1>>,
         now: Instant,
     ) {
         match self.held_reads.get_mut(&room) {
@@ -1343,6 +1351,7 @@ impl Work {
                 if mark > held.mark {
                     held.mark = mark;
                     held.known = known;
+                    held.state = state;
                 }
             }
             None => {
@@ -1350,7 +1359,15 @@ impl Work {
                     .last_read_write
                     .get(&room)
                     .map_or(now, |at| (*at + READ_WRITE_INTERVAL).max(now));
-                self.held_reads.insert(room, HeldRead { mark, known, due });
+                self.held_reads.insert(
+                    room,
+                    HeldRead {
+                        mark,
+                        known,
+                        state,
+                        due,
+                    },
+                );
             }
         }
     }
@@ -1364,14 +1381,33 @@ impl Work {
             .map(|(room, _)| *room)
             .collect();
         for room in due {
-            let Some(HeldRead { mark, known, .. }) = self.held_reads.remove(&room) else {
+            let Some(HeldRead {
+                mark, known, state, ..
+            }) = self.held_reads.remove(&room)
+            else {
                 continue;
             };
             self.last_read_write.insert(room, now);
-            self.push(Kind::Read { room, mark, known }, Step::Slot);
+            self.push(
+                Kind::Read {
+                    room,
+                    mark,
+                    known,
+                    state,
+                },
+                Step::Slot,
+            );
             if let Some(t) = self.tasks.back_mut() {
                 t.reload_asked = true;
             }
+        }
+    }
+
+    /// Make every held read marker due now, not after the interval: the window went away, and
+    /// what is held only lives here (the next [`Work::next_request`] starts the writes).
+    pub fn release_all_reads(&mut self, now: Instant) {
+        for held in self.held_reads.values_mut() {
+            held.due = now;
         }
     }
 
@@ -2349,8 +2385,55 @@ impl Work {
     }
 
     /// Drop finished tasks whose room is shown.
-    pub fn forget_done(&mut self, shown: &dyn Fn(&VerifyingKey) -> bool) {
-        // A read marker that ended, stored or not, is forgotten: the next one carries its own.
+    pub fn forget_done(&mut self, shown: &dyn Fn(&VerifyingKey) -> bool, now: Instant) {
+        // A read marker that ended is forgotten, but one that was not stored is held again, to be
+        // tried after the usual interval: in a quiet room no later marker would carry it.
+        let mut again = Vec::new();
+        for mut t in std::mem::take(&mut self.tasks) {
+            if t.is_read() && !t.running() {
+                if matches!(t.failed, Some((_, true))) {
+                    // `Task` has a destructor, so its kind is swapped out, not moved.
+                    again.push(std::mem::replace(
+                        &mut t.kind,
+                        Kind::Order { order: Vec::new() },
+                    ));
+                }
+            } else {
+                self.tasks.push_back(t);
+            }
+        }
+        for kind in again {
+            if let Kind::Read {
+                room,
+                mark,
+                known,
+                state,
+            } = kind
+                && !self.leaving(&room)
+            {
+                match self.held_reads.get_mut(&room) {
+                    // A later marker is already waiting: it is further on, and carries its own.
+                    Some(held) if held.mark >= mark => {}
+                    Some(held) => {
+                        held.mark = mark;
+                        held.known = known;
+                        held.state = state;
+                    }
+                    None => {
+                        let due = now + READ_WRITE_INTERVAL;
+                        self.held_reads.insert(
+                            room,
+                            HeldRead {
+                                mark,
+                                known,
+                                state,
+                                due,
+                            },
+                        );
+                    }
+                }
+            }
+        }
         self.tasks.retain(|t| !(t.is_read() && !t.running()));
         self.tasks.retain(|t| {
             !(t.step == Step::Done

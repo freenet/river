@@ -84,7 +84,7 @@ fn field(bytes: &[u8], name: &str) -> Option<Value> {
 fn a_marker_moves_forward_and_only_it_changes() {
     let ms = messages();
     let before = slot(&ms, Some(&ms[1]));
-    let after = slot_with_marker(Some(&before), &ms[3].order_key(), &keys(&ms))
+    let after = slot_with_marker(Some(&before), &ms[3].order_key(), &keys(&ms), None)
         .unwrap()
         .expect("a change is written");
     assert_eq!(marker(&after), Some(ms[3].id()));
@@ -114,7 +114,7 @@ fn a_marker_moves_forward_and_only_it_changes() {
 fn a_slot_with_no_marker_gets_one() {
     let ms = messages();
     let before = slot(&ms, None);
-    let after = slot_with_marker(Some(&before), &ms[0].order_key(), &keys(&ms))
+    let after = slot_with_marker(Some(&before), &ms[0].order_key(), &keys(&ms), None)
         .unwrap()
         .unwrap();
     assert_eq!(marker(&after), Some(ms[0].id()));
@@ -126,11 +126,11 @@ fn a_marker_never_moves_back_or_is_written_twice() {
     let before = slot(&ms, Some(&ms[2]));
     // Behind, or the same one: nothing to store.
     assert_eq!(
-        slot_with_marker(Some(&before), &ms[1].order_key(), &keys(&ms)),
+        slot_with_marker(Some(&before), &ms[1].order_key(), &keys(&ms), None),
         Ok(None)
     );
     assert_eq!(
-        slot_with_marker(Some(&before), &ms[2].order_key(), &keys(&ms)),
+        slot_with_marker(Some(&before), &ms[2].order_key(), &keys(&ms), None),
         Ok(None)
     );
 }
@@ -142,7 +142,7 @@ fn a_marker_the_web_ui_stored_past_what_this_app_holds_is_not_moved_back() {
     let ms = messages();
     let before = slot(&ms, Some(&ms[3]));
     assert_eq!(
-        slot_with_marker(Some(&before), &ms[2].order_key(), &keys(&ms[..3])),
+        slot_with_marker(Some(&before), &ms[2].order_key(), &keys(&ms[..3]), None),
         Ok(None),
         "found in the slot's own copy, and further"
     );
@@ -154,7 +154,7 @@ fn a_stored_marker_found_nowhere_loses_to_one_that_is() {
     let ms = messages();
     let gone = message("gone", 5000);
     let before = slot(&ms, Some(&gone));
-    let after = slot_with_marker(Some(&before), &ms[1].order_key(), &keys(&ms))
+    let after = slot_with_marker(Some(&before), &ms[1].order_key(), &keys(&ms), None)
         .unwrap()
         .expect("written");
     assert_eq!(marker(&after), Some(ms[1].id()));
@@ -164,13 +164,13 @@ fn a_stored_marker_found_nowhere_loses_to_one_that_is() {
 fn a_room_that_is_not_stored_or_was_left_is_not_written() {
     let ms = messages();
     assert_eq!(
-        slot_with_marker(None, &ms[0].order_key(), &keys(&ms)),
+        slot_with_marker(None, &ms[0].order_key(), &keys(&ms), None),
         Ok(None)
     );
     let mut tomb = Vec::new();
     ciborium::ser::into_writer(&"Tombstone", &mut tomb).unwrap();
     assert_eq!(
-        slot_with_marker(Some(&tomb), &ms[0].order_key(), &keys(&ms)),
+        slot_with_marker(Some(&tomb), &ms[0].order_key(), &keys(&ms), None),
         Ok(None)
     );
 }
@@ -178,7 +178,7 @@ fn a_room_that_is_not_stored_or_was_left_is_not_written() {
 #[test]
 fn a_slot_this_app_cannot_read_is_an_error_and_left_alone() {
     let ms = messages();
-    assert!(slot_with_marker(Some(b"\xff\xff"), &ms[0].order_key(), &keys(&ms)).is_err());
+    assert!(slot_with_marker(Some(b"\xff\xff"), &ms[0].order_key(), &keys(&ms), None).is_err());
 }
 
 #[test]
@@ -195,4 +195,66 @@ fn further_means_later_in_the_room_and_found() {
     assert!(is_further(&id(0), Some(&gone), &k, &[]));
     assert!(!is_further(&gone, Some(&id(0)), &k, &[]));
     assert!(!is_further(&gone, Some(&gone), &k, &[]));
+}
+
+/// The web UI's count of unread messages after the marker (`unread_candidate_messages` in
+/// `ui/src/components/app/document_title.rs`): from the message after the marker in the slot's
+/// own copy of the room, or all of them when the marker is not in it.
+fn web_unread(bytes: &[u8]) -> usize {
+    let Ok(StoredRoomSlot::Present(r)) = decode_room_slot(bytes) else {
+        panic!("present");
+    };
+    let recent = &r.room_state.recent_messages.messages;
+    let start = match r.last_read_message_id.as_ref() {
+        None => 0,
+        Some(id) => recent
+            .iter()
+            .position(|m| &m.id() == id)
+            .map_or(0, |i| i + 1),
+    };
+    recent[start..].len()
+}
+
+#[test]
+fn a_marker_newer_than_the_slots_copy_of_the_room_is_stored_with_the_message_it_names() {
+    // The web UI stored the first two messages; this app read all four.
+    let ms = messages();
+    let before = slot(&ms[..2], Some(&ms[0]));
+    let mut native = new_room(owner(), "Book club", "Ada", false)
+        .unwrap()
+        .room
+        .room_state;
+    native.recent_messages.messages = ms.clone();
+    let after = slot_with_marker(Some(&before), &ms[3].order_key(), &keys(&ms), Some(&native))
+        .unwrap()
+        .expect("written");
+    assert_eq!(marker(&after), Some(ms[3].id()));
+    assert_eq!(
+        web_unread(&after),
+        0,
+        "the web UI finds the marker and counts nothing after the newest message"
+    );
+    // Without the merge the web UI would have counted every message.
+    let bare = slot_with_marker(Some(&before), &ms[3].order_key(), &keys(&ms), None);
+    let bare = bare
+        .unwrap()
+        .expect("a marker the slot holds is still moved");
+    assert_eq!(marker(&bare), Some(ms[1].id()));
+    assert_eq!(web_unread(&bare), 0, "never worse than before");
+    assert_eq!(web_unread(&before), 1);
+    // The rest of the slot is untouched.
+    assert_eq!(field(&after, "from_the_future"), Some(Value::from(7u32)));
+    assert_eq!(field(&after, "owner_vk"), field(&before, "owner_vk"));
+}
+
+#[test]
+fn a_marker_the_slot_cannot_locate_and_no_merge_can_place_writes_nothing() {
+    // None of what this app holds is in the slot's copy, and the marker is not either.
+    let ms = messages();
+    let before = slot(&ms[..1], None);
+    let later = &ms[2..];
+    assert_eq!(
+        slot_with_marker(Some(&before), &later[1].order_key(), &keys(later), None),
+        Ok(None)
+    );
 }

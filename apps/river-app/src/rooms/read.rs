@@ -12,6 +12,21 @@
 //! does: only `last_read_message_id` changes, and every other field of the slot, known or not,
 //! stays as the web UI wrote it. It runs inside the compare-and-swap loop of [`super::work`].
 //!
+//! **A marker the web UI can find.** The web UI counts unread messages after the marker in the
+//! slot's own copy of the room, and counts everything as unread when the marker is not in it. A
+//! message this app has read is often newer than that copy, which the web UI wrote. So when the
+//! marker is not in the slot's copy, this app's copy of the room is merged into it (with the
+//! room's own merge, [`ChatRoomStateV1::merge_from`]) in the same edit, and the marker then
+//! names a message the slot holds. If that merge is refused, or leaves the message out, the
+//! marker written is the furthest message this app holds that the slot's copy also holds, or none
+//! when there is none: a write never makes the web UI count more unread than before. The cost is
+//! that the slot's copy of the room grows to this app's, which the web UI would merge anyway.
+//!
+//! Residual: a web tab that has not yet received the message (its live state is behind) can
+//! still hold an older marker for a moment, and a read position held back for pacing is lost if
+//! the app quits within the interval after the window was last in front (the window going away
+//! or into the tray writes it at once, so only an abrupt quit loses it).
+//!
 //! **Never backwards.** The web UI merges two copies' markers with `furthest_read_marker`: the one
 //! further along in the room's messages wins, and one that is not in the messages (evicted) loses to
 //! one that is. Here the same rule is applied against what the store holds, so a marker the
@@ -21,6 +36,7 @@
 
 use ciborium::Value;
 use river_core::room_state::message::{MessageId, MessageOrderKey};
+use river_core::room_state::{ChatRoomParametersV1, ChatRoomStateV1};
 use river_core::stored_rooms::{StoredRoomSlot, decode_room_slot};
 
 /// The field of the slot that holds the marker.
@@ -61,11 +77,13 @@ pub fn is_further(
 /// moved to `mark`, whose place in the room and the places of the messages around it are in
 /// `known`. `Ok(None)` when the slot already holds that marker or one further along, so nothing
 /// is written; the same when the room is not stored (gone, left, or a tombstone: there is nothing
-/// to mark). A slot this app can't read is an error, and left alone.
+/// to mark). A slot this app can't read is an error, and left alone. `state` is this app's copy of
+/// the room, merged into the slot's when the marker is not in the slot's copy.
 pub fn slot_with_marker(
     current: Option<&[u8]>,
     mark: &MessageOrderKey,
     known: &[MessageOrderKey],
+    state: Option<&ChatRoomStateV1>,
 ) -> Result<Option<Vec<u8>>, String> {
     let Some(bytes) = current.filter(|b| !b.is_empty()) else {
         return Ok(None);
@@ -87,6 +105,45 @@ pub fn slot_with_marker(
     {
         return Ok(None);
     }
+    // The marker must be one the web UI can find in the slot's own copy of the room, or it counts
+    // everything as unread (and its save may roll the marker back). A message the web UI has not
+    // stored yet is stored with it: the room's merge puts this app's copy of the room into the
+    // slot's, in this same edit.
+    let mut marker = mark.id.clone();
+    let mut merged_state = None;
+    if !own.iter().any(|k| k.id == mark.id) {
+        let merged = state.and_then(|state| {
+            let mut merged = stored.room_state.clone();
+            let params = ChatRoomParametersV1 {
+                owner: stored.owner_vk,
+            };
+            merged.merge_from(&params, state).ok()?;
+            merged
+                .recent_messages
+                .messages
+                .iter()
+                .any(|m| m.id() == mark.id)
+                .then_some(merged)
+        });
+        match merged {
+            Some(merged) => merged_state = Some(merged),
+            None => {
+                // Not mergeable: the furthest message this app holds that the slot's copy also
+                // holds, so a write never makes the web UI count more unread than it did.
+                let Some(best) = known
+                    .iter()
+                    .filter(|k| *k <= mark && own.iter().any(|o| o.id == k.id))
+                    .max()
+                else {
+                    return Ok(None);
+                };
+                if !is_further(&best.id, stored.last_read_message_id.as_ref(), known, &own) {
+                    return Ok(None);
+                }
+                marker = best.id.clone();
+            }
+        }
+    }
     let Ok(Value::Map(mut outer)) = ciborium::de::from_reader::<Value, _>(bytes) else {
         return Err("room slot: not a map".into());
     };
@@ -97,7 +154,17 @@ pub fn slot_with_marker(
     else {
         return Err("room slot: not a present room".into());
     };
-    let wanted = Value::serialized(&Some(&mark.id)).map_err(|e| format!("room slot: {e}"))?;
+    let wanted = Value::serialized(&Some(&marker)).map_err(|e| format!("room slot: {e}"))?;
+    if let Some(merged) = &merged_state {
+        let room = Value::serialized(merged).map_err(|e| format!("room slot: {e}"))?;
+        match fields
+            .iter_mut()
+            .find(|(k, _)| k.as_text() == Some("room_state"))
+        {
+            Some((_, v)) => *v = room,
+            None => return Err("room slot: no room state".into()),
+        }
+    }
     match fields
         .iter_mut()
         .find(|(k, _)| k.as_text() == Some(MARKER_FIELD))

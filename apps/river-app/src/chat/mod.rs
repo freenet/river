@@ -301,7 +301,9 @@ pub struct Chat {
     /// The room a right-click on the room list landed on, and where: its menu (Move up, Move
     /// down) is open there. Cleared when the menu closes.
     pub room_menu: Option<(String, rune::PointerPress)>,
-    /// Whether the window is in front (it is, until told otherwise): what the user is reading.
+    /// Whether the window is known to be in front: what the user is reading. False until the
+    /// shell reports a focus event, so a window that was never shown (started at login, in the
+    /// tray) does not mark what arrives as read.
     window_front: bool,
     /// The newest message (`Message::key`) reported read for each room, so each is reported once.
     read_sent: HashMap<String, String>,
@@ -560,8 +562,15 @@ impl Chat {
 
     /// The window came to the front or went away.
     pub fn set_window_front(&mut self, front: bool) {
-        self.window_front = front;
+        let was = std::mem::replace(&mut self.window_front, front);
         self.report_read();
+        // Away (or into the tray): what was held back for pacing is stored now.
+        if was && !front && matches!(self.source, Source::Node(_)) {
+            self.report(Command {
+                room: String::new(),
+                action: Action::FlushReads,
+            });
+        }
     }
 
     /// The open history now shows its newest message, or does not.
@@ -600,6 +609,11 @@ impl Chat {
             room: room_key,
             action: Action::MarkRead { up_to },
         };
+        self.report(command);
+    }
+
+    /// Hand a command that is not the user's doing to the sink, beside `outgoing`.
+    fn report(&mut self, command: Command) {
         match &self.sink {
             Some(sink) => sink(command),
             None => self.reported.push(command),
@@ -648,7 +662,7 @@ impl Chat {
             members_overlay: false,
             link_menu: None,
             room_menu: None,
-            window_front: true,
+            window_front: false,
             read_sent: HashMap::new(),
             reported: Vec::new(),
             emoji_open: false,

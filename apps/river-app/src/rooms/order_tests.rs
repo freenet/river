@@ -172,3 +172,12 @@ fn merging_places_a_stranger_next_to_the_neighbour_it_followed() {
     merge_room_order(&mut base, &[vk(1), vk(1)]);
     assert_eq!(base, vec![vk(1)]);
 }
+
+#[test]
+fn a_room_shown_twice_is_stored_once_at_its_first_place() {
+    let stored = cbor(&web_meta(&[vk(1), vk(2), vk(3)]));
+    let written = meta_with_order(Some(&stored), &[vk(2), vk(1), vk(2), vk(3), vk(1)])
+        .unwrap()
+        .unwrap();
+    assert_eq!(read_back(&written).room_order, vec![vk(2), vk(1), vk(3)]);
+}
