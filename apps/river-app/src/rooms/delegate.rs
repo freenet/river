@@ -211,6 +211,23 @@ pub fn answers(response: &HostResponse) -> Vec<ChatDelegateResponseMsg> {
         .collect()
 }
 
+/// The room contract's id worked out from its definition (`BLAKE3(BLAKE3(wasm) || params)`, with
+/// the params the CBOR of `ChatRoomParametersV1 { owner }`), apart from `create::contract_key`,
+/// so a test of the ask does not compare the function with itself.
+#[cfg(test)]
+pub(crate) fn independent_contract_id(owner: &VerifyingKey) -> [u8; 32] {
+    let mut params = Vec::new();
+    ciborium::ser::into_writer(
+        &river_core::room_state::ChatRoomParametersV1 { owner: *owner },
+        &mut params,
+    )
+    .unwrap();
+    let mut h = blake3::Hasher::new();
+    h.update(blake3::hash(super::create::ROOM_CONTRACT_WASM).as_bytes());
+    h.update(&params);
+    *h.finalize().as_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,12 +337,6 @@ mod tests {
         }
     }
 
-    /// The CBOR the web UI sends for these two requests, built the way `ui/src/signing.rs`
-    /// builds them (`StoreSigningKey { room_key, signing_key_bytes }` and
-    /// `GetPublicKey { room_key }`, then `ciborium::ser::into_writer` into an
-    /// `ApplicationMessage`, `enqueue_delegate_request_inner`), with the room named as
-    /// `create_room_modal.rs` names it. Pinned as literal bytes too, so a change to the shared
-    /// type that moves the encoding fails here, and decoded with the type the delegate decodes.
     /// The ask to follow a room is the shared type, naming the owner and the contract id of
     /// the room's contract key.
     #[test]
@@ -350,15 +361,18 @@ mod tests {
             } => {
                 assert_eq!(room_owner_vk, owner.to_bytes());
                 assert_eq!(request_id, 5);
-                assert_eq!(
-                    contract_id,
-                    *crate::rooms::create::contract_key(&owner).id().as_bytes()
-                );
+                assert_eq!(contract_id, independent_contract_id(&owner));
             }
             other => panic!("unexpected {other:?}"),
         }
     }
 
+    /// The CBOR the web UI sends for these two requests, built the way `ui/src/signing.rs`
+    /// builds them (`StoreSigningKey { room_key, signing_key_bytes }` and
+    /// `GetPublicKey { room_key }`, then `ciborium::ser::into_writer` into an
+    /// `ApplicationMessage`, `enqueue_delegate_request_inner`), with the room named as
+    /// `create_room_modal.rs` names it. Pinned as literal bytes too, so a change to the shared
+    /// type that moves the encoding fails here, and decoded with the type the delegate decodes.
     #[test]
     fn signing_key_requests_are_the_web_uis_bytes() {
         let sk = SigningKey::from_bytes(&[8u8; 32]);

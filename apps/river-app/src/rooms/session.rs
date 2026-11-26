@@ -1140,6 +1140,13 @@ fn follow_on(
             settled: last_read.elapsed() >= pace.key_delay,
             writes,
         };
+        // An ask to follow a room names this build's room contract: only once the watch has
+        // confirmed it is the current one (an unreachable pointer is not a confirmation).
+        rooms.keys.allow_ensure(
+            watching
+                .watch
+                .confirmed_current(super::generation::Artifact::RoomContract),
+        );
         if let Some(request) = rooms
             .keys
             .next_request(&rooms.list, gate.open(), Instant::now())
