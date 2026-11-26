@@ -32,7 +32,7 @@ pub(super) const NOT_YET: &str = "Not available yet";
 
 pub fn view(chat: &Chat, logo: Option<&Pixels>, cx: &mut Cx<RiverApp>) -> El {
     let p = st::palette();
-    let k = Kit::neutral(true);
+    let k = Kit::neutral(st::is_dark());
     let narrow = cx
         .layout_with("chat", |r| r[2] < NARROW_WIDTH)
         .unwrap_or(false);

@@ -1,5 +1,11 @@
-//! The chat screen's colours and type, taken from the web UI's dark theme
+//! The chat screen's colours and type, taken from the web UI's light and dark themes
 //! (`ui/assets/tailwind.css`) so the two look like one product.
+//!
+//! [`palette`] returns the colours of the theme the current frame is drawn in. The view sets
+//! that once at the top of each frame ([`set_dark`]) from the appearance setting and the
+//! system's appearance, so the ~30 call sites need no extra argument.
+
+use std::cell::Cell;
 
 use rune::tok::TextStyle;
 use rune::{Color, oklch};
@@ -51,7 +57,98 @@ fn hex(s: &str) -> Color {
     rune::color::hex(s).expect("a valid colour")
 }
 
+thread_local! {
+    /// The theme the frame being built is drawn in. The UI runs on one thread, and each test
+    /// thread builds its own frames, so a thread-local needs no locking and cannot leak a
+    /// theme between parallel tests.
+    static DARK: Cell<bool> = const { Cell::new(true) };
+}
+
+/// Draw the frames that follow in the dark theme (`true`) or the light one.
+pub fn set_dark(dark: bool) {
+    DARK.with(|d| d.set(dark));
+}
+
+/// Whether the frame being built is dark.
+pub fn is_dark() -> bool {
+    DARK.with(Cell::get)
+}
+
+/// The colours of the theme the current frame is drawn in.
 pub fn palette() -> Palette {
+    palette_for(is_dark())
+}
+
+/// The colours of the dark theme (`true`) or the light one.
+pub fn palette_for(dark_theme: bool) -> Palette {
+    if dark_theme { dark() } else { light() }
+}
+
+/// What the Appearance setting asks for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mode {
+    /// Follow the operating system.
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+/// The preference the mode is kept under.
+pub const MODE_PREF: &str = "appearance";
+
+impl Mode {
+    pub const ALL: [Mode; 3] = [Mode::System, Mode::Light, Mode::Dark];
+
+    /// Whether to draw dark, given whether the system is.
+    pub fn dark(self, system_dark: bool) -> bool {
+        match self {
+            Mode::System => system_dark,
+            Mode::Light => false,
+            Mode::Dark => true,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Mode::System => "system",
+            Mode::Light => "light",
+            Mode::Dark => "dark",
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Mode::System => "Same as system",
+            Mode::Light => "Light",
+            Mode::Dark => "Dark",
+        }
+    }
+
+    /// The stored value's mode; anything unrecognised means [`Mode::System`].
+    pub fn from_name(s: &str) -> Mode {
+        Mode::ALL
+            .into_iter()
+            .find(|m| m.name() == s)
+            .unwrap_or_default()
+    }
+}
+
+/// `fg` at opacity `a` over `bg`: what the web UI's `color-mix(in srgb, fg a%, bg)` gives. The
+/// mix is in the gamma-encoded sRGB the web mixes in, not in the linear light colours are held in.
+fn over(fg: Color, a: f32, bg: Color) -> Color {
+    use rune::color::{srgb_decode, srgb_encode};
+    let mix = |f: f32, b: f32| srgb_decode(srgb_encode(f) * a + srgb_encode(b) * (1.0 - a));
+    Color {
+        r: mix(fg.r, bg.r),
+        g: mix(fg.g, bg.g),
+        b: mix(fg.b, bg.b),
+        a: 1.0,
+    }
+}
+
+/// The web UI's dark theme (`@media (prefers-color-scheme: dark)` in `tailwind.css`).
+fn dark() -> Palette {
     Palette {
         bg: hex("#141416"),
         rail: hex("#0f0f11"),
@@ -93,6 +190,69 @@ pub fn palette() -> Palette {
     }
 }
 
+/// The web UI's light theme (the `:root` block and `@theme` in `tailwind.css`). Each field
+/// takes the value of the web variable its dark value came from; the comments name it.
+fn light() -> Palette {
+    let panel = hex("#ffffff");
+    let rail = hex("#f4f4f6");
+    let surface = hex("#ebebeb");
+    // `--color-link` is the light `--color-accent`.
+    let link = oklch(0.50, 0.11, 262.0);
+    Palette {
+        // --color-panel
+        bg: panel,
+        // --color-rail
+        rail,
+        // --color-surface, --color-surface-hover
+        surface,
+        surface_hover: hex("#e8e8ea"),
+        // --color-row-hover: the surface at 40% over what the row sits on (here the rail).
+        row_hover: over(surface, 0.4, rail),
+        // --color-row-self and -self-hover: the link colour at 6% and 10% over the panel.
+        own_row: over(link, 0.06, panel),
+        own_row_hover: over(link, 0.10, panel),
+        // --color-border, --color-border-hover
+        line: hex("#e0e0e4"),
+        line_strong: hex("#d0d0d4"),
+        shadow: Color {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.18,
+        },
+        scrim: Color {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.35,
+        },
+        // --color-text, -text-secondary, -text-muted, -text-quote
+        text: hex("#1a1a1a"),
+        text_secondary: hex("#484850"),
+        text_muted: hex("#6b6b6b"),
+        quote: hex("#5c5c5c"),
+        // --color-link
+        accent: link,
+        // --color-accent-soft: the link colour at 9% over the panel.
+        accent_soft: over(link, 0.09, panel),
+        // The dark value is the accent at about 55% over the panel.
+        accent_line: over(link, 0.55, panel),
+        // --color-danger-text
+        danger: hex("#b42318"),
+        // --color-warning-text, -warning-bg, --color-warning
+        warning_text: hex("#8a5800"),
+        warning_bg: hex("#fefce8"),
+        warning: hex("#eab308"),
+        // --color-error-bg; --color-danger and -danger-hover
+        danger_bg: hex("#fef2f2"),
+        danger_fill: hex("#b42318"),
+        danger_fill_hover: hex("#912018"),
+        // --color-success, --color-error
+        success: hex("#22c55e"),
+        error: hex("#ef4444"),
+    }
+}
+
 pub const BRAND: TextStyle = TextStyle::new(18.0, 700.0).tracking(-0.18);
 pub const SECTION: TextStyle = TextStyle::new(12.0, 600.0);
 pub const ROOM: TextStyle = TextStyle::new(14.0, 500.0);
@@ -120,5 +280,10 @@ pub fn avatar_colors(id: u32) -> (Color, Color) {
     // Multiplying by 7 (coprime with 10) gives consecutive ids different hues.
     let hue = id.wrapping_mul(7) % 10;
     let h = hue as f32 * 36.0;
-    (oklch(0.42, 0.07, h), oklch(0.93, 0.045, h))
+    if is_dark() {
+        // The web UI's `--avatar-l`, `--avatar-c` and `--avatar-text-l` in each theme.
+        (oklch(0.42, 0.07, h), oklch(0.93, 0.045, h))
+    } else {
+        (oklch(0.90, 0.05, h), oklch(0.37, 0.045, h))
+    }
 }

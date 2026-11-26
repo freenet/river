@@ -98,6 +98,10 @@ messages and identity are not stored there.
 **Settings** is the gear in the room list header, or Ctrl+, (Cmd+, on a Mac). Press Ctrl+/ (Cmd+/)
 to see every keyboard shortcut.
 
+River follows your system's light or dark appearance and changes with it. **Settings > Appearance**
+can fix it to light or dark instead. **Settings > About** shows the River and Freenet versions, the
+source code address and the licence.
+
 ### Closing the window and quitting
 
 When the system has a tray, closing the window hides it and River keeps running, so notifications
@@ -217,4 +221,3 @@ The design rules, what the app writes to the node, and how Rune is updated are i
   have had much less use.
 - On Windows, a River started from PowerShell does not stop with Ctrl+C
   ([#966](https://github.com/freenet/river/issues/966)).
-- There is no light theme yet.

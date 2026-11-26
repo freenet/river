@@ -259,6 +259,11 @@ impl RiverApp {
                 .get(chat::zoom::PREF)
                 .unwrap_or(i64::from(chat::zoom::DEFAULT)),
         );
+        chat.load_theme(
+            &prefs
+                .get::<String>(chat::style::MODE_PREF)
+                .unwrap_or_default(),
+        );
         chat.node.choice = node;
         chat.node.notice = startup.notice;
         chat.node.problem = startup.problem;
@@ -541,6 +546,11 @@ impl RiverApp {
             && self.dnd_persist
         {
             save_pref(chat::zoom::PREF, &percent);
+        }
+        if let Some(mode) = self.chat.take_theme_dirty()
+            && self.dnd_persist
+        {
+            save_pref(chat::style::MODE_PREF, mode);
         }
         let d = &self.chat.dnd;
         // The switch on means the schedule changes nothing, so nothing to wake for.
@@ -1265,6 +1275,13 @@ fn diagnostics_scene(s: &mut RiverApp) {
     identity_scene(s, |c| {
         c.diagnostics = Some(chat::DiagnosticsUi::new(std::sync::Arc::new(PreviewLog)));
         c.settings.open_at(chat::settings::Section::Diagnostics)
+    });
+}
+
+fn about_scene(s: &mut RiverApp) {
+    identity_scene(s, |c| {
+        c.update.node_version = Some("0.2.160".into());
+        c.settings.open_at(chat::settings::Section::About)
     });
 }
 
@@ -2622,6 +2639,8 @@ pub const SCENES: &[Scene] = &[
         })
     }),
     ("chat-settings-diagnostics", diagnostics_scene),
+    ("chat-settings-about", about_scene),
+    ("chat-settings-about-narrow", about_scene),
     ("chat-settings-background", |s| background_scene(s, true)),
     ("chat-settings-background-narrow", |s| {
         background_scene(s, true)
@@ -3110,13 +3129,15 @@ pub fn app(make: impl FnOnce(AppHandle<RiverApp>) -> RiverApp + 'static) -> rune
 }
 
 pub fn view(s: &RiverApp, cx: &mut Cx<RiverApp>) -> El {
+    // The theme of this frame: the Appearance setting, or the system's when it says so.
+    chat::style::set_dark(s.chat.theme().dark(cx.system_dark()));
     chat::zoom::apply(&s.chat, cx, |cx| screen(s, cx))
 }
 
 fn screen(s: &RiverApp, cx: &mut Cx<RiverApp>) -> El {
-    // River is dark-only for now, like the chat screen; the setup screens match it.
+    // The setup screens use the chat screen's palette and theme.
     let palette = chat::style::palette();
-    let k = Kit::neutral(true);
+    let k = Kit::neutral(chat::style::is_dark());
     let logo = s.logo.as_ref().map(|l| l.image.pixels());
     let t = (&palette, logo);
     let node = &s.chat.node.choice;

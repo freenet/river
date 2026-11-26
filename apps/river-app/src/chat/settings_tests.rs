@@ -273,8 +273,10 @@ fn the_arrow_keys_choose_sections_and_move_the_keyboard_with_them() {
     key(&mut rt, Key::Down);
     assert_eq!(rt.state.chat.settings.section, Section::Appearance);
     key(&mut rt, Key::Down);
-    assert_eq!(rt.state.chat.settings.section, Section::Appearance);
-    for _ in 0..4 {
+    assert_eq!(rt.state.chat.settings.section, Section::About);
+    key(&mut rt, Key::Down);
+    assert_eq!(rt.state.chat.settings.section, Section::About);
+    for _ in 0..5 {
         key(&mut rt, Key::Up);
     }
     assert_eq!(rt.state.chat.settings.section, Section::Updates);
@@ -282,7 +284,7 @@ fn the_arrow_keys_choose_sections_and_move_the_keyboard_with_them() {
     key(&mut rt, Key::Up);
     assert_eq!(rt.state.chat.settings.section, Section::Updates);
     key(&mut rt, Key::End);
-    assert_eq!(rt.state.chat.settings.section, Section::Appearance);
+    assert_eq!(rt.state.chat.settings.section, Section::About);
     key(&mut rt, Key::Home);
     assert_eq!(rt.state.chat.settings.section, Section::Updates);
     assert!(is_open(&rt), "arrows never close it");
@@ -1138,6 +1140,8 @@ fn every_scene_of_these_sections_exists() {
         "chat-settings-appearance",
         "chat-settings-appearance-narrow",
         "chat-settings-diagnostics",
+        "chat-settings-about",
+        "chat-settings-about-narrow",
         "chat-dnd-on",
     ] {
         assert!(names.contains(&want), "{want}");
@@ -1487,4 +1491,202 @@ fn the_new_sections_are_listed_and_reachable_in_a_narrow_window() {
     press(&mut rt, "settings-back");
     press(&mut rt, "settings-section-identity");
     assert!(rt.find("settings-import-id").is_some());
+}
+
+// ---- Light and dark themes, and the About section ----
+
+fn render_in(state: RiverApp, system_dark: bool) -> Runtime<RiverApp> {
+    let env = Env {
+        system_dark,
+        scale: 1.0,
+    };
+    let mut rt = Runtime::new(state, view, WINDOW_SIZE, env);
+    rt.on_key = crate::spec().on_key;
+    rt.frame(0.0);
+    rt.frame(1.0 / 60.0);
+    rt
+}
+
+/// WCAG relative luminance: a `Color` holds linear light, which is what it is computed from.
+fn luminance(c: rune::Color) -> f32 {
+    c.luminance()
+}
+
+fn contrast(a: rune::Color, b: rune::Color) -> f32 {
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+#[test]
+fn the_light_and_dark_palettes_are_the_web_uis_values() {
+    use super::style::palette_for;
+    let (l, d) = (palette_for(false), palette_for(true));
+    assert_eq!(l.bg, rune::color::hex("#ffffff").unwrap());
+    assert_eq!(l.rail, rune::color::hex("#f4f4f6").unwrap());
+    assert_eq!(l.text, rune::color::hex("#1a1a1a").unwrap());
+    assert_eq!(l.warning_text, rune::color::hex("#8a5800").unwrap());
+    assert_eq!(d.bg, rune::color::hex("#141416").unwrap());
+    assert_eq!(d.text, rune::color::hex("#f0f0f2").unwrap());
+}
+
+#[test]
+fn text_is_readable_on_the_surfaces_it_sits_on_in_both_themes() {
+    use super::style::palette_for;
+    for dark in [false, true] {
+        let p = palette_for(dark);
+        let min = 4.5;
+        for (name, fg) in [
+            ("text", p.text),
+            ("text_secondary", p.text_secondary),
+            ("text_muted", p.text_muted),
+            ("quote", p.quote),
+            ("accent", p.accent),
+            ("danger", p.danger),
+            ("warning_text", p.warning_text),
+        ] {
+            for (surface, bg) in [("bg", p.bg), ("rail", p.rail), ("surface", p.surface)] {
+                let c = contrast(fg, bg);
+                // The web UI's own muted and secondary inks are 4.47:1 and 4.48:1 on the
+                // lifted surface (light and dark); everything else clears 4.5:1.
+                let min = if surface == "surface" { 4.4 } else { min };
+                assert!(c >= min, "dark={dark}: {name} on {surface} is {c:.2}:1");
+            }
+        }
+        for (name, fg, bg) in [
+            ("warning_text on warning_bg", p.warning_text, p.warning_bg),
+            ("danger on danger_bg", p.danger, p.danger_bg),
+            ("accent on accent_soft", p.accent, p.accent_soft),
+            ("accent on own_row", p.accent, p.own_row),
+        ] {
+            let c = contrast(fg, bg);
+            assert!(c >= min, "dark={dark}: {name} is {c:.2}:1");
+        }
+    }
+}
+
+#[test]
+fn the_appearance_mode_resolves_against_the_system() {
+    use super::style::Mode;
+    assert!(Mode::System.dark(true));
+    assert!(!Mode::System.dark(false));
+    assert!(!Mode::Light.dark(true));
+    assert!(Mode::Dark.dark(false));
+    assert_eq!(Mode::default(), Mode::System);
+    for m in Mode::ALL {
+        assert_eq!(Mode::from_name(m.name()), m);
+    }
+    assert_eq!(Mode::from_name("nonsense"), Mode::System);
+    assert_eq!(Mode::from_name(""), Mode::System);
+}
+
+#[test]
+fn the_screen_follows_the_systems_appearance() {
+    let want = |dark: bool| super::style::palette_for(dark).bg;
+    let light = render_in(connected(), false);
+    assert_eq!(find(&light, "chat").fill, want(false), "light system");
+    let dark = render_in(connected(), true);
+    assert_eq!(find(&dark, "chat").fill, want(true), "dark system");
+}
+
+#[test]
+fn the_screen_changes_theme_when_the_system_does() {
+    let mut rt = render_in(connected(), true);
+    assert_eq!(find(&rt, "chat").fill, super::style::palette_for(true).bg);
+    rt.set_system_dark(false);
+    settle(&mut rt);
+    assert_eq!(find(&rt, "chat").fill, super::style::palette_for(false).bg);
+    rt.set_system_dark(true);
+    settle(&mut rt);
+    assert_eq!(find(&rt, "chat").fill, super::style::palette_for(true).bg);
+}
+
+#[test]
+fn a_chosen_theme_overrides_the_system() {
+    use super::style::{Mode, palette_for};
+    let mut s = connected();
+    s.chat.load_theme("light");
+    let rt = render_in(s, true);
+    assert_eq!(find(&rt, "chat").fill, palette_for(false).bg);
+    let mut s = connected();
+    s.chat.load_theme("dark");
+    let rt = render_in(s, false);
+    assert_eq!(find(&rt, "chat").fill, palette_for(true).bg);
+    assert_eq!(Mode::from_name("light"), Mode::Light);
+}
+
+#[test]
+fn the_theme_buttons_set_and_save_the_choice() {
+    use super::style::Mode;
+    let mut s = connected();
+    s.chat.settings.open_at(Section::Appearance);
+    let mut rt = render_in(s, true);
+    assert_eq!(rt.state.chat.theme(), Mode::System, "system is the default");
+    assert_eq!(rt.state.chat.take_theme_dirty(), None);
+    press(&mut rt, "settings-theme-light");
+    assert_eq!(rt.state.chat.theme(), Mode::Light);
+    assert_eq!(
+        find(&rt, "chat").fill,
+        super::style::palette_for(false).bg,
+        "light on a dark system"
+    );
+    assert_eq!(rt.state.chat.take_theme_dirty(), Some("light"));
+    assert_eq!(rt.state.chat.take_theme_dirty(), None);
+    press(&mut rt, "settings-theme-system");
+    assert_eq!(rt.state.chat.take_theme_dirty(), Some("system"));
+    assert_eq!(find(&rt, "chat").fill, super::style::palette_for(true).bg);
+    press(&mut rt, "settings-theme-light");
+    // Choosing what is already chosen saves nothing.
+    rt.state.chat.take_theme_dirty();
+    press(&mut rt, "settings-theme-light");
+    assert_eq!(rt.state.chat.take_theme_dirty(), None);
+}
+
+#[test]
+fn the_dialog_is_light_on_a_light_system() {
+    let mut s = connected();
+    s.chat.settings.open_at(Section::Appearance);
+    let rt = render_in(s, false);
+    let p = super::style::palette_for(false);
+    assert_eq!(
+        find(&rt, "settings-theme-note").text_color,
+        Some(p.text_muted)
+    );
+}
+
+#[test]
+fn the_about_section_shows_the_versions_the_source_and_the_licence() {
+    let mut s = connected();
+    s.chat.update.node_version = Some("0.2.156".into());
+    s.chat.settings.open_at(Section::About);
+    let rt = render(s, WINDOW_SIZE);
+    assert_eq!(
+        find(&rt, "settings-about-version").text.as_deref(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+    assert_eq!(
+        find(&rt, "settings-about-node-version").text.as_deref(),
+        Some("0.2.156")
+    );
+    assert_eq!(
+        find(&rt, "settings-about-source-url").text.as_deref(),
+        Some("https://github.com/freenet/river")
+    );
+    assert!(super::settings::SOURCE_URL.starts_with("https://"));
+    assert_eq!(find(&rt, "settings-about-source").role, "button");
+    assert_eq!(
+        find(&rt, "settings-about-licence").text.as_deref(),
+        Some("LGPL-3.0-only")
+    );
+}
+
+#[test]
+fn the_about_section_says_when_there_is_no_node() {
+    let mut s = connected();
+    s.chat.update.node_version = None;
+    s.chat.settings.open_at(Section::About);
+    let rt = render(s, WINDOW_SIZE);
+    assert_eq!(
+        find(&rt, "settings-about-node-version").text.as_deref(),
+        Some("Not connected")
+    );
 }
