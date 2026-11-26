@@ -73,7 +73,7 @@ impl ShortHandle {
     }
 
     /// Bitcoin-alphabet base58 text (21 or 22 characters).
-    pub fn to_base58(&self) -> String {
+    pub fn to_base58(self) -> String {
         bs58::encode(self.0)
             .with_alphabet(bs58::Alphabet::BITCOIN)
             .into_string()

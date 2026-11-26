@@ -1264,7 +1264,10 @@ mod tests {
         let handle = ShortHandle::derive(key().as_bytes());
         let text = handle.to_base58();
         assert_eq!(parse_room_link(&text), Ok(RoomLink::Handle(handle)));
-        assert_eq!(parse_room_link(&format!(" {text}\n")), Ok(RoomLink::Handle(handle)));
+        assert_eq!(
+            parse_room_link(&format!(" {text}\n")),
+            Ok(RoomLink::Handle(handle))
+        );
         // A full key is still a key.
         assert_eq!(
             parse_room_link(&owner_key_b58(&key())),
@@ -1274,16 +1277,25 @@ mod tests {
         assert_eq!(parse_room_param(&text), Err(RoomLinkError::BadLength(16)));
         // 17 bytes is neither.
         let seventeen = bs58::encode([5u8; 17]).into_string();
-        assert_eq!(parse_room_link(&seventeen), Err(RoomLinkError::BadLength(17)));
+        assert_eq!(
+            parse_room_link(&seventeen),
+            Err(RoomLinkError::BadLength(17))
+        );
         // Nothing says "not supported yet" any more.
         assert!(!RoomLinkError::BadHandle.message().contains("not supported"));
     }
 
     #[test]
     fn the_refusals_name_what_happened() {
-        assert!(RoomLinkError::HandleMismatch.message().contains("does not match"));
-        assert!(RoomLinkError::OfficialMismatch.message().contains("Official room"));
-        assert!(RoomLinkError::HandleMalformed.message().contains("cannot be opened"));
+        assert!(RoomLinkError::HandleMismatch
+            .message()
+            .contains("does not match"));
+        assert!(RoomLinkError::OfficialMismatch
+            .message()
+            .contains("Official room"));
+        assert!(RoomLinkError::HandleMalformed
+            .message()
+            .contains("cannot be opened"));
     }
 
     #[test]

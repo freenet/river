@@ -554,7 +554,7 @@ mod tests {
             &m.id,
             Answer::State(&minimal_state(vk.as_bytes())),
         );
-        assert_eq!(r.claimed, true);
+        assert!(r.claimed);
         assert_eq!(r.outcome, Outcome::Resolved(vk));
     }
 
