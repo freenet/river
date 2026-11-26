@@ -2735,10 +2735,14 @@ pub const SCENES: &[Scene] = &[
     }),
     // The room list's menu: right-click a room to move it up or down, as the web UI's drag does.
     ("chat-room-list-menu", |s| {
-        details_scene(s, "town-square", |_, _| {});
+        connect(s);
+        s.chat.source = chat::Source::Node(chat::LinkStatus::Live);
+        let rooms = chat::example::data().rooms;
+        s.chat
+            .show_node_rooms(rooms, None, chat::LinkStatus::Live, 29_000_000);
         s.chat.room_menu = Some((
-            "town-square".to_owned(),
-            rune::PointerPress { x: 120.0, y: 200.0 },
+            "rust-help".to_owned(),
+            rune::PointerPress { x: 120.0, y: 268.0 },
         ));
     }),
     // Leave room: the question as a member and as the owner sees it.
