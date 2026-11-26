@@ -11563,8 +11563,8 @@ fn schedule_idle_resolution(armed_gen: u32, armed_attempt: u32) {
                 super::legacy_sweep_marker::write_marker_if_sweep_proved_empty(
                     SWEEP_EPOCH.load(Ordering::Relaxed),
                     cur_attempt,
-                    false,
-                    true,
+                    SAW_FETCH_FAILURE.load(Ordering::Relaxed),
+                    rooms_map_is_empty(),
                 );
                 RoomsLoadState::Loaded
             };

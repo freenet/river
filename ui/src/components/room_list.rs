@@ -568,6 +568,15 @@ pub fn RoomList() -> Element {
                                 {line_icon(SEARCH_ICON_PATH, 14)}
                                 span { "Discover rooms" }
                             }
+                            button {
+                                r#type: "button",
+                                "data-testid": "room-list-empty-older-rooms",
+                                class: "mt-1 px-3 py-1 rounded-lg text-xs text-text-muted hover:text-text transition-colors",
+                                // Clears the "nothing found" marker and sweeps
+                                // the older delegate versions again (a Retry).
+                                onclick: move |_| retry_rooms_load(),
+                                span { "Look for rooms from older versions" }
+                            }
                         }
                     },
                     RoomListDisplay::LoadFailed => rsx! {

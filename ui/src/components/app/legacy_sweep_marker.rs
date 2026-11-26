@@ -33,8 +33,17 @@ use super::freenet_api::constants::get_websocket_url;
 /// The localStorage key holding the marker.
 #[cfg(target_arch = "wasm32")]
 const STORAGE_KEY: &str = "river.legacy_sweep_empty";
-/// Format version of the stored value. A value with any other prefix is ignored.
-const VALUE_PREFIX: &str = "v1:";
+/// Format version of the stored value (`v2:<fingerprint>:<written at, ms>`). A
+/// value with any other prefix is ignored.
+const VALUE_PREFIX: &str = "v2:";
+
+/// How long a marker is believed. It bounds a wrong marker in time: rooms
+/// written later to a legacy generation by an old tab or an old desktop build,
+/// or a node whose data changed behind the same URL, are found again by the
+/// next sweep after this.
+const MARKER_MAX_AGE_MS: f64 = 7.0 * 24.0 * 60.0 * 60.0 * 1000.0;
+/// A stamp this far ahead of the clock is not believed (clock changed).
+const MARKER_FUTURE_SLACK_MS: f64 = 60.0 * 1000.0;
 
 /// Where the marker lives. Every method can fail (private mode, quota).
 pub(crate) trait MarkerStore {
@@ -60,15 +69,51 @@ pub(crate) fn fingerprint(node: &str, current: &[u8], legacy: &[[u8; 32]]) -> St
     format!("{VALUE_PREFIX}{}", h.finalize().to_hex())
 }
 
-/// Whether the store holds exactly `fingerprint`. Any failure or any other
-/// value (older format, other node, other generation set) is `false`.
-pub(crate) fn marker_matches(store: &dyn MarkerStore, fingerprint: &str) -> bool {
-    matches!(store.get(), Ok(Some(v)) if v == fingerprint)
+fn stored_value(fingerprint: &str, now_ms: f64) -> String {
+    format!("{fingerprint}:{}", now_ms.max(0.0) as u64)
 }
 
-/// Write the marker; `false` if the store refused.
-pub(crate) fn write_marker(store: &dyn MarkerStore, fingerprint: &str) -> bool {
-    store.set(fingerprint).is_ok()
+/// Whether a stored value is `fingerprint`, written at most
+/// [`MARKER_MAX_AGE_MS`] before `now_ms`. Pure.
+fn value_is_fresh_match(value: &str, fingerprint: &str, now_ms: f64) -> bool {
+    let Some(stamp) = value
+        .strip_prefix(fingerprint)
+        .and_then(|rest| rest.strip_prefix(':'))
+    else {
+        return false;
+    };
+    let Ok(written) = stamp.parse::<u64>() else {
+        return false;
+    };
+    let age = now_ms - written as f64;
+    (-MARKER_FUTURE_SLACK_MS..MARKER_MAX_AGE_MS).contains(&age)
+}
+
+fn now_ms() -> f64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        js_sys::Date::now()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as f64)
+            .unwrap_or(0.0)
+    }
+}
+
+/// Whether the store holds `fingerprint`, written within the last seven days.
+/// Any failure or any other value (older format, other node, other generation
+/// set, too old) is `false`.
+pub(crate) fn marker_matches(store: &dyn MarkerStore, fingerprint: &str, now_ms: f64) -> bool {
+    matches!(store.get(), Ok(Some(v)) if value_is_fresh_match(&v, fingerprint, now_ms))
+}
+
+/// Write the marker, stamped `now_ms`; `false` if the store refused.
+pub(crate) fn write_marker(store: &dyn MarkerStore, fingerprint: &str, now_ms: f64) -> bool {
+    store.set(&stored_value(fingerprint, now_ms)).is_ok()
 }
 
 /// Remove the marker (best effort).
@@ -168,9 +213,10 @@ impl SweepLedger {
         }
     }
 
-    /// The node said the generation's delegate is not installed (a typed
-    /// `Missing`, or the empty reply of core 0.2.136 and earlier): nothing in
-    /// it to find, for all three requests.
+    /// The node said, with a typed `Missing`, that the generation's delegate is
+    /// not installed: nothing in it to find, for all three requests. An empty
+    /// reply is NOT this: it proves nothing about the delegate, so a node that
+    /// answers that way writes no marker.
     pub(crate) fn note_absent(&mut self, generation: usize) {
         if let Some(bits) = self.answered.get_mut(generation) {
             *bits = ANSWERED_ALL;
@@ -255,8 +301,7 @@ pub(crate) fn note_legacy_reply(delegate: &[u8], response: &ChatDelegateResponse
     with_ledger(|l| l.note_reply(generation, reply));
 }
 
-/// A legacy delegate is absent on the node (typed `Missing`, or an empty
-/// reply).
+/// A legacy delegate is absent on the node (typed `Missing` only).
 pub(crate) fn note_legacy_absent(delegate: &[u8]) {
     if let Some(generation) = generation_of(delegate) {
         with_ledger(|l| l.note_absent(generation));
@@ -266,7 +311,7 @@ pub(crate) fn note_legacy_absent(delegate: &[u8]) {
 /// Whether the stored marker covers this node, current delegate and
 /// generation list.
 pub(crate) fn marker_matches_now() -> bool {
-    marker_matches(&BrowserStore, &current_fingerprint())
+    marker_matches(&BrowserStore, &current_fingerprint(), now_ms())
 }
 
 /// Remove the marker: a Retry, an interrupted-migration recovery, found data.
@@ -290,16 +335,21 @@ pub(crate) fn write_marker_if_sweep_proved_empty(
             rooms_empty,
         )
     });
-    proved && write_marker(&BrowserStore, &current_fingerprint())
+    proved && write_marker(&BrowserStore, &current_fingerprint(), now_ms())
 }
 
 fn current_fingerprint() -> String {
-    let legacy: Vec<[u8; 32]> = legacy_delegate_pairs().iter().map(|(k, _)| *k).collect();
-    fingerprint(
+    fingerprint_for(
         &get_websocket_url(),
         current_delegate_key().bytes(),
-        &legacy,
+        legacy_delegate_pairs(),
     )
+}
+
+/// [`fingerprint`] over the generated registry (`(key, code hash)` pairs).
+fn fingerprint_for(node: &str, current: &[u8], registry: &[([u8; 32], [u8; 32])]) -> String {
+    let legacy: Vec<[u8; 32]> = registry.iter().map(|(k, _)| *k).collect();
+    fingerprint(node, current, &legacy)
 }
 
 /// The browser's localStorage. Natively (unit tests) every call fails, which
@@ -379,6 +429,9 @@ mod tests {
         }
     }
 
+    const T0: f64 = 1_800_000_000_000.0;
+    const DAY: f64 = 24.0 * 60.0 * 60.0 * 1000.0;
+
     const NODE: &str = "wss://node-a.example/v1/contract/command";
 
     fn gens(n: u8) -> Vec<[u8; 32]> {
@@ -438,12 +491,13 @@ mod tests {
     fn marker_matches_only_the_exact_fingerprint() {
         let store = MemStore::default();
         let fp = fingerprint(NODE, &[9; 32], &gens(3));
-        assert!(!marker_matches(&store, &fp), "empty store");
-        assert!(write_marker(&store, &fp));
-        assert!(marker_matches(&store, &fp));
+        assert!(!marker_matches(&store, &fp, T0), "empty store");
+        assert!(write_marker(&store, &fp, T0));
+        assert!(marker_matches(&store, &fp, T0 + 1.0));
         assert!(!marker_matches(
             &store,
-            &fingerprint(NODE, &[9; 32], &gens(4))
+            &fingerprint(NODE, &[9; 32], &gens(4)),
+            T0 + 1.0
         ));
     }
 
@@ -453,7 +507,7 @@ mod tests {
         let fp = fingerprint(NODE, &[9; 32], &gens(3));
         for junk in ["", "1", "v2:abc", "true", &fp[VALUE_PREFIX.len()..]] {
             *store.value.borrow_mut() = Some(junk.to_string());
-            assert!(!marker_matches(&store, &fp), "{junk:?}");
+            assert!(!marker_matches(&store, &fp, T0), "{junk:?}");
         }
     }
 
@@ -464,18 +518,84 @@ mod tests {
             ..Default::default()
         };
         let fp = fingerprint(NODE, &[9; 32], &gens(3));
-        assert!(!marker_matches(&store, &fp));
-        assert!(!write_marker(&store, &fp));
+        assert!(!marker_matches(&store, &fp, T0));
+        assert!(!write_marker(&store, &fp, T0));
         clear_marker(&store); // must not panic
+    }
+
+    #[test]
+    fn a_marker_older_than_seven_days_is_absent() {
+        let store = MemStore::default();
+        let fp = fingerprint(NODE, &[9; 32], &gens(3));
+        assert!(write_marker(&store, &fp, T0));
+        assert!(marker_matches(&store, &fp, T0 + 6.9 * DAY));
+        assert!(!marker_matches(&store, &fp, T0 + 7.0 * DAY));
+        assert!(!marker_matches(&store, &fp, T0 + 30.0 * DAY));
+    }
+
+    #[test]
+    fn a_marker_stamped_in_the_future_is_absent() {
+        let store = MemStore::default();
+        let fp = fingerprint(NODE, &[9; 32], &gens(3));
+        assert!(write_marker(&store, &fp, T0 + DAY));
+        assert!(!marker_matches(&store, &fp, T0));
+    }
+
+    #[test]
+    fn a_marker_without_a_valid_stamp_is_absent() {
+        let store = MemStore::default();
+        let fp = fingerprint(NODE, &[9; 32], &gens(3));
+        for junk in [
+            fp.clone(),
+            format!("{fp}:"),
+            format!("{fp}:x"),
+            format!("{fp}:-5"),
+        ] {
+            *store.value.borrow_mut() = Some(junk.clone());
+            assert!(!marker_matches(&store, &fp, T0), "{junk:?}");
+        }
+    }
+
+    /// The real key must cover the real registry and the current delegate:
+    /// dropping either would let a marker outlive a re-key.
+    #[test]
+    fn the_real_fingerprint_covers_the_registry_and_the_current_delegate() {
+        let registry = legacy_delegate_pairs();
+        assert!(!registry.is_empty(), "the generated registry is not empty");
+        let current = [7u8; 32];
+        let full = fingerprint_for(NODE, &current, registry);
+        assert_ne!(
+            full,
+            fingerprint_for(NODE, &current, &registry[1..]),
+            "dropping a generation changes the key"
+        );
+        assert_ne!(
+            full,
+            fingerprint_for(NODE, &[8u8; 32], registry),
+            "changing the current delegate changes the key"
+        );
+        assert_ne!(full, fingerprint_for(NODE, &[], registry));
+        assert_ne!(full, fingerprint_for("wss://other/", &current, registry));
+        let keys: Vec<[u8; 32]> = registry.iter().map(|(k, _)| *k).collect();
+        assert_eq!(full, fingerprint(NODE, &current, &keys));
+        // And the production entry point goes through it.
+        let src = include_str!("legacy_sweep_marker.rs");
+        let body = fn_body(src, "fn current_fingerprint() -> String {");
+        assert!(body.contains("current_delegate_key().bytes()"));
+        assert!(body.contains("legacy_delegate_pairs()"));
+        assert!(body.contains("get_websocket_url()"));
+        let body = fn_body(src, "fn fingerprint_for(");
+        assert!(body.contains("registry.iter().map(|(k, _)| *k)"));
+        assert!(body.contains("fingerprint(node, current, &legacy)"));
     }
 
     #[test]
     fn clear_removes_the_marker() {
         let store = MemStore::default();
         let fp = fingerprint(NODE, &[9; 32], &gens(3));
-        write_marker(&store, &fp);
+        write_marker(&store, &fp, T0);
         clear_marker(&store);
-        assert!(!marker_matches(&store, &fp));
+        assert!(!marker_matches(&store, &fp, T0));
     }
 
     // ---- when the marker may be written ----
@@ -640,6 +760,20 @@ mod tests {
             2,
             "single-wave end and last-wave end"
         );
+        // The last-wave note sits inside the `!cut_short` branch.
+        let guard = body
+            .find("if !cut_short && load_attempt_is_current(attempt) {")
+            .expect("the last-wave note is guarded by !cut_short");
+        let last_note = body
+            .rfind("legacy_sweep_marker::note_all_waves_sent(")
+            .unwrap();
+        let close = body[guard..].find("\n        }\n").expect("guard end");
+        assert!(
+            last_note > guard && last_note < guard + close,
+            "note_all_waves_sent must be inside the !cut_short branch"
+        );
+        // The mid-wave break marks the sweep cut short.
+        assert!(body.contains("cut_short = true;\n                    break;"));
     }
 
     #[test]
@@ -654,6 +788,10 @@ mod tests {
             whole,
             "fn schedule_idle_resolution(armed_gen: u32, armed_attempt: u32) {",
         );
+        // Real values, not constants: the failure flag and the room map.
+        assert!(idle.contains(
+            "SAW_FETCH_FAILURE.load(Ordering::Relaxed),\n                    rooms_map_is_empty(),"
+        ));
         let failed = idle.find("RoomsLoadState::LoadFailed").unwrap();
         let write = idle
             .find("write_marker_if_sweep_proved_empty(")
@@ -676,8 +814,46 @@ mod tests {
     fn replies_and_absences_feed_the_ledger() {
         let handler = include_str!("freenet_api/response_handler.rs");
         assert!(handler.contains("legacy_sweep_marker::note_legacy_reply("));
-        assert!(handler.contains("legacy_sweep_marker::note_legacy_absent("));
         let sync = include_str!("freenet_api/freenet_synchronizer.rs");
         assert!(sync.contains("legacy_sweep_marker::note_legacy_absent("));
+    }
+
+    /// An empty `values` reply proves nothing about the delegate: it counts as
+    /// a pacing answer but never as "answered absent".
+    #[test]
+    fn an_empty_values_reply_is_not_an_absence() {
+        let handler = include_str!("freenet_api/response_handler.rs");
+        let start = handler
+            .find("if values.is_empty() {")
+            .expect("the empty-values branch");
+        let branch = &handler[start..];
+        let branch = &branch[..branch.find("\n                    }\n").unwrap()];
+        assert!(branch.contains("note_sweep_answer("));
+        assert!(!branch.contains("note_legacy_absent"));
+        // And a ledger given only pacing answers writes nothing.
+        let mut l = SweepLedger::new(7, 2, N);
+        l.note_all_waves_sent();
+        assert!(!l.complete_and_empty(7, 2, false, true));
+    }
+
+    #[test]
+    fn the_empty_state_offers_a_look_for_older_rooms() {
+        let list = include_str!("../room_list.rs");
+        let start = list
+            .find("RoomListDisplay::Empty => rsx!")
+            .expect("empty arm");
+        let arm = &list[start..];
+        let arm = &arm[..arm.find("RoomListDisplay::LoadFailed").unwrap()];
+        assert!(arm.contains("Look for rooms from older versions"));
+        assert!(arm.contains("onclick: move |_| retry_rooms_load()"));
+        // `retry_rooms_load` clears the marker and the session guard, then
+        // re-runs the load, which sweeps.
+        let body = fn_body(
+            include_str!("chat_delegate.rs"),
+            "pub(crate) fn retry_rooms_load() {",
+        );
+        assert!(body.contains("LEGACY_MIGRATION_ATTEMPTED.store(false"));
+        assert!(body.contains("clear_marker_now()"));
+        assert!(body.contains("set_up_chat_delegate_registering()"));
     }
 }

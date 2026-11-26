@@ -164,10 +164,9 @@ impl ResponseHandler {
                     if values.is_empty() {
                         // Core 0.2.136 and earlier answer a delegate it does
                         // not have with an empty reply: still an answer.
+                        // Pacing only: it proves nothing about the delegate, so it
+                        // is not an absence for the sweep marker (#972).
                         crate::components::app::chat_delegate::note_sweep_answer(key.bytes());
-                        crate::components::app::legacy_sweep_marker::note_legacy_absent(
-                            key.bytes(),
-                        );
                     }
                 }
 
