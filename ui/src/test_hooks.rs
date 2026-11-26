@@ -500,6 +500,15 @@ pub fn install_test_hooks() {
             .into_js_value(),
     );
 
+    // Follow a short link (base58 handle) inside the page, without closing the current viewer.
+    set_hook(
+        "viewShortLink",
+        Closure::<dyn FnMut(String)>::new(move |handle: String| {
+            crate::util::defer(move || crate::public_room::view_for_test(&handle));
+        })
+        .into_js_value(),
+    );
+
     // View another example room in place, without closing the current viewer.
     set_hook(
         "viewRoom",

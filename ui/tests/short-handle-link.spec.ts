@@ -127,3 +127,15 @@ test("Copy short link appears only after the entry is found; the full link stays
   expect(shortCopied).toBe(handle);
   expect(fullCopied).toContain(`?room=${owner}`);
 });
+
+test("following the same short link again in place asks again and opens the room", async ({ page }) => {
+  const handle = await handleOf(page, "public");
+  await page.goto(`/?room=${handle}`);
+  await waitForApp(page);
+  await expect(page.getByTestId("viewed-room-name")).toHaveText("Open Public Room");
+  expect(await callRiverTest(page, "resolverLookups")).toBe(1);
+  await callRiverTest(page, "viewShortLink", handle);
+  await expect(page.getByTestId("viewed-room-resolving")).toBeVisible();
+  await expect(page.getByTestId("viewed-room-name")).toHaveText("Open Public Room");
+  expect(await callRiverTest(page, "resolverLookups")).toBe(2);
+});

@@ -101,6 +101,9 @@ pub fn ViewedRoomPane() -> Element {
             }
             return;
         }
+        // Not (or no longer) a short link being resolved: a later link to the
+        // same handle, followed in place, must send its own GET.
+        resolve_asked.set(None);
         let Some(ViewedRoom {
             owner_vk: Some(owner_vk),
             status,

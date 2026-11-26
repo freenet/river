@@ -7,8 +7,10 @@
 //! address is computable from the handle alone, and its state holds the owner
 //! key. Every reader repeats the contract's own check: the key must hash to the
 //! handle. A resolver can therefore never send a reader to a different room
-//! (short of a 2^64-work collision, which is why the Official room is also
-//! compared with its known full key: [`OFFICIAL_ROOM_OWNER_KEY`]).
+//! (short of a second preimage of the 128-bit handle, about 2^128 work, which is
+//! why the Official room is also compared with its known full key:
+//! [`OFFICIAL_ROOM_OWNER_KEY`]). A 2^64-work collision only lets an attacker
+//! make two keys of their own share a handle; it cannot redirect an existing one.
 //!
 //! This is a copy of `cli/src/shortkey.rs` (riverctl, #1043) restricted to the
 //! pure parts, kept in `ui/` and not lifted to `common/`: `common/` is compiled
@@ -98,7 +100,9 @@ impl ShortHandle {
         Ok(handle)
     }
 
-    /// Check that `vk` is the key this handle names.
+    /// Check that `vk` is the key this handle names (the resolve path inlines
+    /// this so its derivation can be injected).
+    #[cfg(test)]
     pub fn verify(&self, vk: &[u8; KEY_LEN]) -> Result<(), ShortError> {
         if Self::derive(vk) == *self {
             Ok(())
@@ -190,17 +194,44 @@ pub fn validate_owner_key(vk: &[u8; KEY_LEN]) -> Result<(), ShortError> {
 }
 
 /// Whether `handle` is the Official room's, and if so whether `vk` is its key.
-fn check_official(handle: &ShortHandle, vk: &[u8; KEY_LEN]) -> Result<(), ShortError> {
-    let official = bs58::decode(OFFICIAL_ROOM_OWNER_KEY)
+/// `derive` is the handle derivation, a parameter only so a test can build the
+/// hash collision that makes this check reachable (see
+/// `the_official_handle_refuses_any_other_key_through_the_resolve_path`).
+fn check_official(
+    handle: &ShortHandle,
+    vk: &[u8; KEY_LEN],
+    official: &[u8; KEY_LEN],
+    derive: &impl Fn(&[u8; KEY_LEN]) -> ShortHandle,
+) -> Result<(), ShortError> {
+    if derive(official) == *handle && official != vk {
+        return Err(ShortError::OfficialMismatch);
+    }
+    Ok(())
+}
+
+fn official_key() -> [u8; KEY_LEN] {
+    bs58::decode(OFFICIAL_ROOM_OWNER_KEY)
         .with_alphabet(bs58::Alphabet::BITCOIN)
         .into_vec()
         .ok()
         .and_then(|b| <[u8; KEY_LEN]>::try_from(b).ok())
-        .expect("the Official room key constant is a valid 32-byte key");
-    if ShortHandle::derive(&official) == *handle && official != *vk {
-        return Err(ShortError::OfficialMismatch);
+        .expect("the Official room key constant is a valid 32-byte key")
+}
+
+/// [`resolve_state`] with the Official key and the derivation injected.
+fn resolve_state_with(
+    handle: &ShortHandle,
+    state: &[u8],
+    official: &[u8; KEY_LEN],
+    derive: impl Fn(&[u8; KEY_LEN]) -> ShortHandle,
+) -> Result<[u8; KEY_LEN], ShortError> {
+    let vk = state_owner_key(state)?;
+    if derive(&vk) != *handle {
+        return Err(ShortError::Mismatch);
     }
-    Ok(())
+    validate_owner_key(&vk)?;
+    check_official(handle, &vk, official, &derive)?;
+    Ok(vk)
 }
 
 /// Read a resolver state and verify it against `handle`: the key it holds must
@@ -208,11 +239,7 @@ fn check_official(handle: &ShortHandle, vk: &[u8; KEY_LEN]) -> Result<(), ShortE
 /// room's handle it must be the Official room's key. Every refusal here means
 /// the link opens nothing.
 pub fn resolve_state(handle: &ShortHandle, state: &[u8]) -> Result<[u8; KEY_LEN], ShortError> {
-    let vk = state_owner_key(state)?;
-    handle.verify(&vk)?;
-    validate_owner_key(&vk)?;
-    check_official(handle, &vk)?;
-    Ok(vk)
+    resolve_state_with(handle, state, &official_key(), ShortHandle::derive)
 }
 
 #[cfg(test)]
@@ -374,19 +401,53 @@ mod tests {
     }
 
     #[test]
-    fn the_official_handle_refuses_any_other_key() {
-        // check_official is separate from the hash check: a key that hashed to
-        // the Official handle (a collision) would pass `verify` and must still
-        // be refused.
-        let handle = ShortHandle::derive(&official());
+    fn the_official_handle_refuses_any_other_key_through_the_resolve_path() {
+        // A key that hashed to the Official handle would pass the hash check,
+        // so the only way to reach the Official comparison is a derivation
+        // with a collision. Inject one: every key gets the same handle. The
+        // resolve path must still refuse any key but the Official one.
+        let collide = |_: &[u8; 32]| ShortHandle([7u8; 16]);
+        let handle = ShortHandle([7u8; 16]);
+        let official = key_of(1);
+        let other = key_of(2);
         assert_eq!(
-            check_official(&handle, &key_of(3)),
+            resolve_state_with(&handle, &minimal_state(&other), &official, collide),
             Err(ShortError::OfficialMismatch)
         );
-        assert_eq!(check_official(&handle, &official()), Ok(()));
-        // A handle that is not the Official room's is not constrained by it.
-        let other = ShortHandle::derive(&key_of(3));
-        assert_eq!(check_official(&other, &key_of(3)), Ok(()));
+        assert_eq!(
+            resolve_state_with(&handle, &minimal_state(&official), &official, collide),
+            Ok(official)
+        );
+        // Without the collision the same substitution is an ordinary mismatch.
+        assert_eq!(
+            resolve_state(
+                &ShortHandle::derive(&official_key()),
+                &minimal_state(&other)
+            ),
+            Err(ShortError::Mismatch)
+        );
+    }
+
+    #[test]
+    fn a_handle_that_is_not_the_official_ones_is_not_constrained_by_it() {
+        let official = key_of(1);
+        let other = key_of(2);
+        let derive = |vk: &[u8; 32]| {
+            if *vk == key_of(1) {
+                ShortHandle([1u8; 16])
+            } else {
+                ShortHandle([9u8; 16])
+            }
+        };
+        assert_eq!(
+            resolve_state_with(
+                &ShortHandle([9u8; 16]),
+                &minimal_state(&other),
+                &official,
+                derive
+            ),
+            Ok(other)
+        );
     }
 
     #[test]

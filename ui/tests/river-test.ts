@@ -28,7 +28,9 @@ type RiverTestHooks = {
   shortHandle(kind: "public" | "private" | "open" | "hard" | "full" | "missing" | "mismatch"): string;
   // Make the fixture resolver hold the short-link entry of the room with this owner key (base58) and forget earlier existence checks.
   publishShortEntry(ownerKey: string): boolean;
-  // Resolver lookups this page has sent; a full link sends none.
+  // Follow a short link (base58 handle) inside the page, as a link followed in place would, without closing the viewer.
+  viewShortLink(handle: string): void;
+  // Resolver GETs this page has actually sent (retries included); a full link sends none.
   resolverLookups(): number;
   // Which solver the last join used: "workers" (Web Workers) or "main" (the fallback); "" before any join.
   powSolverMode(): string;

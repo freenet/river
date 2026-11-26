@@ -80,6 +80,7 @@ fn with_mirror<R>(f: impl FnOnce(&mut ResolveMirror) -> R) -> Option<R> {
 /// Start resolving `handle` (a page opened on a short link). Replaces any
 /// earlier resolution.
 pub fn begin(handle: ShortHandle) {
+    note_seen(handle.resolver_instance_id());
     *MIRROR.lock().unwrap_or_else(|e| e.into_inner()) = Some(ResolveMirror::new(handle));
 }
 
@@ -89,7 +90,7 @@ pub fn end() {
     GEN.fetch_add(1, Ordering::SeqCst);
 }
 
-/// Resolver lookups this page started (each `request` and `request_check`), for the "a full link sends no extra
+/// Resolver GETs this page actually sent, retries included, for the "a full link sends no extra
 /// lookup" pin.
 static LOOKUPS_SENT: AtomicU32 = AtomicU32::new(0);
 
@@ -233,6 +234,25 @@ pub fn waiting_hint(connected: bool) -> &'static str {
     }
 }
 
+/// Resolver ids this page has asked about. A late answer for one of them (after
+/// the viewer closed or moved on, or for a check that timed out) is swallowed
+/// here instead of falling through to the room handlers as an unknown contract.
+static SEEN: Mutex<Option<std::collections::HashSet<ContractInstanceId>>> = Mutex::new(None);
+
+fn note_seen(id: ContractInstanceId) {
+    SEEN.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert(id);
+}
+
+fn was_seen(id: &ContractInstanceId) -> bool {
+    SEEN.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|s| s.contains(id))
+}
+
 static GEN: AtomicU64 = AtomicU64::new(0);
 static RETRIED: AtomicBool = AtomicBool::new(false);
 
@@ -293,7 +313,8 @@ fn deliver(id: &ContractInstanceId, answer: Answer) -> bool {
     }
     // The share-link check may be waiting on the same contract.
     let checked = check_deliver(id, answer);
-    routed.claimed || checked
+    // Anything else for a resolver this page asked about is a late answer: drop it.
+    routed.claimed || checked || was_seen(id)
 }
 
 /// Route a GET response. `true` if it was a resolver's.
@@ -331,6 +352,21 @@ pub fn deliver_error(error_text: &str) {
     }
 }
 
+/// Whether a GET can go out now: the socket is up. The no-sync example build
+/// answers from fixtures and always can.
+#[cfg(not(feature = "no-sync"))]
+fn can_send() -> bool {
+    crate::components::app::WEB_API
+        .try_peek()
+        .map(|w| w.is_some())
+        .unwrap_or(false)
+}
+
+#[cfg(feature = "no-sync")]
+fn can_send() -> bool {
+    true
+}
+
 #[cfg(not(feature = "no-sync"))]
 fn send_get(id: ContractInstanceId) {
     use crate::components::app::WEB_API;
@@ -343,6 +379,7 @@ fn send_get(id: ContractInstanceId) {
             blocking_subscribe: false,
         });
         if let Some(web_api) = WEB_API.write().as_mut() {
+            LOOKUPS_SENT.fetch_add(1, Ordering::SeqCst);
             if let Err(e) = web_api.send(request).await {
                 dioxus::logger::tracing::warn!("short link: resolver GET failed to send: {e}");
             }
@@ -354,6 +391,7 @@ fn send_get(id: ContractInstanceId) {
 /// enough for the loading state to be seen.
 #[cfg(feature = "no-sync")]
 fn send_get(id: ContractInstanceId) {
+    LOOKUPS_SENT.fetch_add(1, Ordering::SeqCst);
     #[cfg(all(target_arch = "wasm32", feature = "example-data"))]
     crate::util::safe_spawn_local(async move {
         crate::util::sleep(Duration::from_millis(1200)).await;
@@ -375,7 +413,6 @@ fn send_get(id: ContractInstanceId) {
 /// answered after [`RESOLVE_RETRY_AFTER`], and time out after
 /// [`RESOLVE_TIMEOUT`] (the same rules as the room lookup).
 pub fn request(handle: ShortHandle) {
-    LOOKUPS_SENT.fetch_add(1, Ordering::SeqCst);
     let Some(id) = with_mirror(|m| {
         m.requested = true;
         m.id
@@ -445,7 +482,11 @@ pub fn is_published(owner: &VerifyingKey) -> bool {
 /// published only if it exists and verifies. Anything else (not found, error,
 /// timeout) leaves the short link unoffered. Safe to call on every render.
 pub fn request_check(owner: VerifyingKey) {
-    LOOKUPS_SENT.fetch_add(1, Ordering::SeqCst);
+    // Nothing is stamped or sent while the socket is not up: the dialog calls
+    // this again on every render, including the one after the connect.
+    if !can_send() {
+        return;
+    }
     let now = crate::public_room::now_ms_pub();
     {
         let mut at = CHECKED_AT.lock().unwrap_or_else(|e| e.into_inner());
@@ -460,6 +501,7 @@ pub fn request_check(owner: VerifyingKey) {
     }
     let handle = handle_of(&owner);
     let id = handle.resolver_instance_id();
+    note_seen(id);
     PENDING
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -740,6 +782,19 @@ mod tests {
         let verify = body.find("check_proves_entry(").unwrap();
         let publish = body.find("PUBLISHED.write()").unwrap();
         assert!(verify < publish);
+    }
+
+    #[test]
+    fn a_late_answer_for_a_resolver_this_page_asked_about_is_swallowed() {
+        let h = handle_of(&vk_of(21));
+        begin(h);
+        end();
+        // The viewer is gone, but the answer is still the resolver's.
+        assert!(deliver_not_found(&h.resolver_instance_id()));
+        // A contract this page never asked about is not.
+        assert!(!deliver_not_found(
+            &handle_of(&vk_of(22)).resolver_instance_id()
+        ));
     }
 
     #[test]

@@ -981,9 +981,14 @@ pub(super) fn ConfigError(error: Option<String>) -> Element {
 /// shown. The full link above stays the default share link.
 #[component]
 fn ShortLinkCopy(owner_vk: VerifyingKey) -> Element {
-    // Once per mount, off the render path: the request is spawned.
-    use_hook(move || crate::short_resolve::request_check(owner_vk));
     crate::util::signal_guard::anchor();
+    // Re-render when the connection changes, and ask again then: the check is
+    // not sent (or stamped) while the socket is down. It is idempotent, so a
+    // call on every render is cheap, and it follows `owner_vk` if the prop changes.
+    let _connection = crate::components::app::SYNC_STATUS
+        .try_read()
+        .map(|s| s.clone());
+    crate::short_resolve::request_check(owner_vk);
     let published = match crate::short_resolve::PUBLISHED.try_read() {
         Ok(p) => p.contains(&owner_vk),
         Err(_) => {
