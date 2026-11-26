@@ -108,7 +108,16 @@ test("the damaged-link message is an accessible dialog: Escape, backdrop, 44px t
   const box = await page.getByTestId("damaged-invitation-dismiss-button").boundingBox();
   expect(box!.height).toBeGreaterThanOrEqual(44);
 
-  await expect(page.getByTestId("damaged-invitation-dismiss-button")).toBeFocused();
+  const dismiss = page.getByTestId("damaged-invitation-dismiss-button");
+  await expect(dismiss).toBeFocused();
+  // Tab and Shift+Tab stay inside the dialog.
+  for (const key of ["Tab", "Tab", "Shift+Tab"]) {
+    await page.keyboard.press(key);
+    await expect(dismiss).toBeFocused();
+  }
+  // Escape still works after a click on the message text moves focus.
+  await page.getByText(MESSAGE).click();
+  await expect(modal).toBeVisible();
   await page.keyboard.press("Escape");
   await expect(modal).toHaveCount(0);
 });
@@ -130,6 +139,9 @@ const RIVER_ID = "raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv";
 const RIVER_PATH = `/v1/contract/web/${RIVER_ID}/`;
 
 async function openAtGatewayPath(page: Page) {
+  // As in the gateway sandbox, so a click the interceptor misses leaves
+  // `?invitation=` in the address, where the tests below can see it.
+  await keepInvitationInUrl(page);
   await page.route(`**${RIVER_PATH}*`, async (route) => {
     const root = new URL("/", route.request().url()).toString();
     await route.fulfill({ response: await route.fetch({ url: root }) });
@@ -168,4 +180,7 @@ test("clicking a valid invitation link in River still opens the invitation dialo
   await clickInviteLink(page, INVITATION_CODE);
   await expect(page.getByTestId("receive-invitation-modal")).toBeVisible();
   await expect(page.getByTestId("damaged-invitation-modal")).toHaveCount(0);
+  // Intercepted: without this, a missed click would navigate to the link and
+  // the address-bar path would open the same dialog.
+  expect(new URL(page.url()).search).toBe("");
 });

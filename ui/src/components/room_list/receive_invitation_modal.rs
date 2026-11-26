@@ -726,6 +726,8 @@ pub(crate) fn classify_invitation_code(code: &str) -> InvitationCode {
 /// cannot strip `?invitation=` from its own address).
 #[component]
 pub fn DamagedInvitationModal(code: Signal<Option<String>>) -> Element {
+    // Before the early return, so the hook order never changes.
+    let mut dismiss_el = use_signal(|| None::<std::rc::Rc<MountedData>>);
     let Some(current) = code.read().clone() else {
         return rsx! {};
     };
@@ -733,6 +735,10 @@ pub fn DamagedInvitationModal(code: Signal<Option<String>>) -> Element {
     let dismiss = move || {
         let current = current.clone();
         crate::util::defer(move || {
+            // Shares the capped processed list with valid invitations. That is
+            // acceptable: an entry here needs a distinct broken link opened
+            // from the address bar and dismissed, and an evicted valid entry
+            // only means that old link prompts again if it is reopened.
             mark_invitation_processed(&current);
             code.set(None);
         });
@@ -755,12 +761,25 @@ pub fn DamagedInvitationModal(code: Signal<Option<String>>) -> Element {
                 "aria-modal": "true",
                 "aria-labelledby": "damaged-invitation-title",
                 "aria-describedby": "damaged-invitation-text",
-                class: "relative z-10 w-full max-w-md mx-4 bg-panel rounded-xl shadow-xl border border-border",
-                onkeydown: move |evt: KeyboardEvent| {
-                    if evt.key() == Key::Escape {
+                class: "relative z-10 w-full max-w-md mx-4 bg-panel rounded-xl shadow-xl border border-border outline-none",
+                // Focusable, so a click on the text keeps focus in the dialog
+                // and Escape keeps working.
+                tabindex: "-1",
+                onkeydown: move |evt: KeyboardEvent| match evt.key() {
+                    Key::Escape => {
                         evt.prevent_default();
                         dismiss_on_key();
                     }
+                    // Dismiss is the only control, so Tab keeps focus on it.
+                    Key::Tab => {
+                        evt.prevent_default();
+                        if let Some(el) = dismiss_el.peek().clone() {
+                            crate::util::safe_spawn_local(async move {
+                                let _ = el.set_focus(true).await;
+                            });
+                        }
+                    }
+                    _ => {}
                 },
                 div {
                     class: "p-6",
@@ -782,6 +801,7 @@ pub fn DamagedInvitationModal(code: Signal<Option<String>>) -> Element {
                             // Focus starts here so Escape and Enter work at once.
                             onmounted: move |cx| {
                                 let element = cx.data();
+                                dismiss_el.set(Some(element.clone()));
                                 crate::util::safe_spawn_local(async move {
                                     let _ = element.set_focus(true).await;
                                 });

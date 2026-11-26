@@ -408,11 +408,12 @@ pub fn App() -> Element {
                             // This block runs on every render and the sandboxed
                             // iframe cannot strip `?invitation=`, so skip a code
                             // the user already dismissed (in this session or,
-                            // via the processed hash, before a reload), and
-                            // one already showing.
+                            // via the processed hash, before a reload). Never
+                            // replace a message already showing (it may be a
+                            // clicked link's), so Dismiss marks the code the
+                            // user actually saw.
                             if !is_invitation_processed(&invitation_code)
-                                && damaged_invitation.peek().as_deref()
-                                    != Some(invitation_code.as_str())
+                                && damaged_invitation.peek().is_none()
                             {
                                 damaged_invitation.set(Some(invitation_code.clone()));
                             }
