@@ -388,11 +388,13 @@ impl PointerSource for NodePointers {
         wait: Duration,
         deliver: &dyn Fn(ContractInstanceId, Fetch),
     ) {
+        // Counted from before the connect, so `wait` bounds the connect too (which itself gives
+        // up after its own few seconds).
+        let deadline = Instant::now() + wait;
         // This connection only reads, so its gate never needs closing.
         let Ok(mut socket) = NodeSocket::connect(authority, token, &WriteGate::default()) else {
             return;
         };
-        let deadline = Instant::now() + wait;
         for id in ids {
             let get = ContractRequest::Get {
                 key: *id,
@@ -536,6 +538,9 @@ impl std::ops::Deref for Watch {
 struct Inner {
     /// The newest version seen above this build, per artifact.
     newer: [Option<u32>; 2],
+    /// Whether a pointer record has positively named this build's generation, per artifact.
+    /// An unreachable or silent pointer leaves it as it was (false until one answers).
+    confirmed: [bool; 2],
     /// When the first check was started, and whether one has finished.
     first_started: Option<Instant>,
     first_done: bool,
@@ -691,6 +696,7 @@ impl Shared {
         }
         if verdict != Verdict::NoSignal {
             let mut inner = self.inner();
+            inner.confirmed[w.artifact.index()] = verdict == Verdict::Current;
             if !inner.heard.contains(&id) {
                 inner.heard.push(id);
             }
@@ -806,6 +812,14 @@ impl Watch {
             closed |= self.poll(authority, token, pace);
         }
         closed
+    }
+
+    /// Whether a pointer record has positively named this build's `artifact` generation and
+    /// River has not moved on. Unlike [`writes_allowed`](Self::writes_allowed) this fails
+    /// closed: an unreachable pointer, a build with no record for it, or no answer yet is not a
+    /// confirmation. For the few requests that must not act on a guess.
+    pub fn confirmed_current(&self, artifact: Artifact) -> bool {
+        !self.is_stale() && self.inner().confirmed[artifact.index()]
     }
 
     /// Whether the app may write now: River has not moved on, and the first check has

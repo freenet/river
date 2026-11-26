@@ -17,6 +17,9 @@ use rune_kit::{Button, ButtonVariant, Kit, TextInput};
 
 use super::conversation::avatar;
 use super::dialog_kit::{self as dk, DialogSpec, NoticeKind, copy_field, notice};
+use std::hash::{Hash, Hasher};
+use std::rc::Rc;
+
 use super::icons;
 use super::model::{Appointer, BanOffer, Member, MemberId, Role, Room};
 use super::style::{self as st, Palette};
@@ -57,42 +60,110 @@ impl Imitation<'_> {
     }
 }
 
-/// The privileged member `m`'s name resembles without being them, if it does.
+/// Who imitates whom in one room, worked out once: the member list, the author lines and the
+/// dialog all read this, so there is one predicate and it runs once per change of the members
+/// ([`Chat::imitations`]), not once per row.
 ///
 /// The protected names are the owner's and every deputy's in this viewer's view, as the web
 /// UI's `impersonation_checker_for_viewer` builds them: a name only counts when its member chose
 /// it and this computer can read it, and not when it folds to a placeholder or to a generated
-/// handle (each shared by a whole class of members). The owner is checked first, then the
-/// deputies in River's member id order (`Member::order`). A member is never accused of imitating a name that is theirs,
-/// and a flagged member who holds privileges themselves gets a sentence that is true of both.
+/// handle (each shared by a whole class of members). `Role::Deputy` is set only for a member
+/// with a deputy badge (`rooms/room.rs`, from the same `deputy_badges_for_viewer` the web UI's
+/// checker takes), so the deputies protected here are the ones the web UI protects. The owner
+/// is checked first, then the deputies in River's member id order (`Member::order`). A member
+/// is never accused of imitating a name that is theirs, and a flagged member who holds
+/// privileges themselves gets a sentence that is true of both.
+#[derive(Default)]
+pub(super) struct Imitations {
+    /// Flagged member id -> (the member imitated, the sentence).
+    by_member: HashMap<MemberId, (MemberId, &'static str)>,
+}
+
+impl Imitations {
+    pub(super) fn new(room: &Room) -> Self {
+        use super::visual_fold::{
+            folds_match, name_folds, names_fold_to_generated_handle, names_fold_together,
+        };
+        let protected = |p: &Member| {
+            p.claimed
+                && !PLACEHOLDERS
+                    .iter()
+                    .any(|ph| names_fold_together(&p.nickname, ph))
+                && !names_fold_to_generated_handle(&p.nickname)
+        };
+        let mut deputies: Vec<&Member> = room
+            .members
+            .iter()
+            .filter(|d| d.role == Role::Deputy)
+            .collect();
+        deputies.sort_by_key(|d| d.order);
+        let owners = room.members.iter().filter(|o| o.role == Role::Owner);
+        let names: Vec<(&Member, [String; 2])> = owners
+            .chain(deputies)
+            .filter(|p| protected(p))
+            .map(|p| (p, name_folds(&p.nickname)))
+            .collect();
+        let mut by_member = HashMap::new();
+        if !names.is_empty() {
+            for m in &room.members {
+                let folds = name_folds(&m.nickname);
+                let Some((who, _)) = names
+                    .iter()
+                    .find(|(p, pf)| p.id != m.id && folds_match(&folds, pf))
+                else {
+                    continue;
+                };
+                let text = if m.role != Role::Member {
+                    NAME_CONFLICT
+                } else if who.role == Role::Owner {
+                    IMPERSONATION
+                } else {
+                    IMPERSONATION_DEPUTY
+                };
+                by_member.entry(m.id).or_insert((who.id, text));
+            }
+        }
+        Imitations { by_member }
+    }
+
+    /// The privileged member `id`'s name resembles without being them, if it does.
+    pub(super) fn get<'a>(&self, room: &'a Room, id: MemberId) -> Option<Imitation<'a>> {
+        let &(who, text) = self.by_member.get(&id)?;
+        Some(Imitation {
+            who: room.member(who)?,
+            text,
+        })
+    }
+}
+
+/// One member's imitation, worked out from scratch.
+#[cfg(test)]
 pub(super) fn imitation<'a>(room: &'a Room, m: &Member) -> Option<Imitation<'a>> {
-    use super::visual_fold::{names_fold_to_generated_handle, names_fold_together};
-    let protected = |p: &Member| {
-        p.claimed
-            && !PLACEHOLDERS
-                .iter()
-                .any(|ph| names_fold_together(&p.nickname, ph))
-            && !names_fold_to_generated_handle(&p.nickname)
-    };
-    let mut deputies: Vec<&Member> = room
-        .members
-        .iter()
-        .filter(|d| d.role == Role::Deputy)
-        .collect();
-    deputies.sort_by_key(|d| d.order);
-    let owners = room.members.iter().filter(|o| o.role == Role::Owner);
-    let who = owners
-        .chain(deputies)
-        .filter(|p| protected(p))
-        .find(|p| p.id != m.id && names_fold_together(&m.nickname, &p.nickname))?;
-    let text = if m.role != Role::Member {
-        NAME_CONFLICT
-    } else if who.role == Role::Owner {
-        IMPERSONATION
-    } else {
-        IMPERSONATION_DEPUTY
-    };
-    Some(Imitation { who, text })
+    Imitations::new(room).get(room, m.id)
+}
+
+impl Chat {
+    /// [`Imitations`] for the open room, kept until a member's id, name, role, claim or order
+    /// changes, so a frame that changed none of them folds no names.
+    pub(super) fn imitations(&self) -> Rc<Imitations> {
+        let Some(room) = self.room() else {
+            return Rc::default();
+        };
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        room.key.hash(&mut h);
+        for m in &room.members {
+            (m.id, &m.nickname, m.role as u8, m.claimed, m.order).hash(&mut h);
+        }
+        let sig = h.finish();
+        if let Some((have, got)) = &*self.imitation_cache.borrow()
+            && *have == sig
+        {
+            return Rc::clone(got);
+        }
+        let got = Rc::new(Imitations::new(room));
+        *self.imitation_cache.borrow_mut() = Some((sig, Rc::clone(&got)));
+        got
+    }
 }
 
 /// Whether `m` was invited, directly or not, by `by`. The walk is bounded by the member count,
@@ -614,7 +685,7 @@ pub(super) fn member_modal(chat: &Chat, room: &Room, uid: &str, k: &Kit, layer: 
     let above = me
         .filter(|_| !is_me && m.invited_by.is_some())
         .is_some_and(|me| me.role == Role::Owner || invited_through(&by_id, m, me));
-    let imitated = imitation(room, m);
+    let imitated = chat.imitations().get(room, m.id);
 
     let mut tags = row().key("member-tags").w_full().gap(8.0).flex_wrap();
     if is_owner {

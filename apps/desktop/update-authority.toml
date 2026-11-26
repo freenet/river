@@ -1,0 +1,81 @@
+# Who may name River's trusted update-signing key, and where that is published.
+#
+# River's self-update trusts one ed25519 update-signing key (apps/desktop/update-pubkey.hex,
+# compiled into each build). If that key leaks, builds signed with it must stop being
+# accepted, and a replacement must be nameable, without every user reinstalling by hand
+# (freenet/river#927). This file is the trust anchor for that.
+#
+# THE RECORD. A Freenet "pointer record" (freenet-migrate) lives at the fixed contract
+# address `pointer_key` below. It is a 100-byte state: a version that only rises, a 32-byte
+# payload, and a signature by `authority_verifying_key` over (authority key, app_id, version,
+# payload). Here the payload IS the trusted update-signing public key. All-zero payload is the
+# tombstone: "no update key is trusted" (every update is refused).
+#
+# Before each update check, a build that can reach the Freenet node reads the record. The
+# effective key is the one named by the highest-version verified record this install has ever
+# seen (kept in its update state file); with none seen yet, the compiled-in key. Check,
+# download and the re-check at restart all use the effective key. A node serving an older or
+# a competing record cannot roll the key back. See apps/desktop/src/update/mod.rs, `# Trust`.
+#
+# THE AUTHORITY KEY must never be the update-signing key: if it were, a leak of the signing
+# key would let the attacker publish their own record. It is a dedicated key used for nothing
+# else, held offline by Ian (password manager), and it is NOT River's author key (the online
+# key in pointer-records.toml that signs the web container and the pointer records): a test
+# keeps the two different. It is not available to the release workflow. This file is compiled
+# into every build, so changing `authority_verifying_key` is itself a new release that old
+# builds never see.
+#
+# PUBLISHING A ROTATION (the record's version must be higher than every earlier one; start
+# at 1). Sign offline with the authority key, from a file named by RIVER_UPDATE_AUTHORITY_KEY_FILE
+# or piped on stdin (an armored block whose lines include `signing_key = "river:v1:sk:..."`;
+# there is no default location, and the script never prints the key):
+#
+#   scripts/sign-update-key-record.sh --version <N> --key <NEW update-signing public key, hex>
+#
+# It prints the record's `state` and address, and checks the address equals `pointer_key` below.
+# Publish it through your own node (NOT the production gateway), from main, the way
+# scripts/publish-pointer-records.sh publishes the other records. The pointer contract WASM is
+# the committed pointer-v1.wasm whose code hash is `pointer_code_hash` in pointer-records.toml:
+#
+#   first publish:  fdev -p <port> execute put --timeout 180 --code <pointer-v1.wasm> \
+#                       --parameters <params.bin> contract --state <state.bin>
+#   later versions: fdev -p <port> execute update --timeout 180 <pointer_key> <state.bin>
+#
+# (<params.bin> is the `params=` hex from `pointer-record key --author-vk <authority key>
+# --app-id river-desktop-update-key`, through `xxd -r -p`; <state.bin> is the printed state
+# through `xxd -r -p`.) Then read it back with `fdev execute get` and check it with
+# `pointer-record verify`: a PUT at an already-used version is silently ignored.
+# Also commit the new key to apps/desktop/update-pubkey.hex and cut a release signed by it, so
+# fresh installs start on it, and PIN the record into that release: set `pinned_record` below
+# to the printed state. A build seeds its floor from the pin, so a fresh install of it cannot
+# adopt an older genuine record (one naming a leaked key) that a node has not yet replaced.
+# After publishing record vN, the next release pins vN.
+#
+# WITHDRAWING (a leak with no replacement yet): `scripts/sign-update-key-record.sh --version
+# <N> --withdraw`. Every build that sees it refuses all updates and tells the person to
+# download a new build. A withdrawal is lifted only by a record with a HIGHER version, signed
+# by the authority key. If the authority key itself is compromised, whoever holds it can
+# withdraw updates for every install that sees the record. Only a release carrying a new
+# authority key (and its own `pinned_record`) lifts that: the kept record then no longer
+# verifies, and the build falls back to its pin. Reinstalling the same build does not, because
+# River's update-state.json stays; deleting that file resets a build to its pin.
+#
+# WHAT IT CANNOT DO. It cannot remove an update that is already installed. It acts only on a
+# build that can reach its node at check time. A fresh install that has never seen the record
+# and cannot reach its node trusts the key compiled into it (the newest one, if its release
+# pinned the record); that is the behaviour freenet/river#927 chose. A person who deletes
+# River's update notes (update-state.json) also forgets every record kept, and starts again
+# from the build's compiled-in key and pin. The record is independent of freenet.org:
+# serving files from the update address does not let anyone change or silence it.
+#
+# The newest record this build knows (hex of its 100 signed bytes), verified when the build
+# starts. v1 names the update key in apps/desktop/update-pubkey.hex (a test checks they match,
+# and that RIVER_UPDATE_PUBKEY_HEX does when it is set). It also wins over a different compiled
+# key: it is newer evidence than the build's environment. A build pointed at a local update
+# server (a debug or test-hooks build with a manifest override) reads no record at all.
+pinned_record = "00000001ce19db0789a8e80e1c88a0327e748cda3843102f052e70241cb09dfa77e5dfe274a46838d386b5dedab0ec5e2b73d3a3aaff31dded175894f8efca7f2c06961b539a09415a65c129e684758201b0c45badc1446bab475d2f4f4434bf1d373f0d"
+authority_verifying_key = "river:v1:vk:BjcR2x8vpUEPGLt72vm2L1ytL6JqTitZQvfpSogzMtxV"
+app_id = "river-desktop-update-key"
+# The fixed address the record is published at: derived from the pointer contract's frozen
+# code hash and (authority_verifying_key || app_id). Recorded for humans; a test recomputes it.
+pointer_key = "EZsS4gAUzv22AME7SioNgiTw8ahioNZNkfkvrTjHfasU"

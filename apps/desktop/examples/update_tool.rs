@@ -14,6 +14,10 @@
 //!     Hash each artifact, write <dir>/manifest.json and <dir>/manifest.json.sig.
 //!     --sequence defaults to the current unix time, which rises with every signing.
 //!
+//! update_tool check-key <hex>
+//!     Exit 0 if the 64 hex digits are an update-signing public key the app would accept in an
+//!     update-key record (a canonical point, not weak, not all zero), else 1.
+//!
 //! update_tool verify --pubkey <hex> --manifest <file> --sig <file>
 //!     Check a manifest the way the app does.
 //! ```
@@ -27,7 +31,10 @@
 //!
 //! A new key is a new release, because the key is compiled into each build: run
 //! `update_tool keygen <file>`, commit the printed public key to `update-pubkey.hex` in a
-//! reviewed PR, then cut a release. Installed versions keep trusting the old key.
+//! reviewed PR, then cut a release. Installed versions keep trusting the old key until they see
+//! a signed update-key record naming the new one (`scripts/sign-update-key-record.sh`,
+//! `apps/desktop/update-authority.toml`): publish that record BEFORE the old key is retired, and
+//! pin it into the release. An install that cannot reach its node keeps the key it has.
 //!
 //! # Publishing a release
 //!
@@ -78,6 +85,7 @@ fn main() {
         ),
         Some("sign") => sign(args.collect()),
         Some("verify") => verify(args.collect()),
+        Some("check-key") => check_key(args.collect()),
         _ => die("usage: update_tool keygen|sign|verify (see the top of examples/update_tool.rs)"),
     }
 }
@@ -220,5 +228,26 @@ fn verify(args: Vec<String>) {
             m.artifacts.len()
         ),
         Err(e) => die(&format!("invalid: {e}")),
+    }
+}
+
+/// `check-key <hex>`: the same test the app applies to a key named by an update-key record.
+fn check_key(args: Vec<String>) {
+    let ok = match args.as_slice() {
+        [hexkey] => <[u8; 32]>::try_from(hex::decode(hexkey).unwrap_or_default())
+            .ok()
+            .is_some_and(|k| {
+                k != [0u8; 32]
+                    && freenet_migrate::is_canonical_field_element(&k)
+                    && ed25519_dalek::VerifyingKey::from_bytes(&k).is_ok_and(|v| !v.is_weak())
+            }),
+        _ => {
+            eprintln!("usage: update_tool check-key <64 hex digits>");
+            exit(2);
+        }
+    };
+    if !ok {
+        eprintln!("not an acceptable update-signing public key");
+        exit(1);
     }
 }

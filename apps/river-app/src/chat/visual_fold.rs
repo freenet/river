@@ -16,6 +16,17 @@ pub(crate) fn names_fold_together(a: &str, b: &str) -> bool {
     folds_together(a, b)
 }
 
+/// The two folds [`names_fold_together`] compares, for a name compared with many others.
+pub(crate) fn name_folds(name: &str) -> [String; 2] {
+    comparison_folds(name)
+}
+
+/// [`names_fold_together`] on folds from [`name_folds`]: a name that folds to nothing matches
+/// nothing.
+pub(crate) fn folds_match(a: &[String; 2], b: &[String; 2]) -> bool {
+    !a[0].is_empty() && (a[0] == b[0] || a[1] == b[1])
+}
+
 /// `s` as a plain-text search compares it: combining marks dropped, precomposed Latin letters
 /// reduced to their unaccented base (the NFD-then-drop-marks step below), then lowercased. Unlike
 /// the skeleton folds this keeps look-alike letters apart (`l` is not `I`), so a typed query
