@@ -3688,9 +3688,11 @@ dependencies = [
 name = "river-desktop"
 version = "0.1.0"
 dependencies = [
+ "bs58",
  "directories",
  "ed25519-dalek",
  "flate2",
+ "freenet-migrate",
  "getrandom 0.3.4",
  "hex",
  "ksni",
@@ -3704,6 +3706,7 @@ dependencies = [
  "sha2",
  "tar",
  "tempfile",
+ "toml 0.8.23",
  "tray-icon",
  "ureq",
  "windows-sys 0.59.0",

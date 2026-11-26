@@ -6,6 +6,28 @@
 //! this module never sees a key, a hash or a path. It asks the host to check, to download and to
 //! restart, and shows what comes back.
 //!
+//! # Trust
+//!
+//! The one thing this module does for the trust decision is carry bytes. A host that has an
+//! update-key record ([`UpdateHost::key_record_id`], freenet/river#927: it says which key signs
+//! updates, or that none does) gets it fetched from the node right before each check
+//! ([`UpdateController::set_record_source`], [`NodeRecordSource`]: a GET with the app's saved
+//! grant, no code, no subscription) and receives the raw bytes as a [`KeyRecord`]. Whether they
+//! are a record, which key they name, and what to do with an older one are the host's alone
+//! (see `apps/desktop/src/update/mod.rs`, `# Trust`, for the failure table). Here:
+//!
+//! - **No answer** (no grant yet, node down, slower than a few seconds) is
+//!   [`KeyRecord::Unavailable`]: the check goes ahead, never delayed past that wait, and the
+//!   host falls back on what an earlier check kept.
+//! - The node's own answer that it has no such contract is [`KeyRecord::Absent`].
+//! - `river --self-update` has no link: it reads the record with [`NodeRecordSource::saved`] (the
+//!   grant the app saved for the node it would use), and without one goes on with what an
+//!   earlier check kept.
+//! - The fetch has its own deadline (connect included); a source that hangs or panics costs the
+//!   check at most that wait.
+//! - This module cannot undo an installed update and cannot act while the node is unreachable on
+//!   a fresh install. Deleting the host's update notes forgets every record kept.
+//!
 //! # What the person sees
 //!
 //! - **Automatic (the default).** A newer signed version downloads in the background, is
@@ -31,8 +53,8 @@
 //! The check runs shortly after start and then every 6 to 12 hours (a random delay, so every
 //! install does not ask in the same minute).
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -58,6 +80,50 @@ pub struct UpdateInfo {
     pub required: bool,
 }
 
+/// What the node said about River's update-key record (see the desktop shell's
+/// `update/keyrecord.rs`) when the host asked for it. The bytes are the raw record: this
+/// crate never judges them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeyRecord {
+    /// The state the node served.
+    State(Vec<u8>),
+    /// The node answered that it has no such contract.
+    Absent,
+    /// No node to ask (no grant yet), no answer in time, or an error.
+    Unavailable,
+}
+
+/// Fetches the update-key record from the node.
+pub trait KeyRecordSource: Send + Sync + 'static {
+    /// The state at contract `id`, waiting at most `wait`.
+    fn fetch(&self, id: [u8; 32], wait: Duration) -> KeyRecord;
+}
+
+/// How long a check waits for the update-key record before going on without it.
+const KEY_RECORD_WAIT: Duration = Duration::from_secs(5);
+/// How long past the fetch's own wait a check lets it run before giving up on it.
+const KEY_RECORD_GRACE: Duration = Duration::from_secs(2);
+
+/// The update-key record for `host`, fetched through `source`, within `wait` plus `grace`. A
+/// host with no record, a missing source, a source that panics and one that does not answer in
+/// time are all [`KeyRecord::Unavailable`]: the check goes on without it. The fetch runs on a
+/// thread of its own, so a source stuck in a connect cannot hold the caller past the limit.
+pub fn fetch_key_record(
+    host: &dyn UpdateHost,
+    source: Option<Arc<dyn KeyRecordSource>>,
+    wait: Duration,
+    grace: Duration,
+) -> KeyRecord {
+    let (Some(id), Some(source)) = (host.key_record_id(), source) else {
+        return KeyRecord::Unavailable;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || drop(tx.send(source.fetch(id, wait))));
+    // A panic drops the sender, which ends the wait at once.
+    rx.recv_timeout(wait + grace)
+        .unwrap_or(KeyRecord::Unavailable)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UpdateCheck {
     UpToDate,
@@ -81,8 +147,13 @@ pub trait UpdateHost: Send + Sync + 'static {
     fn take_notice(&self) -> Option<String> {
         None
     }
-    /// Fetch and verify the signed manifest.
-    fn check(&self) -> Result<UpdateCheck, String>;
+    /// The contract id of the update-key record, or `None` when this host has none. The
+    /// controller fetches it from the node and passes what it found to [`Self::check`].
+    fn key_record_id(&self) -> Option<[u8; 32]> {
+        None
+    }
+    /// Fetch and verify the signed manifest, under the update key `record` leaves trusted.
+    fn check(&self, record: KeyRecord) -> Result<UpdateCheck, String>;
     /// Download and verify what the last check offered, reporting `(received, total)`.
     /// Returns the version now ready.
     fn download(&self, progress: &mut dyn FnMut(u64, u64)) -> Result<String, String>;
@@ -148,6 +219,8 @@ pub struct UpdateController {
     report: Arc<dyn Fn(UpdateEvent) + Send + Sync>,
     busy: Arc<AtomicBool>,
     auto: Arc<AtomicBool>,
+    records: Arc<Mutex<Option<Arc<dyn KeyRecordSource>>>>,
+    record_wait: (Duration, Duration),
 }
 
 impl UpdateController {
@@ -161,7 +234,38 @@ impl UpdateController {
             report: Arc::new(report),
             busy: Arc::new(AtomicBool::new(false)),
             auto: Arc::new(AtomicBool::new(auto)),
+            records: Arc::new(Mutex::new(None)),
+            record_wait: (KEY_RECORD_WAIT, KEY_RECORD_GRACE),
         }
+    }
+
+    /// For tests: how long the record fetch may take.
+    #[cfg(test)]
+    fn with_record_wait(mut self, wait: Duration, grace: Duration) -> Self {
+        self.record_wait = (wait, grace);
+        self
+    }
+
+    /// Where to read the update-key record before each check. Without one every check goes
+    /// ahead on what the host already knows (the record seen by an earlier check, else its
+    /// compiled-in key).
+    pub fn set_record_source(&self, source: Arc<dyn KeyRecordSource>) {
+        *self
+            .records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(source);
+    }
+
+    /// The update-key record, right now, within the record wait: a node that is slow or not
+    /// there must not delay the check.
+    fn key_record(&self) -> KeyRecord {
+        let source = self
+            .records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let (wait, grace) = self.record_wait;
+        fetch_key_record(&*self.host, source, wait, grace)
     }
 
     pub fn host(&self) -> &Arc<dyn UpdateHost> {
@@ -243,7 +347,7 @@ impl UpdateController {
 
     fn check_and_fetch(&self) {
         self.status(UpdateStatus::Checking);
-        match self.host.check() {
+        match self.host.check(self.key_record()) {
             Ok(UpdateCheck::UpToDate) => self.status(UpdateStatus::UpToDate),
             Ok(UpdateCheck::Available(info)) => {
                 let fetch = self.auto.load(Ordering::SeqCst)
@@ -413,6 +517,57 @@ impl UpdateUi {
     }
 }
 
+/// Reads the update-key record from a node with the app's saved grant: a GET without code or
+/// subscription, as the generation watch reads its records.
+pub struct NodeRecordSource {
+    access: Box<dyn Fn() -> Option<(String, crate::rooms::grant::GrantToken)> + Send + Sync>,
+}
+
+impl NodeRecordSource {
+    /// The node the rooms link follows now, and the grant saved for it.
+    pub fn new(link: crate::rooms::Link) -> Self {
+        NodeRecordSource {
+            access: Box::new(move || link.node_access()),
+        }
+    }
+
+    /// `authority` (`host:port`), with the grant saved in `config_dir` for it (`explicit`: the
+    /// person chose this node, see `rooms::token::node_dir`). For `river --self-update`, which
+    /// has no link.
+    pub fn saved(config_dir: std::path::PathBuf, authority: String, explicit: bool) -> Self {
+        NodeRecordSource {
+            access: Box::new(move || {
+                crate::rooms::saved_grant(&config_dir, &authority, explicit)
+                    .map(|token| (authority.clone(), token))
+            }),
+        }
+    }
+}
+
+impl KeyRecordSource for NodeRecordSource {
+    fn fetch(&self, id: [u8; 32], wait: Duration) -> KeyRecord {
+        use crate::rooms::generation::{Fetch, NodePointers, PointerSource};
+        // No saved grant yet (first run, not approved): nothing to ask with.
+        let Some((authority, token)) = (self.access)() else {
+            return KeyRecord::Unavailable;
+        };
+        let id = freenet_stdlib::prelude::ContractInstanceId::new(id);
+        let answer = Mutex::new(KeyRecord::Unavailable);
+        NodePointers.fetch(&authority, &token, &[id], wait, &|_, fetch| {
+            *answer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = match fetch {
+                Fetch::State(bytes) => KeyRecord::State(bytes),
+                Fetch::Absent => KeyRecord::Absent,
+                Fetch::Unreachable => KeyRecord::Unavailable,
+            };
+        });
+        answer
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,6 +593,8 @@ mod tests {
         restarts: AtomicUsize,
         check_calls: AtomicUsize,
         confirms: AtomicUsize,
+        record_id: Option<[u8; 32]>,
+        records: Mutex<Vec<KeyRecord>>,
     }
 
     impl FakeHost {
@@ -453,6 +610,8 @@ mod tests {
                 restarts: AtomicUsize::new(0),
                 check_calls: AtomicUsize::new(0),
                 confirms: AtomicUsize::new(0),
+                record_id: None,
+                records: Mutex::new(Vec::new()),
             }
         }
     }
@@ -473,7 +632,11 @@ mod tests {
         fn confirm_started(&self) {
             self.confirms.fetch_add(1, Ordering::SeqCst);
         }
-        fn check(&self) -> Result<UpdateCheck, String> {
+        fn key_record_id(&self) -> Option<[u8; 32]> {
+            self.record_id
+        }
+        fn check(&self, record: KeyRecord) -> Result<UpdateCheck, String> {
+            self.records.lock().unwrap().push(record);
             self.check_calls.fetch_add(1, Ordering::SeqCst);
             self.checks
                 .lock()
@@ -1189,5 +1352,124 @@ mod tests {
             version: "0.2.161".into(),
         });
         assert_eq!(host.confirms.load(Ordering::SeqCst), 1);
+    }
+
+    struct FakeSource(Box<dyn Fn() -> KeyRecord + Send + Sync>);
+    impl KeyRecordSource for FakeSource {
+        fn fetch(&self, id: [u8; 32], _: Duration) -> KeyRecord {
+            assert_eq!(id, [7; 32], "asked for the host's record");
+            (self.0)()
+        }
+    }
+
+    fn keyed(source: Option<FakeSource>) -> Arc<FakeHost> {
+        let mut host = FakeHost::new(UpdateSupport::Automatic, vec![Ok(UpdateCheck::UpToDate)]);
+        host.record_id = Some([7; 32]);
+        let host = Arc::new(host);
+        let (ctl, rx) = controller(host.clone(), false);
+        if let Some(s) = source {
+            ctl.set_record_source(Arc::new(s));
+        }
+        ctl.check_now();
+        settle(&ctl, &rx);
+        host
+    }
+
+    #[test]
+    fn the_checked_record_is_what_the_node_served() {
+        let host = keyed(Some(FakeSource(Box::new(|| KeyRecord::State(vec![1, 2])))));
+        assert_eq!(
+            *host.records.lock().unwrap(),
+            [KeyRecord::State(vec![1, 2])]
+        );
+    }
+
+    #[test]
+    fn without_a_source_the_record_is_unavailable() {
+        let host = keyed(None);
+        assert_eq!(*host.records.lock().unwrap(), [KeyRecord::Unavailable]);
+        // A host with no record at all is never asked.
+        let plain = Arc::new(FakeHost::new(UpdateSupport::Automatic, vec![]));
+        let (ctl, rx) = controller(plain.clone(), false);
+        ctl.set_record_source(Arc::new(FakeSource(Box::new(|| unreachable!()))));
+        ctl.check_now();
+        settle(&ctl, &rx);
+        assert_eq!(*plain.records.lock().unwrap(), [KeyRecord::Unavailable]);
+    }
+
+    fn assert_unavailable_fast(source: Option<Arc<dyn KeyRecordSource>>, why: &str) {
+        let mut host = FakeHost::new(UpdateSupport::Automatic, vec![]);
+        host.record_id = Some([7; 32]);
+        let began = std::time::Instant::now();
+        let got = fetch_key_record(
+            &host,
+            source,
+            Duration::from_millis(1),
+            Duration::from_millis(20),
+        );
+        assert_eq!(got, KeyRecord::Unavailable, "{why}");
+        assert!(began.elapsed() < Duration::from_secs(5), "{why}: waited");
+    }
+
+    #[test]
+    fn a_source_that_never_answers_or_panics_does_not_hold_the_check() {
+        // Blocks until the test lets it go: no sleeping on the clock.
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = Mutex::new(held);
+        let stuck = FakeSource(Box::new(move || {
+            let _ = held.lock().unwrap().recv();
+            KeyRecord::Absent
+        }));
+        assert_unavailable_fast(Some(Arc::new(stuck)), "stuck");
+        drop(release);
+        assert_unavailable_fast(
+            Some(Arc::new(FakeSource(Box::new(|| panic!("a broken source"))))),
+            "panicking",
+        );
+        assert_unavailable_fast(None, "no source");
+    }
+
+    #[test]
+    fn a_slow_source_does_not_delay_the_controller_past_its_wait() {
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = Mutex::new(held);
+        let mut host = FakeHost::new(UpdateSupport::Automatic, vec![Ok(UpdateCheck::UpToDate)]);
+        host.record_id = Some([7; 32]);
+        let host = Arc::new(host);
+        let (ctl, rx) = controller(host.clone(), false);
+        let ctl = ctl.with_record_wait(Duration::from_millis(1), Duration::from_millis(20));
+        ctl.set_record_source(Arc::new(FakeSource(Box::new(move || {
+            let _ = held.lock().unwrap().recv();
+            KeyRecord::Absent
+        }))));
+        ctl.check_now();
+        settle(&ctl, &rx);
+        drop(release);
+        assert_eq!(*host.records.lock().unwrap(), [KeyRecord::Unavailable]);
+    }
+
+    #[test]
+    fn the_node_source_without_a_grant_or_a_node_is_unavailable() {
+        let dir = std::env::temp_dir().join(format!("river-record-src-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 127.0.0.1:9 (discard) refuses connections: nothing listens.
+        let authority = "127.0.0.1:9".to_string();
+        let src = NodeRecordSource::saved(dir.clone(), authority.clone(), true);
+        // No saved grant: nothing is asked.
+        assert_eq!(
+            src.fetch([7; 32], Duration::from_secs(1)),
+            KeyRecord::Unavailable
+        );
+        // A grant, but no node.
+        let node_dir = crate::rooms::token::node_dir(&dir, &authority, true);
+        crate::rooms::token::TokenStore::in_dir(&node_dir)
+            .save(&crate::rooms::grant::GrantToken::new("abc123".into()))
+            .unwrap();
+        assert_eq!(
+            src.fetch([7; 32], Duration::from_secs(1)),
+            KeyRecord::Unavailable
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

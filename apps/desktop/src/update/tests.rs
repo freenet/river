@@ -94,6 +94,7 @@ impl Rig {
                 handshake_timeout: Duration::from_secs(3),
                 floor: Trust::default(),
                 retry_delay: Duration::ZERO,
+                key_authority: None,
             },
             installer,
         )
@@ -210,7 +211,7 @@ fn an_update_is_verified_swapped_started_and_confirmed() {
     let rig = Rig::new();
     let u = rig.updater("0.1.0", &server.url("/manifest.json"), 1);
 
-    let found = offer(u.check().unwrap());
+    let found = offer(u.check(&KeyRecord::Unavailable).unwrap());
     assert_eq!(found.version, Version(0, 2, 0));
     assert_eq!(rig.installed(), OLD, "checking changes nothing");
 
@@ -259,7 +260,10 @@ fn an_update_is_verified_swapped_started_and_confirmed() {
     assert_eq!(fs::read_to_string(&marker).unwrap(), "0.2.0");
     assert!(state::load(rig.data.path()).probation.is_none());
     // The version it now runs is current.
-    assert_eq!(new.check().unwrap(), CheckResult::UpToDate);
+    assert_eq!(
+        new.check(&KeyRecord::Unavailable).unwrap(),
+        CheckResult::UpToDate
+    );
 }
 
 #[test]
@@ -269,7 +273,7 @@ fn a_new_binary_that_crashes_is_rolled_back() {
     Release::new("0.2.0", 10, crashes("0.2.0")).publish(&server);
     let rig = Rig::new();
     let u = rig.updater("0.1.0", &server.url("/manifest.json"), 1);
-    u.check().unwrap();
+    u.check(&KeyRecord::Unavailable).unwrap();
     u.download(&mut |_, _| {}).unwrap();
     let applied = u.apply().unwrap();
     assert_eq!(rig.installed(), crashes("0.2.0"));
@@ -294,7 +298,7 @@ fn a_new_binary_that_never_confirms_is_killed_and_rolled_back() {
     let rig = Rig::new();
     let mut cfg_updater = rig.updater("0.1.0", &server.url("/manifest.json"), 1);
     cfg_updater.cfg.handshake_timeout = Duration::from_millis(600);
-    cfg_updater.check().unwrap();
+    cfg_updater.check(&KeyRecord::Unavailable).unwrap();
     cfg_updater.download(&mut |_, _| {}).unwrap();
     let applied = cfg_updater.apply().unwrap();
     let started = std::time::Instant::now();
@@ -315,7 +319,7 @@ fn a_binary_that_will_not_run_is_never_installed() {
         Release::new("0.2.0", 10, binary).publish(&server);
         let rig = Rig::new();
         let u = rig.updater("0.1.0", &server.url("/manifest.json"), 1);
-        u.check().unwrap();
+        u.check(&KeyRecord::Unavailable).unwrap();
         u.download(&mut |_, _| {}).unwrap();
         assert!(u.apply().is_err(), "{name}");
         rig.assert_untouched(name);
@@ -336,7 +340,10 @@ fn hostile_servers_and_manifests_are_refused_and_change_nothing() {
         ..Release::new("0.2.0", 10, healthy("0.2.0"))
     }
     .publish(&server);
-    let err = rig.updater("0.1.0", &url, 1).check().unwrap_err();
+    let err = rig
+        .updater("0.1.0", &url, 1)
+        .check(&KeyRecord::Unavailable)
+        .unwrap_err();
     assert!(err.contains("signature"), "{err}");
     rig.assert_untouched("bad signature");
     assert_eq!(
@@ -349,7 +356,11 @@ fn hostile_servers_and_manifests_are_refused_and_change_nothing() {
     let rig = Rig::new();
     good.publish(&server);
     server.set("/manifest.json.sig", Reply::Status(404));
-    assert!(rig.updater("0.1.0", &url, 1).check().is_err());
+    assert!(
+        rig.updater("0.1.0", &url, 1)
+            .check(&KeyRecord::Unavailable)
+            .is_err()
+    );
     rig.assert_untouched("unsigned");
 
     // Manifest bytes altered after signing.
@@ -359,7 +370,10 @@ fn hostile_servers_and_manifests_are_refused_and_change_nothing() {
     let at = altered.windows(5).position(|w| w == b"0.2.0").unwrap();
     altered[at + 2] = b'9';
     server.set("/manifest.json", Reply::Body(altered));
-    let err = rig.updater("0.1.0", &url, 1).check().unwrap_err();
+    let err = rig
+        .updater("0.1.0", &url, 1)
+        .check(&KeyRecord::Unavailable)
+        .unwrap_err();
     assert!(err.contains("signature"), "{err}");
     rig.assert_untouched("altered manifest");
 
@@ -371,7 +385,7 @@ fn hostile_servers_and_manifests_are_refused_and_change_nothing() {
     evil[last] ^= 0xff;
     server.set("/river-0.2.0.tar.gz", Reply::Body(evil));
     let u = rig.updater("0.1.0", &url, 1);
-    u.check().unwrap();
+    u.check(&KeyRecord::Unavailable).unwrap();
     let err = u.download(&mut |_, _| {}).unwrap_err();
     assert!(err.contains("signed checksum"), "{err}");
     assert!(u.staged_version().is_none());
@@ -417,7 +431,10 @@ fn downgrades_replays_rollbacks_and_expiry_are_refused() {
 
     // A genuine signed manifest for an older version than the one running: nothing offered.
     Release::new("0.0.9", 5, healthy("0.0.9")).publish(&server);
-    assert_eq!(u.check().unwrap(), CheckResult::UpToDate);
+    assert_eq!(
+        u.check(&KeyRecord::Unavailable).unwrap(),
+        CheckResult::UpToDate
+    );
     assert!(
         u.download(&mut |_, _| {}).is_err(),
         "nothing was offered, so nothing downloads"
@@ -426,25 +443,25 @@ fn downgrades_replays_rollbacks_and_expiry_are_refused() {
 
     // The current release is accepted and remembered.
     Release::new("0.2.0", 10, healthy("0.2.0")).publish(&server);
-    offer(u.check().unwrap());
+    offer(u.check(&KeyRecord::Unavailable).unwrap());
     // Replay: the older signed manifest, genuinely signed, comes back.
     Release::new("0.0.9", 5, healthy("0.0.9")).publish(&server);
-    let err = u.check().unwrap_err();
+    let err = u.check(&KeyRecord::Unavailable).unwrap_err();
     assert!(err.contains("older than one already seen"), "{err}");
     // Replay of an old sequence carrying a newer version number is just as stale.
     Release::new("0.3.0", 9, healthy("0.3.0")).publish(&server);
     assert!(
-        u.check()
+        u.check(&KeyRecord::Unavailable)
             .unwrap_err()
             .contains("older than one already seen")
     );
     // Rollback: a new signing that names an older version than was already offered.
     Release::new("0.1.5", 11, healthy("0.1.5")).publish(&server);
-    let err = u.check().unwrap_err();
+    let err = u.check(&KeyRecord::Unavailable).unwrap_err();
     assert!(err.contains("already offered"), "{err}");
     // The remembered floor survives a restart of the app.
     let again = rig.updater("0.1.0", &url, 1);
-    assert!(again.check().is_err());
+    assert!(again.check(&KeyRecord::Unavailable).is_err());
     rig.assert_untouched("replay and rollback");
 
     // Expiry.
@@ -457,7 +474,11 @@ fn downgrades_replays_rollbacks_and_expiry_are_refused() {
         NOW + 100_001,
         Arc::new(LinuxInstaller::at(rig2.install.clone())),
     );
-    assert!(late.check().unwrap_err().contains("expired"));
+    assert!(
+        late.check(&KeyRecord::Unavailable)
+            .unwrap_err()
+            .contains("expired")
+    );
     rig2.assert_untouched("expired");
     // A manifest dated far ahead of this clock.
     let early = rig2.updater_with(
@@ -467,7 +488,12 @@ fn downgrades_replays_rollbacks_and_expiry_are_refused() {
         NOW - 10 * 86_400,
         Arc::new(LinuxInstaller::at(rig2.install.clone())),
     );
-    assert!(early.check().unwrap_err().contains("future"));
+    assert!(
+        early
+            .check(&KeyRecord::Unavailable)
+            .unwrap_err()
+            .contains("future")
+    );
     rig2.assert_untouched("from the future");
 }
 
@@ -481,7 +507,7 @@ fn a_staged_update_is_verified_again_before_it_is_applied() {
     // The artifact changed on disk after it was downloaded.
     let rig = Rig::new();
     let u = rig.updater("0.1.0", &url, 1);
-    u.check().unwrap();
+    u.check(&KeyRecord::Unavailable).unwrap();
     u.download(&mut |_, _| {}).unwrap();
     let staged = state::load(rig.data.path()).staged.unwrap();
     let mut bytes = fs::read(&staged.artifact).unwrap();
@@ -493,7 +519,7 @@ fn a_staged_update_is_verified_again_before_it_is_applied() {
     // The stored manifest was swapped for one signed by another key.
     let rig = Rig::new();
     let u = rig.updater("0.1.0", &url, 1);
-    u.check().unwrap();
+    u.check(&KeyRecord::Unavailable).unwrap();
     u.download(&mut |_, _| {}).unwrap();
     let staged = state::load(rig.data.path()).staged.unwrap();
     let mut sig = fs::read(&staged.signature).unwrap();
@@ -505,7 +531,7 @@ fn a_staged_update_is_verified_again_before_it_is_applied() {
     // A newer River than the staged one already runs.
     let rig = Rig::new();
     let u = rig.updater("0.1.0", &url, 1);
-    u.check().unwrap();
+    u.check(&KeyRecord::Unavailable).unwrap();
     u.download(&mut |_, _| {}).unwrap();
     let running_newer = rig.updater("0.2.0", &url, 1);
     running_newer.remember_install();
@@ -534,7 +560,7 @@ fn a_copy_managed_by_something_else_is_never_replaced() {
     );
     assert!(matches!(u.support(), Support::External(_)));
     // It can still tell the person an update exists.
-    offer(u.check().unwrap());
+    offer(u.check(&KeyRecord::Unavailable).unwrap());
     let err = u.download(&mut |_, _| {}).unwrap_err();
     assert!(err.contains("package manager"), "{err}");
     assert!(u.apply().is_err());
@@ -658,7 +684,7 @@ fn river_never_turns_off_the_nodes_auto_update() {
 }
 
 fn stage_and_apply(u: &Updater) -> Applied {
-    offer(u.check().unwrap());
+    offer(u.check(&KeyRecord::Unavailable).unwrap());
     u.download(&mut |_, _| {}).unwrap();
     u.apply().unwrap()
 }
@@ -671,11 +697,11 @@ fn a_resigned_same_version_is_restaged_instead_of_wedging() {
     let rig = Rig::new();
     let u = rig.updater("0.1.0", &url, 1);
     Release::new("0.2.0", 10, healthy("0.2.0")).publish(&server);
-    offer(u.check().unwrap());
+    offer(u.check(&KeyRecord::Unavailable).unwrap());
     u.download(&mut |_, _| {}).unwrap();
     // The same version is signed again with a newer sequence before anyone pressed Restart.
     Release::new("0.2.0", 11, healthy("0.2.0")).publish(&server);
-    offer(u.check().unwrap());
+    offer(u.check(&KeyRecord::Unavailable).unwrap());
     u.download(&mut |_, _| {}).unwrap();
     assert_eq!(
         server.hits("/river-0.2.0.tar.gz"),
@@ -688,9 +714,9 @@ fn a_resigned_same_version_is_restaged_instead_of_wedging() {
     // A check that finds the same manifest again reuses what is staged.
     let rig = Rig::new();
     let u = rig.updater("0.1.0", &url, 1);
-    offer(u.check().unwrap());
+    offer(u.check(&KeyRecord::Unavailable).unwrap());
     u.download(&mut |_, _| {}).unwrap();
-    offer(u.check().unwrap());
+    offer(u.check(&KeyRecord::Unavailable).unwrap());
     u.download(&mut |_, _| {}).unwrap();
     assert_eq!(
         server.hits("/river-0.2.0.tar.gz"),
@@ -709,7 +735,7 @@ fn a_staged_manifest_that_expired_before_the_press_recovers() {
     short.expires_at = NOW + 1000;
     short.publish(&server);
     let u = rig.updater("0.1.0", &url, 1);
-    offer(u.check().unwrap());
+    offer(u.check(&KeyRecord::Unavailable).unwrap());
     u.download(&mut |_, _| {}).unwrap();
     // Later, the staged manifest has expired. Pressing Restart fails once and clears it.
     let later = NOW + 2000;
@@ -731,7 +757,7 @@ fn a_staged_manifest_that_expired_before_the_press_recovers() {
     rig.assert_untouched("expired staged update");
     // The publisher signs a fresh manifest; the next check stages and applies it.
     Release::new("0.2.0", 11, healthy("0.2.0")).publish(&server);
-    offer(u2.check().unwrap());
+    offer(u2.check(&KeyRecord::Unavailable).unwrap());
     u2.download(&mut |_, _| {}).unwrap();
     u2.apply().unwrap();
     assert_eq!(rig.installed(), healthy("0.2.0"));
@@ -745,11 +771,11 @@ fn a_superseded_staged_update_is_cleared_when_it_fails_to_apply() {
     let rig = Rig::new();
     Release::new("0.2.0", 10, healthy("0.2.0")).publish(&server);
     let u = rig.updater("0.1.0", &url, 1);
-    offer(u.check().unwrap());
+    offer(u.check(&KeyRecord::Unavailable).unwrap());
     u.download(&mut |_, _| {}).unwrap();
     // A newer signing is accepted by a check that never downloads it.
     Release::new("0.3.0", 12, healthy("0.3.0")).publish(&server);
-    offer(u.check().unwrap());
+    offer(u.check(&KeyRecord::Unavailable).unwrap());
     let err = u.apply().unwrap_err();
     assert!(err.contains("older than one already seen"), "{err}");
     assert!(state::load(rig.data.path()).staged.is_none());
@@ -777,7 +803,10 @@ fn a_signature_that_lags_the_manifest_is_fetched_again_once() {
         ),
     );
     let u = rig.updater("0.1.0", &server.url("/manifest.json"), 1);
-    offer(u.check().expect("one retry covers CDN skew"));
+    offer(
+        u.check(&KeyRecord::Unavailable)
+            .expect("one retry covers CDN skew"),
+    );
     assert_eq!(server.hits("/manifest.json.sig"), 2);
     // A signature that stays wrong is still refused, after one retry only.
     let rig = Rig::new();
@@ -785,7 +814,7 @@ fn a_signature_that_lags_the_manifest_is_fetched_again_once() {
     let before = server.hits("/manifest.json.sig");
     assert!(
         rig.updater("0.1.0", &server.url("/manifest.json"), 1)
-            .check()
+            .check(&KeyRecord::Unavailable)
             .unwrap_err()
             .contains("signature")
     );
@@ -804,7 +833,11 @@ fn an_unconfigured_build_refuses_to_update() {
         u
     };
     let u = placeholder(&rig);
-    assert!(u.check().unwrap_err().contains("no update key"));
+    assert!(
+        u.check(&KeyRecord::Unavailable)
+            .unwrap_err()
+            .contains("no update key")
+    );
     assert!(u.download(&mut |_, _| {}).is_err());
     assert!(u.apply().is_err());
     assert_eq!(server.hits("/manifest.json"), 0, "it did not even ask");
@@ -812,7 +845,7 @@ fn an_unconfigured_build_refuses_to_update() {
     // Through the app's host too.
     use river_app::{UpdateHost, UpdateSupport};
     let host = host::DesktopUpdate::with_parts(placeholder(&rig), PLACEHOLDER_PUBKEY);
-    assert!(host.check().is_err());
+    assert!(host.check(KeyRecord::Unavailable).is_err());
     assert!(matches!(host.support(), UpdateSupport::Unavailable(_)));
     assert!(host.restart().is_err());
 }
@@ -825,7 +858,7 @@ fn a_damaged_state_file_stops_updating_and_changes_nothing() {
     let rig = Rig::new();
     fs::write(state::path(rig.data.path()), b"{ truncated").unwrap();
     let u = rig.updater("0.1.0", &server.url("/manifest.json"), 1);
-    let err = u.check().unwrap_err();
+    let err = u.check(&KeyRecord::Unavailable).unwrap_err();
     assert!(err.contains("damaged"), "{err}");
     assert!(u.download(&mut |_, _| {}).is_err());
     assert!(u.apply().is_err());
@@ -849,7 +882,7 @@ fn a_build_floor_refuses_old_manifests_on_a_fresh_install() {
         highest_version: None,
     };
     assert!(
-        u.check()
+        u.check(&KeyRecord::Unavailable)
             .unwrap_err()
             .contains("older than one already seen")
     );
@@ -857,7 +890,11 @@ fn a_build_floor_refuses_old_manifests_on_a_fresh_install() {
         highest_sequence: 0,
         highest_version: Some(Version(0, 3, 0)),
     };
-    assert!(u.check().unwrap_err().contains("already offered"));
+    assert!(
+        u.check(&KeyRecord::Unavailable)
+            .unwrap_err()
+            .contains("already offered")
+    );
     rig.assert_untouched("build floor");
 }
 
@@ -868,7 +905,7 @@ fn an_install_that_changed_under_a_running_river_is_not_replaced() {
     Release::new("0.2.0", 10, healthy("0.2.0")).publish(&server);
     let rig = Rig::new();
     let u = rig.updater("0.1.0", &server.url("/manifest.json"), 1);
-    offer(u.check().unwrap());
+    offer(u.check(&KeyRecord::Unavailable).unwrap());
     u.download(&mut |_, _| {}).unwrap();
     // A package manager (or another River) replaces the file after this River started.
     fs::write(&rig.install, b"#!/bin/sh\necho river 0.1.5\n").unwrap();
@@ -974,7 +1011,7 @@ fn old_leftovers_are_swept_and_young_ones_kept() {
             .unwrap();
     }
     rig.updater("0.1.0", &server.url("/manifest.json"), 1)
-        .check()
+        .check(&KeyRecord::Unavailable)
         .unwrap();
     assert!(!old.exists() && !handshake.exists());
     assert!(young.exists());
@@ -1108,7 +1145,7 @@ fn a_swap_is_refused_while_the_installed_hash_is_unknown() {
     Release::new("0.2.0", 10, healthy("0.2.0")).publish(&server);
     let rig = Rig::new();
     let u = rig.updater("0.1.0", &server.url("/manifest.json"), 1);
-    offer(u.check().unwrap());
+    offer(u.check(&KeyRecord::Unavailable).unwrap());
     u.download(&mut |_, _| {}).unwrap();
     // A fresh updater (a new run) that has not yet recorded the install.
     let fresh = rig.updater("0.1.0", &server.url("/manifest.json"), 1);
@@ -1123,7 +1160,7 @@ fn download_waits_for_an_apply_in_progress() {
     Release::new("0.2.0", 10, healthy("0.2.0")).publish(&server);
     let rig = Rig::new();
     let u = rig.updater("0.1.0", &server.url("/manifest.json"), 1);
-    offer(u.check().unwrap());
+    offer(u.check(&KeyRecord::Unavailable).unwrap());
     let held = Lock::take(&rig.data.path().join("update/apply.lock")).unwrap();
     assert!(
         u.download(&mut |_, _| {})
@@ -1141,7 +1178,7 @@ fn a_restart_lets_go_of_the_lock_so_the_next_update_can_start() {
     Release::new("0.2.0", 10, healthy("0.2.0")).publish(&server);
     let rig = Rig::new();
     let u = rig.updater("0.1.0", &server.url("/manifest.json"), 1);
-    offer(u.check().unwrap());
+    offer(u.check(&KeyRecord::Unavailable).unwrap());
     u.download(&mut |_, _| {}).unwrap();
     let host = host::DesktopUpdate::with_parts(u, pubkey(1));
     host.restart_without_exiting(&[]).unwrap();
@@ -1158,7 +1195,7 @@ fn a_launch_that_only_shows_the_other_river_releases_the_updater_and_is_not_coun
     Release::new("0.2.0", 10, healthy("0.2.0")).publish(&server);
     let rig = Rig::new();
     let old = rig.updater("0.1.0", &server.url("/manifest.json"), 1);
-    old.check().unwrap();
+    old.check(&KeyRecord::Unavailable).unwrap();
     old.download(&mut |_, _| {}).unwrap();
     old.apply().unwrap();
     let starts = || state::load(rig.data.path()).probation.unwrap().starts;
@@ -1241,7 +1278,10 @@ fn a_state_file_from_a_newer_build_is_read_but_never_written_over() {
     let newer = br#"{"schema":99,"highest_sequence":5,"some_future_field":{"a":1}}"#;
     fs::write(state::path(rig.data.path()), newer).unwrap();
     let u = rig.updater("0.1.0", &server.url("/manifest.json"), 1);
-    offer(u.check().expect("a newer file is not a damaged one"));
+    offer(
+        u.check(&KeyRecord::Unavailable)
+            .expect("a newer file is not a damaged one"),
+    );
     assert_eq!(
         fs::read(state::path(rig.data.path())).unwrap(),
         newer,
@@ -1253,3 +1293,388 @@ fn a_state_file_from_a_newer_build_is_read_but_never_written_over() {
 /// Keep clippy honest about helpers only some tests use.
 #[allow(dead_code)]
 fn _unused(_: &Path, _: &SigningKey) {}
+
+// ---- the update-key record (freenet/river#927) ----
+
+mod key_record {
+    use super::*;
+    use crate::update::keyrecord::tests::{authority, key_of, record};
+
+    /// A rig whose build trusts key 1 and reads the record.
+    fn rotating(rig: &Rig, server: &TestServer) -> Updater {
+        let mut u = rig.updater("0.1.0", &server.url("/manifest.json"), 1);
+        u.cfg.key_authority = Some(authority());
+        u
+    }
+
+    fn release_signed_by(server: &TestServer, signer: u8) {
+        let mut r = Release::new("0.2.0", 10, healthy("0.2.0"));
+        r.signer = signer;
+        r.publish(server);
+    }
+
+    fn check(u: &Updater, fetched: Vec<u8>) -> Result<CheckResult, String> {
+        u.check(&KeyRecord::State(fetched))
+    }
+
+    fn offered(r: Result<CheckResult, String>) {
+        offer(r.unwrap());
+    }
+
+    #[test]
+    fn no_record_trusts_the_compiled_key() {
+        let ports = Ports::lock();
+        let server = ports.serve(vec![]);
+        release_signed_by(&server, 1);
+        let rig = Rig::new();
+        let u = rotating(&rig, &server);
+        offered(u.check(&KeyRecord::Absent));
+        offered(u.check(&KeyRecord::Unavailable));
+        release_signed_by(&server, 2);
+        assert!(u.check(&KeyRecord::Absent).is_err());
+    }
+
+    #[test]
+    fn a_record_replaces_the_compiled_key() {
+        let ports = Ports::lock();
+        let server = ports.serve(vec![]);
+        let rig = Rig::new();
+        let u = rotating(&rig, &server);
+        release_signed_by(&server, 1);
+        // A manifest the old key signed is refused once the record names another.
+        assert!(check(&u, record(1, key_of(2))).is_err());
+        release_signed_by(&server, 2);
+        offered(u.check(&KeyRecord::Unavailable));
+    }
+
+    #[test]
+    fn a_higher_record_rotates_again() {
+        let ports = Ports::lock();
+        let server = ports.serve(vec![]);
+        let rig = Rig::new();
+        let u = rotating(&rig, &server);
+        release_signed_by(&server, 2);
+        offered(check(&u, record(1, key_of(2))));
+        release_signed_by(&server, 3);
+        assert!(u.check(&KeyRecord::Unavailable).is_err());
+        offered(check(&u, record(2, key_of(3))));
+        release_signed_by(&server, 2);
+        assert!(u.check(&KeyRecord::Unavailable).is_err());
+    }
+
+    #[test]
+    fn a_stale_record_does_not_roll_the_key_back() {
+        let ports = Ports::lock();
+        let server = ports.serve(vec![]);
+        let rig = Rig::new();
+        let u = rotating(&rig, &server);
+        release_signed_by(&server, 3);
+        offered(check(&u, record(2, key_of(3))));
+        // A node serving the older record keeps it.
+        offered(check(&u, record(1, key_of(2))));
+        release_signed_by(&server, 2);
+        assert!(check(&u, record(1, key_of(2))).is_err());
+        release_signed_by(&server, 3);
+        offered(u.check(&KeyRecord::Unavailable));
+    }
+
+    #[test]
+    fn a_record_from_another_signer_or_app_is_ignored() {
+        use crate::update::keyrecord::tests::{APP_ID, authority_key, record_for};
+        let ports = Ports::lock();
+        let server = ports.serve(vec![]);
+        let rig = Rig::new();
+        let u = rotating(&rig, &server);
+        let stranger = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        release_signed_by(&server, 2);
+        for bad in [
+            record_for(&stranger, APP_ID, 5, key_of(2)),
+            record_for(&authority_key(), "river.chat-delegate", 5, key_of(2)),
+        ] {
+            assert!(check(&u, bad).is_err(), "key 2 must not be trusted");
+        }
+        release_signed_by(&server, 1);
+        offered(u.check(&KeyRecord::Unavailable));
+    }
+
+    #[test]
+    fn a_tombstone_refuses_every_update_and_a_higher_record_lifts_it() {
+        let ports = Ports::lock();
+        let server = ports.serve(vec![]);
+        let rig = Rig::new();
+        let u = rotating(&rig, &server);
+        release_signed_by(&server, 1);
+        let err = check(&u, record(1, [0; 32])).unwrap_err();
+        assert!(err.contains("withdrawn"), "{err}");
+        // Not the old key, not a node that goes quiet, not a replay of the record before it.
+        for fetched in [
+            KeyRecord::Unavailable,
+            KeyRecord::Absent,
+            KeyRecord::State(record(1, key_of(1))),
+        ] {
+            let err = u.check(&fetched).unwrap_err();
+            assert!(err.contains("withdrawn"), "{err}");
+        }
+        release_signed_by(&server, 6);
+        offered(check(&u, record(2, key_of(6))));
+    }
+
+    #[test]
+    fn an_unreachable_node_keeps_the_key_the_last_record_named() {
+        let ports = Ports::lock();
+        let server = ports.serve(vec![]);
+        let rig = Rig::new();
+        release_signed_by(&server, 2);
+        offered(check(&rotating(&rig, &server), record(1, key_of(2))));
+        // A later run, no node: the record is on disk.
+        let later = rotating(&rig, &server);
+        offered(later.check(&KeyRecord::Unavailable));
+        release_signed_by(&server, 1);
+        assert!(
+            later.check(&KeyRecord::Unavailable).is_err(),
+            "never the compiled key"
+        );
+        assert!(later.check(&KeyRecord::Absent).is_err());
+    }
+
+    #[test]
+    fn a_damaged_kept_record_refuses_updates_until_a_served_one_replaces_it() {
+        use crate::update::keyrecord::tests::{APP_ID, record_for};
+        let ports = Ports::lock();
+        let server = ports.serve(vec![]);
+        let rig = Rig::new();
+        let stranger = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        let forged = hex::encode(record_for(&stranger, APP_ID, 1, key_of(2)));
+        let mut flipped = record(1, key_of(2));
+        flipped[40] ^= 1;
+        for kept in [forged, hex::encode(flipped), "zz".to_string()] {
+            state::modify(rig.data.path(), |st| st.key_record = Some(kept)).unwrap();
+            let u = rotating(&rig, &server);
+            // Neither the compiled key nor the one the file names: nothing is trusted.
+            for signer in [1, 2] {
+                release_signed_by(&server, signer);
+                let err = u.check(&KeyRecord::Unavailable).unwrap_err();
+                assert!(err.contains("damaged"), "{err}");
+            }
+            // A verified record from the node puts it right.
+            release_signed_by(&server, 3);
+            offered(check(&u, record(1, key_of(3))));
+        }
+    }
+
+    #[test]
+    fn a_build_staged_under_a_key_revoked_since_is_refused_at_apply() {
+        let ports = Ports::lock();
+        let server = ports.serve(vec![]);
+        let rig = Rig::new();
+        let u = rotating(&rig, &server);
+        release_signed_by(&server, 1);
+        offered(u.check(&KeyRecord::Unavailable));
+        u.download(&mut |_, _| {}).unwrap();
+        assert_eq!(u.staged_version(), Some(Version(0, 2, 0)));
+        // The key is replaced (this check then fails: the server still offers the old build).
+        assert!(check(&u, record(1, key_of(2))).is_err());
+        assert_eq!(u.staged_version(), None, "no longer offered as ready");
+        assert!(u.apply().is_err(), "refused at restart");
+        rig.assert_untouched("a revoked key's build");
+        assert!(state::load(rig.data.path()).staged.is_none(), "discarded");
+    }
+
+    #[test]
+    fn a_withdrawn_key_refuses_a_staged_build_at_apply() {
+        let ports = Ports::lock();
+        let server = ports.serve(vec![]);
+        let rig = Rig::new();
+        let u = rotating(&rig, &server);
+        release_signed_by(&server, 1);
+        offered(u.check(&KeyRecord::Unavailable));
+        u.download(&mut |_, _| {}).unwrap();
+        assert!(check(&u, record(1, [0; 32])).is_err());
+        let err = u.apply().unwrap_err();
+        assert!(err.contains("withdrawn"), "{err}");
+        rig.assert_untouched("a withdrawn key's build");
+    }
+
+    #[test]
+    fn a_weak_or_zero_key_in_a_record_is_not_adopted() {
+        let ports = Ports::lock();
+        let server = ports.serve(vec![]);
+        let rig = Rig::new();
+        let u = rotating(&rig, &server);
+        release_signed_by(&server, 1);
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        offered(check(&u, record(1, identity)));
+        assert_eq!(state::load(rig.data.path()).key_record, None);
+    }
+
+    #[test]
+    fn the_record_is_kept_in_the_state_file_and_old_files_still_load() {
+        let ports = Ports::lock();
+        let server = ports.serve(vec![]);
+        let rig = Rig::new();
+        release_signed_by(&server, 2);
+        offered(check(&rotating(&rig, &server), record(1, key_of(2))));
+        let kept = state::load(rig.data.path()).key_record.unwrap();
+        assert_eq!(kept, hex::encode(record(1, key_of(2))));
+        let old: state::State =
+            serde_json::from_str(r#"{"schema":1,"highest_sequence":3}"#).unwrap();
+        assert_eq!(old.key_record, None);
+    }
+
+    #[test]
+    fn an_offer_checked_before_a_rotation_stages_nothing() {
+        let ports = Ports::lock();
+        let server = ports.serve(vec![]);
+        let rig = Rig::new();
+        let u = rotating(&rig, &server);
+        release_signed_by(&server, 1);
+        offered(u.check(&KeyRecord::Unavailable));
+        // The record now names key 2 (this check fails: the server still offers key 1's build).
+        assert!(check(&u, record(1, key_of(2))).is_err());
+        assert!(
+            u.download(&mut |_, _| {}).is_err(),
+            "refused under the new key"
+        );
+        assert!(state::load(rig.data.path()).staged.is_none());
+        assert!(
+            !rig.data.path().join("update/staged").exists(),
+            "nothing staged"
+        );
+    }
+
+    #[test]
+    fn download_is_refused_by_a_withdrawal_another_run_kept() {
+        let ports = Ports::lock();
+        let server = ports.serve(vec![]);
+        let rig = Rig::new();
+        release_signed_by(&server, 1);
+        let u = rotating(&rig, &server);
+        offered(u.check(&KeyRecord::Unavailable));
+        // Another River sees the tombstone; this one still holds its offer.
+        assert!(check(&rotating(&rig, &server), record(1, [0; 32])).is_err());
+        let err = u.download(&mut |_, _| {}).unwrap_err();
+        assert!(err.contains("withdrawn"), "{err}");
+        assert!(state::load(rig.data.path()).staged.is_none());
+    }
+
+    #[test]
+    fn a_staged_build_is_not_reused_after_a_rotation() {
+        let ports = Ports::lock();
+        let server = ports.serve(vec![]);
+        let rig = Rig::new();
+        let u = rotating(&rig, &server);
+        release_signed_by(&server, 1);
+        offered(u.check(&KeyRecord::Unavailable));
+        u.download(&mut |_, _| {}).unwrap();
+        // Key 2 signs the same release (same sequence and artifact) and the record names it.
+        release_signed_by(&server, 2);
+        offered(check(&u, record(1, key_of(2))));
+        u.download(&mut |_, _| {}).unwrap();
+        let staged = state::load(rig.data.path()).staged.unwrap();
+        let (manifest, sig) = (
+            fs::read(&staged.manifest).unwrap(),
+            fs::read(&staged.signature).unwrap(),
+        );
+        assert!(
+            manifest::verify_and_parse(&manifest, &sig, &pubkey(2)).is_ok(),
+            "the staged build was replaced by the one the new key signed"
+        );
+    }
+
+    #[test]
+    fn saved_state_is_newer_than_a_build_without_the_key_record() {
+        let ports = Ports::lock();
+        let server = ports.serve(vec![]);
+        let rig = Rig::new();
+        release_signed_by(&server, 2);
+        offered(check(&rotating(&rig, &server), record(1, key_of(2))));
+        let raw: serde_json::Value =
+            serde_json::from_slice(&fs::read(state::path(rig.data.path())).unwrap()).unwrap();
+        // A build from before the record wrote schema 1 and treats anything higher as written
+        // by a newer build: it reads it and never saves over it (`modify`), so `key_record` stays.
+        assert!(raw["schema"].as_u64().unwrap() > 1, "{raw}");
+        assert!(raw["key_record"].is_string());
+    }
+
+    #[test]
+    fn the_shipped_authority_is_what_the_running_app_reads() {
+        // `DesktopUpdate::new` is what main uses: no hand-set key authority.
+        let u = host::DesktopUpdate::new().expect("a data directory");
+        let shipped = crate::update::keyrecord::Authority::shipped().unwrap();
+        assert_eq!(
+            river_app::UpdateHost::key_record_id(&*u),
+            Some(shipped.pointer_id())
+        );
+    }
+
+    #[test]
+    fn self_update_reads_the_record_before_it_checks() {
+        struct Serves(KeyRecord);
+        impl river_app::KeyRecordSource for Serves {
+            fn fetch(&self, id: [u8; 32], _: Duration) -> KeyRecord {
+                assert_eq!(id, authority().pointer_id());
+                self.0.clone()
+            }
+        }
+        let ports = Ports::lock();
+        let server = ports.serve(vec![]);
+        let rig = Rig::new();
+        release_signed_by(&server, 1);
+        let u = host::DesktopUpdate::with_parts(rotating(&rig, &server), pubkey(1));
+        // The node says the key was withdrawn: the CLI path refuses, with no GUI check first.
+        let src: Arc<dyn river_app::KeyRecordSource> =
+            Arc::new(Serves(KeyRecord::State(record(1, [0; 32]))));
+        let err = host::cli_check(&u, Some(src)).unwrap_err();
+        assert!(err.contains("withdrawn"), "{err}");
+        // And run_cli goes through that function, with the app's source.
+        let text = include_str!("host.rs");
+        let body = &text[text.find("pub fn run_cli").unwrap()..];
+        assert!(body.contains("cli_check(&u, cli_record_source())"));
+    }
+
+    #[test]
+    fn a_rotation_kept_during_the_fetch_stops_the_floors_moving() {
+        let ports = Ports::lock();
+        let server = ports.serve(vec![]);
+        let rig = Rig::new();
+        let u = rotating(&rig, &server);
+        release_signed_by(&server, 1);
+        // Another River keeps a rotation (to key 2) after this one fetched the key-1 manifest,
+        // before it saves.
+        let data = rig.data.path().to_path_buf();
+        let other_data = data.clone();
+        *u.after_fetch.lock().unwrap() = Some(Box::new(move || {
+            state::modify(&other_data, |st| {
+                st.key_record = Some(hex::encode(record(1, key_of(2))));
+            })
+            .unwrap();
+        }));
+        let err = u.check(&KeyRecord::Unavailable).unwrap_err();
+        assert!(err.contains("signature"), "{err}");
+        assert!(err.contains("update key may have changed"), "{err}");
+        let st = state::load(&data);
+        assert_eq!(st.highest_sequence, 0, "the floor did not move");
+        assert_eq!(st.highest_version, None);
+        assert_eq!(st.last_checked, None);
+    }
+
+    #[test]
+    fn a_damaged_kept_record_uses_the_pins_key_when_the_build_pins_one() {
+        let ports = Ports::lock();
+        let server = ports.serve(vec![]);
+        let rig = Rig::new();
+        let mut u = rotating(&rig, &server);
+        // The build pins v1 naming key 2; its compiled key is 1.
+        let pin = hex::encode(record(1, key_of(2)));
+        u.cfg.key_authority = Some(authority().with_pinned(&pin).unwrap());
+        state::modify(rig.data.path(), |st| st.key_record = Some("zz".into())).unwrap();
+        release_signed_by(&server, 1);
+        assert!(
+            u.check(&KeyRecord::Unavailable).is_err(),
+            "not the compiled key"
+        );
+        release_signed_by(&server, 2);
+        offered(u.check(&KeyRecord::Unavailable));
+    }
+}

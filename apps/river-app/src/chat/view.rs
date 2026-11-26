@@ -9,6 +9,7 @@ use rune_kit::{Button, ButtonVariant, Checkbox, Kit, ScrollBar, ScrollBarStyle, 
 use super::conversation::{avatar, conversation, mention_overlay, picker_overlay};
 use super::dialog_kit::{self as dk, DialogSpec};
 use super::icons;
+use super::member_modal::Imitations;
 use super::model::{self, Member, Role, Room};
 use super::style::{self as st, Palette};
 use super::visual_fold;
@@ -931,10 +932,11 @@ fn members(chat: &Chat, room: &Room, overlay: bool, p: &Palette, k: &Kit) -> El 
     // The web UI's order: you first, then the invite tree from the owner down with deputies
     // under who appointed them, narrowed by the search box (see `member_list`).
     let rows = chat.member_rows();
+    let imitations = chat.imitations();
     let searching = chat.member_search.open;
     let mut list = col().key("member-list").gap(2.0).px(8.0).pt(8.0);
     for &i in rows.iter() {
-        list = list.child(member_row(room, &room.members[i], p));
+        list = list.child(member_row(room, &room.members[i], &imitations, p));
     }
     if rows.is_empty() && searching && !chat.member_search.query.text.trim().is_empty() {
         list = list.child(
@@ -1130,8 +1132,9 @@ fn member_search_box(chat: &Chat, p: &Palette, k: &Kit) -> Option<El> {
     )
 }
 
-fn member_row(room: &Room, m: &Member, p: &Palette) -> El {
+fn member_row(room: &Room, m: &Member, imitations: &Imitations, p: &Palette) -> El {
     let uid = m.full_id;
+    let imitated = imitations.get(room, m.id);
     let mut r = row()
         .key(format!("member-{}", m.id))
         .h(40.0)
@@ -1140,7 +1143,11 @@ fn member_row(room: &Room, m: &Member, p: &Palette) -> El {
         .radius(8.0)
         .center_y()
         .role("button")
-        .label(format!("Member info: {}", m.nickname))
+        // A screen reader reads the row's label, not its children, so the warning is in it.
+        .label(match &imitated {
+            Some(i) => format!("Member info: {}, {}", m.nickname, i.label()),
+            None => format!("Member info: {}", m.nickname),
+        })
         .focusable(true)
         .cursor(rune::Cursor::Pointer)
         .on_press(move |s: &mut RiverApp| s.chat.open_member_full(uid))
@@ -1155,6 +1162,16 @@ fn member_row(room: &Room, m: &Member, p: &Palette) -> El {
     // for each; the Member ID in their dialog is what tells them apart, so it is offered here.
     if m.nickname == visual_fold::UNNAMED {
         r = r.help(format!("Member ID {}", m.uid));
+    }
+    // The web UI's `member-list-impersonation-warning`: the warning sign straight after the
+    // name, before the other marks, its tooltip the full sentence.
+    if let Some(i) = imitated {
+        r = r.child(
+            label("\u{26a0}".to_owned(), st::BODY, p.warning_text)
+                .key(format!("member-impersonation-{}", m.id))
+                .label(i.text)
+                .help(i.text),
+        );
     }
     if m.id == room.me {
         r = r.child(label("you", st::SMALL, p.text_muted));

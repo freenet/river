@@ -412,6 +412,8 @@ pub struct Chat {
     pub search: Option<search::Search>,
     /// The members panel's search box ([`member_list`]); closed and cleared when the room changes.
     pub member_search: member_list::MemberSearch,
+    /// Who imitates whom in the open room, with what it was computed for ([`Chat::imitations`]).
+    imitation_cache: std::cell::RefCell<Option<(u64, std::rc::Rc<member_modal::Imitations>)>>,
     /// Whether the window was last laid out narrow (set by the screen's layout hook), which
     /// decides which members flag shows the panel.
     pub(crate) narrow: bool,
@@ -598,6 +600,7 @@ impl Chat {
             switcher: None,
             search: None,
             member_search: Default::default(),
+            imitation_cache: Default::default(),
             narrow: false,
             flash: None,
             reply_dragged: false,
