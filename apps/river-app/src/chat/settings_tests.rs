@@ -1623,7 +1623,51 @@ fn the_about_section_shows_the_versions_the_source_and_the_licence() {
 }
 
 #[test]
-fn the_about_section_says_when_there_is_no_node() {
+fn the_about_section_shows_the_version_the_node_last_answered() {
+    use super::node_status::{Reach, StatusEvent};
+    let mut s = connected();
+    // What River learned when it connected, then what the node says after updating itself.
+    s.chat.update.node_version = Some("0.2.155".into());
+    let at = s.chat.status.address.clone();
+    s.chat.status.apply(
+        &at,
+        StatusEvent::Reach {
+            authority: at.clone(),
+            reach: Reach::Answered {
+                version: "0.2.158".into(),
+            },
+        },
+        std::time::Instant::now(),
+    );
+    s.chat.settings.open_at(Section::About);
+    let rt = render(s, WINDOW_SIZE);
+    assert_eq!(
+        find(&rt, "settings-about-node-version").text.as_deref(),
+        Some("0.2.158")
+    );
+    // Connection shows the same.
+    let mut s = connected();
+    s.chat.update.node_version = Some("0.2.155".into());
+    s.chat.status.apply(
+        &at,
+        StatusEvent::Reach {
+            authority: at.clone(),
+            reach: Reach::Answered {
+                version: "0.2.158".into(),
+            },
+        },
+        std::time::Instant::now(),
+    );
+    s.chat.settings.open_at(Section::Connection);
+    let rt = render(s, WINDOW_SIZE);
+    assert_eq!(
+        find(&rt, "settings-node-version").text.as_deref(),
+        Some("0.2.158")
+    );
+}
+
+#[test]
+fn the_about_section_says_when_no_version_is_known() {
     let mut s = connected();
     s.chat.update.node_version = None;
     s.chat.settings.open_at(Section::About);
@@ -1631,5 +1675,17 @@ fn the_about_section_says_when_there_is_no_node() {
     assert_eq!(
         find(&rt, "settings-about-node-version").text.as_deref(),
         Some("Not connected")
+    );
+}
+
+#[test]
+fn the_source_button_opens_the_repository_in_the_browser() {
+    let mut s = connected();
+    s.chat.settings.open_at(Section::About);
+    let mut rt = render(s, WINDOW_SIZE);
+    press(&mut rt, "settings-about-source");
+    assert_eq!(
+        rt.take_url_requests(),
+        vec!["https://github.com/freenet/river".to_owned()]
     );
 }

@@ -50,6 +50,9 @@ pub struct Palette {
     /// The connection dot: connected and failed (the web UI's `--color-success` and
     /// `--color-error`).
     pub success: Color,
+    /// Text that says something is fine (the web UI's `--color-success-text`); `success` is
+    /// for the dot and is too light to read as text on the light theme.
+    pub success_text: Color,
     pub error: Color,
 }
 
@@ -186,6 +189,7 @@ fn dark() -> Palette {
         danger_fill: hex("#b42318"),
         danger_fill_hover: hex("#d0392d"),
         success: hex("#22c55e"),
+        success_text: hex("#47cd89"),
         error: hex("#ef4444"),
     }
 }
@@ -214,6 +218,7 @@ fn light() -> Palette {
         // --color-border, --color-border-hover
         line: hex("#e0e0e4"),
         line_strong: hex("#d0d0d4"),
+        // Chosen, not web variables: lighter than the dark theme's 0.35 and 0.5.
         shadow: Color {
             r: 0.0,
             g: 0.0,
@@ -235,7 +240,7 @@ fn light() -> Palette {
         accent: link,
         // --color-accent-soft: the link colour at 9% over the panel.
         accent_soft: over(link, 0.09, panel),
-        // The dark value is the accent at about 55% over the panel.
+        // Chosen, not a web variable: the dark value is the accent at about 55% over the panel.
         accent_line: over(link, 0.55, panel),
         // --color-danger-text
         danger: hex("#b42318"),
@@ -247,8 +252,10 @@ fn light() -> Palette {
         danger_bg: hex("#fef2f2"),
         danger_fill: hex("#b42318"),
         danger_fill_hover: hex("#912018"),
-        // --color-success, --color-error
+        // --color-success, --color-error (the dot's colours)
         success: hex("#22c55e"),
+        // --color-success-text
+        success_text: hex("#067647"),
         error: hex("#ef4444"),
     }
 }
@@ -328,12 +335,17 @@ mod tests {
                 ("accent", p.accent),
                 ("danger", p.danger),
                 ("warning_text", p.warning_text),
+                ("success_text", p.success_text),
             ] {
                 for (surface, bg) in [("bg", p.bg), ("rail", p.rail), ("surface", p.surface)] {
                     let c = contrast(fg, bg);
-                    // The web UI's own muted and secondary inks are 4.47:1 and 4.48:1 on the
-                    // lifted surface (light and dark); everything else clears 4.5:1.
-                    let min = if surface == "surface" { 4.4 } else { min };
+                    // The one pair below 4.5:1 is the web UI's own: its light muted ink on
+                    // the lifted surface, 4.47:1. Everything else clears 4.5:1.
+                    let min = if !dark && name == "text_muted" && surface == "surface" {
+                        4.4
+                    } else {
+                        min
+                    };
                     assert!(c >= min, "dark={dark}: {name} on {surface} is {c:.2}:1");
                 }
             }

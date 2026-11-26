@@ -260,6 +260,18 @@ pub(super) fn section_rows(key: &'static str, rows: Vec<El>, p: &Palette) -> El 
     s
 }
 
+/// The node's version as Node status shows it: what it last answered with, else what River
+/// learned when it connected.
+fn node_version_text(chat: &super::Chat) -> String {
+    match chat
+        .status
+        .node_version(chat.update.node_version.as_deref())
+    {
+        Some(v) => super::node_status::safe_version(v),
+        None => "Not connected".to_owned(),
+    }
+}
+
 /// The Connection section: the node River talks to, the node's version, and where to see more.
 fn connection_section(chat: &super::Chat, p: &Palette, k: &Kit) -> El {
     let ui = &chat.update;
@@ -328,15 +340,7 @@ fn connection_section(chat: &super::Chat, p: &Palette, k: &Kit) -> El {
                 "settings-version-node-row",
                 label("Freenet version", st::BODY, p.text),
                 version_note,
-                label(
-                    match &ui.node_version {
-                        Some(v) => super::node_status::safe_version(v),
-                        None => "Not connected".to_owned(),
-                    },
-                    st::BODY,
-                    p.text,
-                )
-                .key("settings-node-version"),
+                label(node_version_text(chat), st::BODY, p.text).key("settings-node-version"),
                 p,
             ),
             setting_row(
@@ -543,6 +547,7 @@ fn appearance_section(chat: &super::Chat, p: &Palette, k: &Kit) -> El {
                     s.chat.set_theme(mode);
                 })
                 .build(k)
+                .checked(mode == chat.theme())
                 .key(format!("settings-theme-{}", mode.name())),
         );
     }
@@ -621,13 +626,7 @@ fn about_section(chat: &super::Chat, p: &Palette, k: &Kit) -> El {
         "settings-about-node-row",
         label("Freenet version", st::BODY, p.text),
         None,
-        value(
-            match &chat.update.node_version {
-                Some(v) => super::node_status::safe_version(v),
-                None => "Not connected".to_owned(),
-            },
-            "settings-about-node-version",
-        ),
+        value(node_version_text(chat), "settings-about-node-version"),
         p,
     );
     let source = setting_row(

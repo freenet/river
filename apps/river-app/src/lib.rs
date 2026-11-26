@@ -3599,6 +3599,52 @@ fn retry_button(k: &Kit) -> El {
 
 #[cfg(test)]
 mod tests {
+    /// The appearance choice is written when it changes and read back at start. Both calls are
+    /// in the code that runs in the app, not only in what tests drive (`dnd_persist` is off
+    /// in tests, so nothing here can write the real preferences file).
+    #[test]
+    fn the_appearance_choice_is_saved_and_read_back() {
+        let production = include_str!("lib.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("the file's code");
+        assert!(
+            production.contains("save_pref(chat::style::MODE_PREF, mode)"),
+            "sync_dnd must save the appearance"
+        );
+        assert!(
+            production.contains(".get::<String>(chat::style::MODE_PREF)"),
+            "init must read the appearance back"
+        );
+        // What the save writes is what the load reads.
+        let dir = std::env::temp_dir().join(format!("river-theme-pref-{}", std::process::id()));
+        let path = dir.join("prefs.json");
+        let mut c = chat::Chat::new(
+            chat::Source::Node(chat::LinkStatus::Loading),
+            vec![],
+            0,
+            0,
+            0,
+        );
+        c.set_theme(chat::style::Mode::Dark);
+        let saved = c.take_theme_dirty().expect("a change is saved");
+        merge_pref(&path, chat::style::MODE_PREF, saved).expect("written");
+        let map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("json");
+        let stored = map[chat::style::MODE_PREF].as_str().expect("a string");
+        let mut fresh = chat::Chat::new(
+            chat::Source::Node(chat::LinkStatus::Loading),
+            vec![],
+            0,
+            0,
+            0,
+        );
+        fresh.load_theme(stored);
+        assert_eq!(fresh.theme(), chat::style::Mode::Dark);
+        assert_eq!(fresh.take_theme_dirty(), None, "loading is not a change");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
     use rune::{Env, Runtime};
 
