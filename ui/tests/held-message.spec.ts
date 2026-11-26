@@ -4,40 +4,38 @@ import { callRiverTest } from "./river-test";
 
 // A message posted while its room is still subscribing is committed to the
 // room but not sent: the sync pass holds it until the subscription is
-// confirmed. The conversation must say so, not show it as posted, and drop the
-// notice when the change goes out. The hold itself is exercised by the native
-// tests in sync_info.rs; here a hook puts the room in that state.
+// confirmed. The message itself must read as pending, not posted, and switch
+// to sent when the change goes out. The hook sets the room up as the invite
+// path leaves it (registered with no baseline; its PUT sent with the room's
+// state); the pass and the timers are covered by native tests in sync_info.rs.
 
-const notice = (page: Page) => page.getByTestId("held-message-notice");
+const row = (page: Page, text: string) => committedRow(page, text);
+const status = (page: Page, text: string) => row(page, text).getByTestId("held-message-status");
 
-test("a message held for an unconfirmed subscription is shown as not sent, then sent", async ({ page }) => {
+test("a message held for an unconfirmed subscription is marked pending, then sent", async ({ page }) => {
   await openRoomWithComposer(page);
-  await expect(notice(page), "nothing held yet").toHaveCount(0);
-
-  await callRiverTest(page, "holdRoomUpdates");
+  await callRiverTest(page, "holdRoomUpdates", false);
   await submitMessage(page, "posted before the subscription");
-  await expect(committedRow(page, "posted before the subscription")).toBeVisible();
 
-  await expect(notice(page), "the unsent message is marked pending").toBeVisible();
-  await expect(notice(page)).toHaveAttribute("data-pending-state", "held");
-  await expect(notice(page)).toHaveAttribute("data-held-count", "1");
-  await expect(page.getByTestId("held-message-status")).toContainText("not been sent");
+  const message = row(page, "posted before the subscription");
+  await expect(message).toBeVisible();
+  await expect(message, "the message itself is marked").toHaveAttribute("data-pending-state", "held");
+  await expect(status(page, "posted before the subscription")).toHaveText("Sending");
 
   await settle(page);
-  await expect(notice(page), "it stays pending while it stays unsent").toBeVisible();
+  await expect(message, "it stays pending while it stays unsent").toHaveAttribute("data-pending-state", "held");
 
   await callRiverTest(page, "releaseRoomUpdates");
-  await expect(notice(page), "once sent, the notice is gone").toHaveCount(0);
-  await expect(committedRow(page, "posted before the subscription")).toBeVisible();
+  await expect(status(page, "posted before the subscription"), "once sent, the mark is gone").toHaveCount(0);
+  await expect(message).not.toHaveAttribute("data-pending-state", /.+/);
 });
 
-test("a second held message is counted, and nothing shows for a room with nothing held", async ({ page }) => {
+test("only the held messages are marked, and a room in error says not sent", async ({ page }) => {
   await openRoomWithComposer(page);
-  await callRiverTest(page, "holdRoomUpdates");
-  await submitMessage(page, "first held");
-  await expect(notice(page)).toHaveAttribute("data-held-count", "1");
-  await submitMessage(page, "second held");
-  await expect(notice(page)).toHaveAttribute("data-held-count", "2");
-  await callRiverTest(page, "releaseRoomUpdates");
-  await expect(notice(page)).toHaveCount(0);
+  await callRiverTest(page, "holdRoomUpdates", true);
+  await submitMessage(page, "will not go out");
+
+  await expect(row(page, "will not go out")).toHaveAttribute("data-pending-state", "failed");
+  await expect(status(page, "will not go out")).toHaveText("Not sent");
+  await expect(page.locator('[data-testid="message-row"][data-pending-state]'), "older messages are not marked").toHaveCount(1);
 });

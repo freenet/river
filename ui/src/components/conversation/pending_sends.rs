@@ -8,8 +8,6 @@
 
 use super::outbox::OUTBOX;
 use super::outbox_commit;
-use crate::components::app::sync_info::SYNC_INFO;
-use crate::components::app::ROOMS;
 use crate::util::{format_utc_as_full_datetime, format_utc_as_local_time};
 use dioxus::prelude::*;
 use ed25519_dalek::VerifyingKey;
@@ -100,60 +98,6 @@ pub(super) fn PendingSends(room: VerifyingKey, author: VerifyingKey) -> Element 
                                     }
                                 }
                             }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// The sender's own messages that are in the room but have not been sent: the
-/// sync pass skipped them because the room is not subscribed yet, and it stays
-/// that way until the subscription is confirmed (or retried). Without this the
-/// message reads as posted while nothing has left the device.
-///
-/// Rendered beside [`PendingSends`] with the same row styling, and gone as soon
-/// as the change is sent (`SyncInfo::state_updated` clears the hold).
-#[component]
-pub(super) fn HeldSends(room: VerifyingKey, author: VerifyingKey) -> Element {
-    // Reads two signals fallibly; anchored so a contended read cannot leave
-    // this unsubscribed (freenet/river#555).
-    crate::util::signal_guard::anchor();
-    let (Ok(sync_info), Ok(rooms)) = (SYNC_INFO.try_read(), ROOMS.try_read()) else {
-        crate::util::signal_guard::schedule_nudge();
-        return rsx! {};
-    };
-    let count = rooms.map.get(&room).map_or(0, |room_data| {
-        sync_info.held_message_count(
-            &room,
-            &room_data.room_state,
-            river_core::room_state::member::MemberId::from(author),
-        )
-    });
-    if count == 0 {
-        return rsx! {};
-    }
-    let text = if count == 1 {
-        "Your message has not been sent yet. It will go out as soon as the room connection is confirmed."
-    } else {
-        "Your messages have not been sent yet. They will go out as soon as the room connection is confirmed."
-    };
-    rsx! {
-        div { class: "msg-history", "data-testid": "held-messages",
-            div {
-                class: "msg-group",
-                "data-testid": "held-message-notice",
-                "data-pending-state": "held",
-                "data-held-count": "{count}",
-                div { class: "msg-row", "data-message-self": "true",
-                    div { class: "msg-gutter" }
-                    div { class: "msg-content relative min-w-0",
-                        span {
-                            "data-testid": "held-message-status",
-                            role: "status",
-                            class: "text-xs text-text-muted",
-                            "{text}"
                         }
                     }
                 }

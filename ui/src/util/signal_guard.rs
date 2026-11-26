@@ -314,8 +314,9 @@ mod tests {
 
     #[test]
     fn every_fallible_memo_anchors_before_its_first_try_read_and_nudges() {
-        // 13 across the 9 files; conversation.rs alone has 4, member_info_modal.rs 2.
-        assert_fallible_hooks_are_guarded(GUARDED_MEMO_SITES, "use_memo(", "freenet/river#555", 13);
+        // 14 across the 9 files; conversation.rs alone has 5 (the held-message
+        // marks among them), member_info_modal.rs 2.
+        assert_fallible_hooks_are_guarded(GUARDED_MEMO_SITES, "use_memo(", "freenet/river#555", 14);
     }
 
     #[test]

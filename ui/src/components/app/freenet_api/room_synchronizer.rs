@@ -1006,6 +1006,11 @@ impl RoomSynchronizer {
         } else {
             std::collections::HashMap::new()
         };
+        if web_api_available {
+            // The rooms that were due are settled: wake once more for the
+            // earliest one still waiting (a pause, or a later request).
+            super::response_handler::arm_next_timeout_pass();
+        }
 
         if !rooms_to_subscribe.is_empty() {
             for (owner_vk, state) in &rooms_to_subscribe {

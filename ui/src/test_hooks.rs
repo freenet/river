@@ -1402,7 +1402,7 @@ pub fn install_test_hooks() {
     // baseline, so every message posted afterwards is one that was not sent.
     set_hook(
         "holdRoomUpdates",
-        Closure::<dyn FnMut()>::new(|| {
+        Closure::<dyn FnMut(bool)>::new(|errored: bool| {
             crate::util::defer(|| {
                 let Some(key) = CURRENT_ROOM.peek().owner_key else {
                     return;
@@ -1410,10 +1410,23 @@ pub fn install_test_hooks() {
                 let Some(state) = ROOMS.peek().map.get(&key).map(|r| r.room_state.clone()) else {
                     return;
                 };
+                // An invited room: registered with no baseline, then its PUT
+                // goes out carrying the current state (as the invite path
+                // does), and a pass holds what is posted afterwards.
                 SYNC_INFO.with_mut(|sync_info| {
                     sync_info.register_new_room(key);
                     sync_info.update_sync_status(&key, RoomSyncStatus::Subscribing);
-                    sync_info.update_last_synced_state(&key, &state);
+                    crate::components::app::sync_info::invite_put_sent_in(sync_info, key, &state);
+                    if errored {
+                        sync_info.update_sync_status(
+                            &key,
+                            RoomSyncStatus::Error(ErrorReport::new(
+                                report_label("Disconnected"),
+                                "publish failed",
+                                "test",
+                            )),
+                        );
+                    }
                     sync_info.hold_update_for_test(&key);
                 });
             });

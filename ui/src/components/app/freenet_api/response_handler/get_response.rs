@@ -870,8 +870,12 @@ pub async fn handle_get_response(
                 // and nothing else runs a pass, so a message posted meanwhile
                 // would never be sent: arm this PUT's own timeout pass, as
                 // loaded rooms do. Deferred after the Subscribing write above.
+                // The PUT carried `retrieved_state_for_put`: that is what the
+                // network will hold, and the baseline a message posted before
+                // any reply is told apart from.
+                let put_state = retrieved_state_for_put.clone();
                 crate::util::defer(move || {
-                    crate::components::app::sync_info::subscribe_request_sent(owner_vk);
+                    crate::components::app::sync_info::invite_put_sent(owner_vk, put_state);
                 });
 
                 // Close the invitation modal by updating PENDING_INVITES directly.
@@ -1269,6 +1273,10 @@ pub async fn handle_get_response(
                                 "Sent PUT+subscribe for imported room {:?}",
                                 MemberId::from(owner_vk)
                             );
+                            // This PUT subscribes: arm its own timeout pass.
+                            crate::util::defer(move || {
+                                crate::components::app::sync_info::subscribe_request_sent(owner_vk);
+                            });
                             true
                         }
                         Err(e) => {
@@ -1898,11 +1906,17 @@ async fn put_state_to_current_key(
 
     if let Some(web_api) = WEB_API.write().as_mut() {
         match web_api.send(ClientRequest::ContractOp(put_request)).await {
-            Ok(_) => info!(
-                "Backward probe: PUT {} state to current contract for room {:?}",
-                label,
-                MemberId::from(owner_vk)
-            ),
+            Ok(_) => {
+                info!(
+                    "Backward probe: PUT {} state to current contract for room {:?}",
+                    label,
+                    MemberId::from(owner_vk)
+                );
+                // This PUT subscribes: arm its own timeout pass.
+                crate::util::defer(move || {
+                    crate::components::app::sync_info::subscribe_request_sent(owner_vk);
+                });
+            }
             Err(e) => error!(
                 "Backward probe: failed to PUT {} state for room {:?}: {}",
                 label,
@@ -3606,7 +3620,7 @@ mod tests {
                 .expect("end of invite branch");
         let arm = &prod[start..end];
         assert!(
-            arm.contains("sync_info::subscribe_request_sent(owner_vk)"),
+            arm.contains("sync_info::invite_put_sent(owner_vk, put_state)"),
             "the invite PUT success arm must arm its own pass"
         );
         let set_subscribing = prod
@@ -3614,7 +3628,7 @@ mod tests {
             .expect("Subscribing write");
         let noted = start
             + arm
-                .find("sync_info::subscribe_request_sent(owner_vk)")
+                .find("sync_info::invite_put_sent(owner_vk, put_state)")
                 .unwrap();
         assert!(set_subscribing < noted, "noted after Subscribing is set");
     }

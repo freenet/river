@@ -81,7 +81,7 @@ use self::mobile_surface::MobileSurfaceGuard;
 use self::not_member_notification::NotMemberNotification;
 use self::outbox::{NewMessage, PendingEffect, PendingKind, OUTBOX};
 use self::pending_effects::{apply_pending_effects, own_reaction_after_pending};
-use self::pending_sends::{HeldSends, PendingSends};
+use self::pending_sends::PendingSends;
 use self::reaction_picker::{ReactionInvoker, ReactionPicker, ReactionSurfaces};
 use self::seal::SealInput;
 use crate::components::conversation::message_input::MessageInput;
@@ -316,6 +316,14 @@ struct GroupedMessage {
     reply_strip: ReplyStrip,
     /// Propagation delay in seconds (send → receive), if known.
     receive_delay_secs: Option<i64>,
+}
+
+/// Own messages held back from the network (see `held_marks`).
+#[derive(Clone, PartialEq, Default)]
+struct HeldMarks {
+    ids: HashSet<MessageId>,
+    /// The room is in error: they will not go out by themselves.
+    not_sent: bool,
 }
 
 /// An item in the conversation display — either a message group or an event summary
@@ -1597,6 +1605,38 @@ pub fn Conversation() -> Element {
             }
             "No Room Selected".to_string()
         }
+    });
+
+    // The current room's own messages that are in the room but have not been
+    // sent: a sync pass held them because the room is not subscribed yet. They
+    // are marked on the message itself until the change goes out.
+    let held_marks = use_memo(move || {
+        // freenet/river#555: anchor before the fallible reads.
+        crate::util::signal_guard::anchor();
+        let none = Rc::new(HeldMarks::default());
+        let Some(key) = CURRENT_ROOM.read().owner_key else {
+            return none;
+        };
+        let Ok(sync_info) = SYNC_INFO.try_read() else {
+            crate::util::signal_guard::schedule_nudge();
+            return none;
+        };
+        // Nothing held (the usual case): do not read, or subscribe to, ROOMS.
+        if !sync_info.has_held_update(&key) {
+            return none;
+        }
+        let Ok(rooms) = ROOMS.try_read() else {
+            crate::util::signal_guard::schedule_nudge();
+            return none;
+        };
+        let Some(room_data) = rooms.map.get(&key) else {
+            return none;
+        };
+        let Some(author) = room_data.self_member_id() else {
+            return none;
+        };
+        let (ids, not_sent) = sync_info.held_messages(&key, &room_data.room_state, author);
+        Rc::new(HeldMarks { ids, not_sent })
     });
 
     // Unread activity waiting behind the mobile rooms panel: rooms OTHER
@@ -3124,6 +3164,7 @@ pub fn Conversation() -> Element {
                                                                 on_reply: on_group_reply,
                                                                 author_hue: author_hue,
                                                                 reactions: reaction_surfaces,
+                                                                held: held_marks.read().clone(),
                                                                 }
                                                             }
                                                         }
@@ -3188,7 +3229,6 @@ pub fn Conversation() -> Element {
                     {
                         if !reader_position.has_newer.get() {
                             PendingSends { room, author }
-                            HeldSends { room, author }
                         }
                     }
                     // Invisible sentinel right under the newest rendered row,
@@ -4113,6 +4153,8 @@ fn MessageGroupComponent(
     /// to the footers and never read here, so the picker opening or closing
     /// renders no group (#830).
     reactions: ReactionSurfaces,
+    /// Own messages not sent yet (`held_marks`); empty almost always.
+    held: Rc<HeldMarks>,
 ) -> Element {
     #[cfg(all(target_arch = "wasm32", feature = "example-data", feature = "no-sync"))]
     crate::test_hooks::note_message_group_render();
@@ -4296,6 +4338,11 @@ fn MessageGroupComponent(
                         // (`mobile_message_actions.rs`); a row being edited
                         // has the form instead.
                         let row_editing = editing_message.read().as_ref() == Some(&msg.id);
+                        // Not sent yet: marked on the message, like a pending send.
+                        let held_state: Option<&'static str> = held
+                            .ids
+                            .contains(&msg.message_id)
+                            .then_some(if held.not_sent { "failed" } else { "held" });
                         let press_row = msg.id.clone();
                         // Its reactions and who made them, once per render,
                         // as the chips show them.
@@ -4336,6 +4383,7 @@ fn MessageGroupComponent(
                                 "data-anchor-key": "{msg.id}",
                                 "data-testid": "message-row",
                                 "data-message-self": "{is_self}",
+                                "data-pending-state": held_state,
                                 // For main.css: on a desktop with a mouse, a row with no
                                 // reactions puts its controls at the end of its last line
                                 // instead of on a footer line of their own.
@@ -4721,13 +4769,27 @@ fn MessageGroupComponent(
                                                 // breaks a long URL only where it would overflow the column.
                                                 div {
                                                     "data-testid": "message-body",
-                                                    class: "msg-body text-[15px] leading-[22px] text-text max-w-[76ch]",
+                                                    class: if held_state.is_some() {
+                                                        "msg-body text-[15px] leading-[22px] text-text-muted max-w-[76ch]"
+                                                    } else {
+                                                        "msg-body text-[15px] leading-[22px] text-text max-w-[76ch]"
+                                                    },
                                                     div {
                                                         class: "prose prose-sm dark:prose-invert max-w-none [overflow-wrap:anywhere]",
                                                         dangerous_inner_html: "{msg.content_html}"
                                                     }
                                                     if msg.edited {
                                                         span { class: "text-xs ml-2 text-text-muted", "(edited)" }
+                                                    }
+                                                    // Held back from the network: "Sending" while it
+                                                    // will go out by itself, "Not sent" when it will not.
+                                                    if let Some(state) = held_state {
+                                                        span {
+                                                            "data-testid": "held-message-status",
+                                                            role: "status",
+                                                            class: if state == "failed" { "text-xs ml-2 text-danger" } else { "text-xs ml-2 text-text-muted" },
+                                                            if state == "failed" { "Not sent" } else { "Sending" }
+                                                        }
                                                     }
                                                 }
                                             }

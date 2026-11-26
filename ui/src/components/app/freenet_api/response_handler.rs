@@ -5,7 +5,7 @@
 pub(crate) mod get_response;
 mod put_response;
 mod subscribe_response;
-mod update_notification;
+pub(crate) mod update_notification;
 mod update_response;
 
 use super::delegate_migration::{is_migration_bookkeeping_key, SweepWrite};
@@ -1701,34 +1701,81 @@ fn empty_rooms() -> Rooms {
 /// branch of the message loop, which the per-room path (running off-loop) can't
 /// reach via `flags`.
 pub(crate) fn schedule_subscription_timeout_check() {
-    #[cfg(test)]
-    {
-        SCHEDULED_TIMEOUT_PASSES.with(|n| n.set(n.get() + 1));
+    arm_timeout_pass(super::constants::REPUT_DELAY_MS + 1000);
+}
+
+/// Arm the one pending timeout pass, `delay_ms` from now, unless one is armed
+/// already: any number of requests (one per room at startup) share a single
+/// timer, so N rooms cost one pass, not N. A pass that finds rooms still
+/// waiting arms the next one itself ([`arm_next_timeout_pass`]), which is what
+/// keeps a room whose request went out after the timer was armed covered.
+fn arm_timeout_pass(delay_ms: u64) {
+    let now = crate::components::app::sync_info::now_ms();
+    // An armed timer that is long overdue never fired (its task was lost):
+    // treat it as not armed rather than disarm the mechanism for good.
+    let overdue =
+        TIMEOUT_PASS_AT.with(|at| at.get().is_some_and(|t| now > t + TIMEOUT_PASS_GRACE_MS));
+    if TIMEOUT_PASS_AT.with(|at| at.get()).is_some() && !overdue {
+        return;
     }
+    TIMEOUT_PASS_AT.with(|at| at.set(Some(now + delay_ms as f64)));
+    #[cfg(test)]
+    SCHEDULED_TIMEOUT_PASSES.with(|n| n.borrow_mut().push(delay_ms));
     crate::util::safe_spawn_local(async move {
-        crate::util::sleep(std::time::Duration::from_millis(
-            super::constants::REPUT_DELAY_MS + 1000,
-        ))
-        .await;
+        crate::util::sleep(std::time::Duration::from_millis(delay_ms)).await;
         crate::util::defer(|| {
             let tx = crate::components::app::SYNCHRONIZER
                 .read()
                 .get_message_sender();
-            if let Err(e) =
-                tx.unbounded_send(super::freenet_synchronizer::SynchronizerMessage::ProcessRooms)
-            {
-                error!("Failed to schedule subscription timeout check: {}", e);
-            }
+            timeout_pass_fired(|| {
+                if let Err(e) = tx
+                    .unbounded_send(super::freenet_synchronizer::SynchronizerMessage::ProcessRooms)
+                {
+                    error!("Failed to schedule subscription timeout check: {}", e);
+                }
+            });
         });
     });
 }
 
-/// Test seam: how many timeout passes `schedule_subscription_timeout_check`
-/// was asked to arm on this thread.
+/// The timer elapsed: free the slot, then request the pass.
+fn timeout_pass_fired(request_pass: impl FnOnce()) {
+    TIMEOUT_PASS_AT.with(|at| at.set(None));
+    request_pass();
+}
+
+/// Called by a pass once it has settled the rooms that were due: arm a timer
+/// for the earliest room still waiting (a request sent after the last timer,
+/// or a room paused after repeated failures), if any.
+pub(crate) fn arm_next_timeout_pass() {
+    let next = crate::components::app::sync_info::SYNC_INFO
+        .try_read()
+        .ok()
+        .and_then(|si| si.next_timeout_delay_ms(crate::components::app::sync_info::now_ms()));
+    if let Some(delay_ms) = next {
+        arm_timeout_pass(delay_ms);
+    }
+}
+
+/// How long past its time an armed timer is trusted before it is replaced.
+const TIMEOUT_PASS_GRACE_MS: f64 = 30_000.0;
+
+thread_local! {
+    /// When the pending timeout pass is due (ms); `None` when none is armed.
+    static TIMEOUT_PASS_AT: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) };
+}
+
+// Test seam: the delays of the timeout passes armed on this thread, in order.
 #[cfg(test)]
 thread_local! {
-    pub(crate) static SCHEDULED_TIMEOUT_PASSES: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(0) };
+    pub(crate) static SCHEDULED_TIMEOUT_PASSES: std::cell::RefCell<Vec<u64>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Test seam: run the timer's firing step without a browser timer.
+#[cfg(test)]
+pub(crate) fn fire_timeout_pass_for_test(request_pass: impl FnOnce()) {
+    timeout_pass_fired(request_pass);
 }
 
 /// Hydrate the in-memory `ROOMS` signal from a `Rooms` value assembled from the

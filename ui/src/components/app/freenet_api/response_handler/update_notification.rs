@@ -252,9 +252,12 @@ pub fn handle_update_notification(
     // subscription for, so one for this room's key proves our subscription
     // when we asked for it. Decided on the deferred write, which re-checks
     // that the room is still Subscribing with a request of ours outstanding.
-    if SYNC_INFO
-        .try_read()
-        .is_ok_and(|si| si.notification_proves_subscription(&room_owner_vk))
+    // A subscription left by a read-only public-room view is not ours: it
+    // delivers notifications whatever became of our request.
+    if !crate::public_room::has_subscribed_view(&room_owner_vk)
+        && SYNC_INFO
+            .try_read()
+            .is_ok_and(|si| si.notification_proves_subscription(&room_owner_vk))
     {
         crate::util::defer(move || {
             crate::components::app::sync_info::mark_room_subscribed_by_notification(room_owner_vk);
