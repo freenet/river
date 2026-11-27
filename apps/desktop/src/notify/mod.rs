@@ -429,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn set_unread_reaches_the_tray_and_an_unchanged_count_is_not_passed_on() {
+    fn the_count_and_the_connection_reach_the_tray_state() {
         use river_app::chat::node_status::Connection;
         let n = DesktopNotifier {
             jobs: mpsc::sync_channel(1).0,

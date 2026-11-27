@@ -18,7 +18,9 @@ use std::path::{Path, PathBuf};
 /// The argument the login item passes: start in the tray, with no window.
 pub const BACKGROUND_FLAG: &str = "--background";
 
-/// The name of the autostart entry (the file's stem, the registry value).
+/// The name of the autostart entry (the file's stem, the registry value). Intentionally
+/// separate from the app id (org.freenet.River) that the menu entry and the window use: this
+/// file only launches River at login.
 const NAME: &str = "river";
 /// The LaunchAgent's label, River's bundle identifier.
 const LABEL: &str = "org.freenet.River";

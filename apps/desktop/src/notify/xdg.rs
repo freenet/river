@@ -80,9 +80,9 @@ impl Backend {
             .body(&body)
             // The icon theme's name for it, which the .desktop file's `Icon=river` installs.
             .icon("river")
-            // Lets the shell attribute the notification to River's launcher entry (name, icon,
-            // per-app mute).
-            .hint(Hint::DesktopEntry("river".into()))
+            // Lets the shell attribute the notification to River's launcher entry
+            // (org.freenet.River.desktop: name, icon, per-app mute).
+            .hint(Hint::DesktopEntry("org.freenet.River".into()))
             .hint(Hint::Category("im.received".into()))
             // The click on the notification itself.
             .action("default", "Open")

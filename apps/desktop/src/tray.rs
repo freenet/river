@@ -4,7 +4,10 @@
 //! GNOME with its AppIndicator extension all speak. A desktop without it has no tray, which
 //! [`start`] reports, and River then quits when its window closes. Windows and macOS use
 //! `tray-icon`, which must be made on the thread that runs the window system's events, so
-//! [`start`] is called from the app's init there.
+//! [`start`] is called from the app's init there. Both draw the unread count on the icon, say it
+//! and the connection in the tooltip, and toggle the window on a left click.
+
+use std::time::{Duration, Instant};
 
 use river_app::RiverApp;
 use river_app::chat::node_status::Connection;
@@ -83,7 +86,6 @@ pub fn tooltip(view: View) -> String {
     let mut text = String::from(TOOLTIP);
     match view.unread {
         0 => {}
-        1 => text.push_str(": 1 unread"),
         n => text.push_str(&format!(": {n} unread")),
     }
     // Example rooms and a live link need no remark; everything else is a state worth saying.
@@ -250,20 +252,86 @@ impl Tracker {
     }
 }
 
-/// A click on the icon: hide the window if it is showing and in front, else show it. The
-/// decision is made on the UI thread, where the app knows whether it has focus. Platforms
-/// that never report focus leave a shown window counting as in front (see
-/// `RiverApp::window_in_front`), so a click hides it.
+/// How soon after the window lost focus a click on the icon still finds it in front. Pressing
+/// a tray icon takes focus from the window on Windows and on some Linux panels before the
+/// click arrives. Where focus is never reported at all, a window the tray (or the start)
+/// showed counts as in front until the first focus event, so a click hides it. macOS has no
+/// click toggle: its click opens the menu.
+const CLICK_GRACE: Duration = Duration::from_millis(500);
+
+/// The window, as the toggle drives it.
+trait Window {
+    fn visible(&self) -> bool;
+    /// Hide it without running the close policy: closing quits when "closing hides to the
+    /// tray" is off, and shows the first-time notice.
+    fn hide(&self);
+    fn open(&self);
+}
+
+impl Window for AppHandle<RiverApp> {
+    fn visible(&self) -> bool {
+        self.is_visible()
+    }
+    fn hide(&self) {
+        AppHandle::hide(self);
+    }
+    fn open(&self) {
+        AppHandle::open(self);
+    }
+}
+
+/// Decide and act on a click, on the UI thread, where the app knows about focus.
+fn apply_toggle(app: &mut RiverApp, window: &impl Window, now: Instant) {
+    match toggle_action(window.visible(), app.recently_in_front(now, CLICK_GRACE)) {
+        Toggle::Hide => {
+            window.hide();
+            app.hidden_by_tray();
+        }
+        Toggle::Show => {
+            window.open();
+            app.shown_by_tray();
+        }
+    }
+}
+
+/// A click on the icon: hide the window if it is showing and in front, else show it.
 fn toggle(handle: &AppHandle<RiverApp>) {
-    let h = handle.clone();
-    handle.update(
-        move |app, _| match toggle_action(h.is_visible(), app.window_in_front()) {
-            // `close` is what the close button does: it hides to the tray (or quits when there is
-            // none), through `background::on_close`.
-            Toggle::Hide => h.close(),
-            Toggle::Show => h.open(),
-        },
-    );
+    let window = handle.clone();
+    handle.update(move |app, _| apply_toggle(app, &window, Instant::now()));
+}
+
+/// The newest value put in, for a thread that applies it: older ones are replaced, so the
+/// thread never works through a backlog and the putter never waits.
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+struct Latest<T> {
+    slot: std::sync::Mutex<Option<T>>,
+    wake: std::sync::Condvar,
+}
+
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+impl<T> Latest<T> {
+    const fn new() -> Self {
+        Latest {
+            slot: std::sync::Mutex::new(None),
+            wake: std::sync::Condvar::new(),
+        }
+    }
+
+    fn put(&self, value: T) {
+        *self.slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(value);
+        self.wake.notify_one();
+    }
+
+    /// Wait for a value and take it.
+    fn take(&self) -> T {
+        let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(v) = slot.take() {
+                return v;
+            }
+            slot = self.wake.wait(slot).unwrap_or_else(|e| e.into_inner());
+        }
+    }
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -292,15 +360,14 @@ mod linux {
         }
     }
 
-    /// The running icon, for [`refresh`].
-    static HANDLE: std::sync::OnceLock<ksni::blocking::Handle<RiverTray>> =
-        std::sync::OnceLock::new();
+    /// The view waiting to be shown. ksni's blocking `update` waits for the tray service's
+    /// D-Bus round trip, which must not hold up a frame, so a thread of its own applies the
+    /// newest view.
+    static LATEST: Latest<View> = Latest::new();
 
-    /// Show a new view: ksni sends the new icon and tooltip to the panel.
+    /// Show a new view: ksni sends the new icon and tooltip to the panel. Never waits.
     pub fn refresh(view: View) {
-        if let Some(h) = HANDLE.get() {
-            h.update(|t| t.view = view);
-        }
+        LATEST.put(view);
     }
 
     impl ksni::Tray for RiverTray {
@@ -378,7 +445,21 @@ mod linux {
         .spawn()
         {
             Ok(h) => {
-                HANDLE.set(h).ok();
+                let applier =
+                    std::thread::Builder::new()
+                        .name("river-tray".into())
+                        .spawn(move || {
+                            loop {
+                                let view = LATEST.take();
+                                if h.update(|t| t.view = view).is_none() {
+                                    // The tray service has shut down.
+                                    return;
+                                }
+                            }
+                        });
+                if let Err(e) = applier {
+                    river_app::diag!("river: the tray icon will not show the unread count: {e}");
+                }
                 background::set_tray_up(true);
                 true
             }
@@ -534,6 +615,9 @@ mod tests {
         assert!(has("Icon=river"));
         assert!(has("Exec=river"));
         assert!(has("StartupWMClass=org.freenet.River"));
+        // Notifications name the same entry, or the shell cannot attribute them to it.
+        let xdg = include_str!("notify/xdg.rs");
+        assert!(xdg.contains("Hint::DesktopEntry(\"org.freenet.River\".into())"));
         let main = include_str!("main.rs");
         assert!(main.contains("rune::set_app_id(\"org.freenet.River\")"));
     }
@@ -642,5 +726,76 @@ mod tests {
         assert_eq!(toggle_action(true, false), Toggle::Show);
         assert_eq!(toggle_action(false, true), Toggle::Show);
         assert_eq!(toggle_action(false, false), Toggle::Show);
+    }
+
+    struct Spy(std::cell::RefCell<Vec<&'static str>>, bool);
+    impl Window for Spy {
+        fn visible(&self) -> bool {
+            self.1
+        }
+        fn hide(&self) {
+            self.0.borrow_mut().push("hide");
+        }
+        fn open(&self) {
+            self.0.borrow_mut().push("open");
+        }
+    }
+
+    /// The window driver has no way to close or quit, so a click can only hide or open it, even
+    /// with "closing hides to the tray" off. Hiding also tells the app it lost focus.
+    #[test]
+    fn a_click_on_a_focused_window_hides_it_without_the_close_policy() {
+        let mut app = RiverApp::detached();
+        app.focus_changed(true);
+        let spy = Spy(Default::default(), true);
+        apply_toggle(&mut app, &spy, Instant::now());
+        assert_eq!(*spy.0.borrow(), ["hide"]);
+        assert!(!app.window_in_front(), "hiding clears the focus");
+        // Pinned: the toggle never goes through `close`, which is what quits with the setting off.
+        let src = include_str!("tray.rs");
+        let body = &src[src.find("fn apply_toggle").unwrap()..src.find("fn toggle(").unwrap()];
+        assert!(!body.contains(".close()") && !body.contains("quit"));
+    }
+
+    #[test]
+    fn a_click_a_moment_after_the_icon_took_focus_still_hides() {
+        let mut app = RiverApp::detached();
+        app.focus_changed(true);
+        app.focus_changed(false);
+        let spy = Spy(Default::default(), true);
+        apply_toggle(&mut app, &spy, Instant::now());
+        assert_eq!(*spy.0.borrow(), ["hide"]);
+        // Long after, a window that is visible but not focused is brought forward instead.
+        let mut app = RiverApp::detached();
+        app.focus_changed(true);
+        app.focus_changed(false);
+        let spy = Spy(Default::default(), true);
+        apply_toggle(&mut app, &spy, Instant::now() + Duration::from_secs(5));
+        assert_eq!(*spy.0.borrow(), ["open"]);
+    }
+
+    #[test]
+    fn a_window_the_tray_showed_hides_on_the_next_click_even_if_no_focus_event_comes() {
+        let mut app = RiverApp::detached();
+        let hidden = Spy(Default::default(), false);
+        apply_toggle(&mut app, &hidden, Instant::now());
+        assert_eq!(*hidden.0.borrow(), ["open"]);
+        let shown = Spy(Default::default(), true);
+        apply_toggle(&mut app, &shown, Instant::now());
+        assert_eq!(*shown.0.borrow(), ["hide"]);
+    }
+
+    #[test]
+    fn only_the_newest_pending_view_is_applied() {
+        let latest = Latest::new();
+        for unread in 1..=5 {
+            latest.put(View {
+                unread,
+                connection: None,
+            });
+        }
+        assert_eq!(latest.take().unread, 5);
+        latest.put(View::default());
+        assert_eq!(latest.take(), View::default());
     }
 }

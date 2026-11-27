@@ -3,8 +3,8 @@
 #
 #   package-linux.sh <river binary> <version> <output dir>
 #
-# The tarball holds one directory with the binary, org.freenet.River.desktop, a 512 px icon, the
-# licence and a README that says where to copy them. It does not install anything.
+# The tarball holds one directory with the binary, org.freenet.River.desktop, a 512 px icon,
+# the licence and a README that says where to copy them. It does not install anything.
 # Run by .github/workflows/release-desktop.yml; also fine to run locally.
 
 set -euo pipefail
@@ -64,8 +64,8 @@ To add River to your applications menu:
 
 ~/.local/bin must be on your PATH for the menu entry to start it.
 
-If you installed an earlier River, remove its old menu entry, which had another name and
-would show River twice:
+If you installed an earlier River, then after copying the files above remove its old menu
+entry, which had another name and would show River twice:
 
   rm -f ~/.local/share/applications/river.desktop
 

@@ -74,6 +74,8 @@ pub struct RiverApp {
     /// before the first focus event ([`RiverApp::window_in_front`]); a windowless one (started
     /// at login into the tray) does not.
     window_shown: bool,
+    /// When the window last lost focus, for [`RiverApp::recently_in_front`].
+    blurred_at: Option<std::time::Instant>,
     /// Messages that arrived in the open room while the window was not focused. The room counts
     /// them as read the moment they land, so the title adds them back until the person returns.
     missed: (String, usize),
@@ -210,6 +212,7 @@ impl RiverApp {
             focused: false,
             focus_known: false,
             window_shown: false,
+            blurred_at: None,
             missed: Default::default(),
             reported_unread: None,
             reported_connection: None,
@@ -294,6 +297,7 @@ impl RiverApp {
             focused: false,
             focus_known: false,
             window_shown: false,
+            blurred_at: None,
             missed: Default::default(),
             reported_unread: None,
             reported_connection: None,
@@ -429,6 +433,9 @@ impl RiverApp {
             && let Some(link) = &self.link
         {
             link.resync();
+        }
+        if self.focused && !focused {
+            self.blurred_at = Some(std::time::Instant::now());
         }
         self.focused = focused;
         self.focus_known = true;
@@ -610,6 +617,31 @@ impl RiverApp {
         self.focused || (!self.focus_known && self.window_shown)
     }
 
+    /// Whether a click on the tray icon found the window in front: it is, or it lost focus no
+    /// more than `grace` before `now`. Pressing a tray icon takes focus from the window on
+    /// Windows and some Linux panels before the click arrives, so the focus the app sees by
+    /// then is already the icon's.
+    pub fn recently_in_front(&self, now: std::time::Instant, grace: std::time::Duration) -> bool {
+        self.window_in_front()
+            || self
+                .blurred_at
+                .is_some_and(|t| now.saturating_duration_since(t) <= grace)
+    }
+
+    /// The tray hid the window (not the close button, so the close policy did not run): it no
+    /// longer has focus, and a hidden window gets no focus-lost event to say so.
+    pub fn hidden_by_tray(&mut self) {
+        self.focus_changed(false);
+        self.blurred_at = None;
+    }
+
+    /// The tray showed the window. A platform that never reports focus when a window opens
+    /// then still has it count as in front (see [`RiverApp::window_in_front`]), so the next
+    /// click hides it.
+    pub fn shown_by_tray(&mut self) {
+        self.window_shown = true;
+    }
+
     /// Say that a window is on screen from the start (see [`RiverApp::window_in_front`]).
     pub fn with_window_shown(mut self, shown: bool) -> Self {
         self.window_shown = shown;
@@ -702,6 +734,14 @@ impl RiverApp {
         if revealing || flashing {
             tx.wake_after(std::time::Duration::from_millis(30));
         }
+        // Before the gate below: example rooms and the setup states are states the tray's tooltip
+        // should say too.
+        let connection =
+            chat::node_status::connection_of(&self.setup, &self.access, self.chat.source);
+        if self.reported_connection != Some(connection) {
+            self.reported_connection = Some(connection);
+            self.notifier.set_connection(connection);
+        }
         if !matches!(self.chat.source, chat::Source::Node(_)) {
             return;
         }
@@ -715,12 +755,6 @@ impl RiverApp {
         if self.reported_unread != Some(unread) {
             self.reported_unread = Some(unread);
             self.notifier.set_unread(unread);
-        }
-        let connection =
-            chat::node_status::connection_of(&self.setup, &self.access, self.chat.source);
-        if self.reported_connection != Some(connection) {
-            self.reported_connection = Some(connection);
-            self.notifier.set_connection(connection);
         }
     }
 

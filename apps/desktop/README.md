@@ -111,6 +111,11 @@ where you can also have River start when you log in (it then starts hidden). To 
 window quits. The first time closing hides River, it shows a notification saying so and how to
 quit; it is not shown again.
 
+The tray icon shows the number of unread messages (the same number as in the window title) in a
+red badge, "9+" from 10 up, and its tooltip says the exact count and, when River is not connected,
+the connection state. On Windows and Linux a left click on the icon hides the window if it is in
+front and shows it otherwise; on macOS the click opens the menu.
+
 On Windows the tray icon may be in the hidden icons area (the `^` by the clock), where new icons
 start.
 
