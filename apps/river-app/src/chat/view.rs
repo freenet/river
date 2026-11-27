@@ -544,11 +544,19 @@ fn rooms(chat: &Chat, logo: Option<&Pixels>, narrow: bool, p: &Palette, k: &Kit)
     if !chat.rooms().is_empty() {
         list = list.child(super::overview::entry(chat, p));
     }
+    // One Tab stop for the rooms, on the open one; Up and Down move among them without opening.
+    let mut rooms = col()
+        .key("room-rows")
+        .role("list")
+        .focus_group()
+        .w_full()
+        .gap(2.0);
     for room in chat.rooms() {
         // While a direct-message thread is open, no room is the one in front.
         let selected = chat.visible_room().is_some_and(|r| r.key == room.key);
-        list = list.child(room_row(room, chat.unread_of(room), selected, width, p));
+        rooms = rooms.child(room_row(room, chat.unread_of(room), selected, width, p));
     }
+    list = list.child(rooms);
     list = list.children(super::dm_view::rail(chat, p));
     let enter = outlined("enter-invite", "Enter invite code", &icons::INVITE, 34.0, p);
     let mut footer = col()
@@ -854,7 +862,15 @@ fn preview_chars(row_width: f32, badge: bool) -> usize {
     (text_w / 6.4).max(8.0) as usize
 }
 
-fn room_row(room: &Room, unread_count: usize, selected: bool, width: f32, p: &Palette) -> El {
+/// A row in the room list: keyboard focusable, Enter or Space opens the room, and Shift+F10 or the
+/// Menu key open its menu, as a right-click does.
+fn room_row(
+    room: &Room,
+    unread_count: usize,
+    selected: bool,
+    width: f32,
+    p: &Palette,
+) -> El {
     let key = room.key.clone();
     let menu_key = room.key.clone();
     let unread = unread_count > 0 && !selected;
@@ -895,7 +911,18 @@ fn room_row(room: &Room, unread_count: usize, selected: bool, width: f32, p: &Pa
         .center_y()
         .radius(8.0)
         .cursor(rune::Cursor::Pointer)
-        .on_press(move |s: &mut RiverApp| s.chat.select(&key))
+        .focusable(true)
+        .focus_selected(selected)
+        // A press must not focus the row (rune focuses a focusable element on press): focus ends
+        // where it does for a click on any other list row, i.e. dropped. A keyboard activation
+        // keeps the row focused.
+        .keeps_text_selection()
+        .on_press_tx(move |s: &mut RiverApp, tx: &mut rune::Tx| {
+            s.chat.select(&key);
+            if !tx.focus_visible() {
+                tx.blur();
+            }
+        })
         .on_secondary_press(
             move |s: &mut RiverApp, press: rune::PointerPress, _: &mut rune::Tx| {
                 s.chat.open_room_menu(&menu_key, press)
