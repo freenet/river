@@ -720,7 +720,6 @@ impl Chat {
         self.dm_settle();
     }
 
-    /// The thread's unread count counted by the title and the tray: not those of a muted room.
     /// The thread "Direct messages" in the tray opens: the first with unread messages that count.
     pub fn first_unread_dm(&self) -> Option<(String, String)> {
         self.dm
@@ -738,6 +737,7 @@ impl Chat {
         self.dm.mark_all_seen(|room| muted.contains(room))
     }
 
+    /// The unread direct messages counted by the title and the tray: not those of a muted room.
     pub fn dm_unread_counted(&self) -> usize {
         self.dm
             .counted_unread(|room| self.mode_of(room) == NotificationMode::Muted)

@@ -184,7 +184,7 @@ fn save(dir: &Path, on: bool, told: bool) -> Result<(), String> {
 
 /// Decide whether this start is River's first on this computer, before anything else writes to
 /// the config directory: a missing or empty directory is, and gets the marker that says so
-/// until setup ends. A directory with anything in it (the lock file every earlier start left,
+/// until the person answers the first-run card (OK, or the login switch). A directory with anything in it (the lock file every earlier start left,
 /// the settings) is not, whatever else it lacks, so nobody who has run River gets a login item
 /// written for them.
 fn note_first_run(dir: &Path) {

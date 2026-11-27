@@ -14,6 +14,7 @@ use crate::{RiverApp, Setup, chat::example};
 #[derive(Clone, Default)]
 struct Recorder {
     menus: Rc<RefCell<Vec<TrayMenu>>>,
+    forced: Rc<RefCell<Vec<TrayMenu>>>,
 }
 
 impl Notifier for Recorder {
@@ -23,6 +24,9 @@ impl Notifier for Recorder {
     fn set_unread(&self, _: usize) {}
     fn set_menu(&self, menu: TrayMenu) {
         self.menus.borrow_mut().push(menu);
+    }
+    fn set_menu_forced(&self, menu: TrayMenu) {
+        self.forced.borrow_mut().push(menu);
     }
 }
 
@@ -193,6 +197,8 @@ fn the_notifier_hears_the_menu_only_when_it_changes() {
 struct Host {
     first: Mutex<bool>,
     login: Mutex<bool>,
+    /// Make `set_start_at_login` fail.
+    fail: Mutex<bool>,
     calls: Mutex<Vec<String>>,
 }
 
@@ -201,6 +207,7 @@ impl Host {
         Arc::new(Host {
             first: Mutex::new(first),
             login: Mutex::new(false),
+            fail: Mutex::new(false),
             calls: Mutex::default(),
         })
     }
@@ -224,6 +231,9 @@ impl chat::BackgroundHost for Host {
     }
     fn set_start_at_login(&self, on: bool) -> Result<(), String> {
         self.calls.lock().unwrap().push(format!("login {on}"));
+        if *self.fail.lock().unwrap() {
+            return Err("no permission".into());
+        }
         *self.login.lock().unwrap() = on;
         Ok(())
     }
@@ -421,5 +431,90 @@ fn the_open_rooms_missed_messages_are_on_its_row() {
         s.unread()
     );
     s.tray_mark_all_read();
+    assert_eq!(s.unread(), 0);
+}
+
+#[test]
+fn a_chosen_check_item_resends_the_menu_as_forced_even_when_nothing_changed() {
+    let rec = Recorder::default();
+    let mut s = app_with(rooms(1, 0)).with_notifier(Box::new(rec.clone()));
+    s.sync_tray_menu();
+    s.resend_tray_menu();
+    assert_eq!(
+        rec.menus.borrow().len(),
+        1,
+        "the plain path was not used again"
+    );
+    assert_eq!(rec.forced.borrow().len(), 1, "the forced path was");
+    s.sync_tray_menu();
+    assert_eq!(
+        rec.menus.borrow().len(),
+        1,
+        "and what it sent counts as reported"
+    );
+}
+
+#[test]
+fn ok_that_fails_keeps_the_card_says_why_and_does_not_retire_it() {
+    let host = Host::new(true);
+    *host.fail.lock().unwrap() = true;
+    let said = Rc::new(RefCell::new(Vec::new()));
+    struct Said(Rc<RefCell<Vec<String>>>);
+    impl Notifier for Said {
+        fn notify(&self, n: Notification) -> bool {
+            self.0.borrow_mut().push(n.body);
+            true
+        }
+        fn set_unread(&self, _: usize) {}
+    }
+    let mut s = RiverApp::detached()
+        .with_notifier(Box::new(Said(said.clone())))
+        .with_background(host.clone());
+    s.confirm_first_run();
+    assert_eq!(
+        host.calls(),
+        ["login true"],
+        "first_run_done was not called"
+    );
+    assert_eq!(
+        s.chat.background.as_ref().unwrap().first_run_login,
+        Some(true)
+    );
+    assert_eq!(s.chat.start_at_login_error(), Some("no permission"));
+    assert_eq!(
+        *said.borrow(),
+        ["Couldn't change Start at login: no permission"]
+    );
+    // Trying again once it works retires the card.
+    *host.fail.lock().unwrap() = false;
+    s.confirm_first_run();
+    assert_eq!(host.calls(), ["login true", "login true", "done"]);
+    assert_eq!(s.chat.background.as_ref().unwrap().first_run_login, None);
+    assert_eq!(s.chat.start_at_login_error(), None);
+}
+
+#[test]
+fn a_failed_toggle_while_the_card_waits_keeps_the_card() {
+    let host = Host::new(true);
+    *host.fail.lock().unwrap() = true;
+    let mut s = RiverApp::detached().with_background(host.clone());
+    s.tray_toggle_start_at_login();
+    assert_eq!(host.calls(), ["login true"]);
+    assert_eq!(
+        s.chat.background.as_ref().unwrap().first_run_login,
+        Some(true)
+    );
+}
+
+#[test]
+fn mark_all_read_reports_the_open_rooms_missed_messages_with_the_window_hidden() {
+    let mut s = app_with(rooms(2, 0));
+    s.focus_changed(false);
+    s.missed = ("r0".into(), 3);
+    s.chat.reported.clear();
+    assert_eq!(s.unread(), 3);
+    s.tray_mark_all_read();
+    let newest = s.chat.rooms()[0].messages.last().unwrap().key.clone();
+    assert_eq!(reported_reads(&mut s), [("r0".to_owned(), newest)]);
     assert_eq!(s.unread(), 0);
 }

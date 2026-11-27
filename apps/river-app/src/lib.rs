@@ -810,8 +810,9 @@ impl RiverApp {
     /// Tell the notifier the tray menu's contents again even if they did not change: after a
     /// check item was chosen, so a menu that flipped its own tick shows the real state.
     pub fn resend_tray_menu(&mut self) {
-        self.reported_menu = None;
-        self.sync_tray_menu();
+        let menu = self.tray_menu();
+        self.reported_menu = Some(menu.clone());
+        self.notifier.set_menu_forced(menu);
     }
 
     /// The tray's "Mark all as read": the rooms the tray lists (those that count) are marked
@@ -843,6 +844,17 @@ impl RiverApp {
     /// page open to show it on, so it is said as a notification.
     pub fn tray_toggle_start_at_login(&mut self) {
         self.chat.toggle_start_at_login();
+        self.say_login_error();
+    }
+
+    /// The first-run card's OK. A login item that could not be written is said on the card and
+    /// as a notification (the window may be on another desktop).
+    pub fn confirm_first_run(&mut self) {
+        self.chat.confirm_first_run();
+        self.say_login_error();
+    }
+
+    fn say_login_error(&mut self) {
         if let Some(why) = self.chat.start_at_login_error().map(str::to_owned) {
             self.send_notice(
                 "Couldn't change Start at login".into(),

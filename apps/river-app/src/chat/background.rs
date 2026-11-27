@@ -131,11 +131,16 @@ impl super::Chat {
     /// the card again. Does nothing when there is no card.
     pub fn confirm_first_run(&mut self) {
         if let Some(b) = &mut self.background
-            && let Some(on) = b.first_run_login.take()
+            && let Some(on) = b.first_run_login
         {
-            if on {
-                b.error = b.host.set_start_at_login(true).err();
+            if on && let Err(e) = b.host.set_start_at_login(true) {
+                // Not answered: the card stays, says why, and OK tries again.
+                b.error = Some(e);
+                b.refresh();
+                return;
             }
+            b.error = None;
+            b.first_run_login = None;
             b.host.first_run_done();
             b.refresh();
         }
@@ -157,8 +162,9 @@ impl super::Chat {
             let want = !b.start_at_login;
             b.error = b.host.set_start_at_login(want).err();
             b.refresh();
-            // Choosing it here, in Settings or in the tray, is the answer the card asks for.
-            if b.first_run_login.take().is_some() {
+            // Choosing it here, in Settings or in the tray, is the answer the card asks for,
+            // unless it failed: then the card stays.
+            if b.error.is_none() && b.first_run_login.take().is_some() {
                 b.host.first_run_done();
             }
         }
@@ -195,11 +201,17 @@ pub(super) fn first_run_card(chat: &super::Chat, p: &Palette, k: &Kit) -> Option
                 .w_full()
                 .key("first-run-note"),
             )
+            .children(chat.start_at_login_error().map(|e| {
+                label(format!("Couldn't change it: {e}"), st::SMALL, p.danger)
+                    .wrap()
+                    .w_full()
+                    .key("first-run-error")
+            }))
             .child(
                 rune::row().child(
                     rune_kit::Button::new("OK")
                         .variant(rune_kit::ButtonVariant::Contrast)
-                        .on_press(|s: &mut RiverApp| s.chat.confirm_first_run())
+                        .on_press(|s: &mut RiverApp| s.confirm_first_run())
                         .build(k)
                         .key("first-run-ok"),
                 ),

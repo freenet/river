@@ -651,7 +651,7 @@ impl Chat {
     /// Tell the node the room keyed `room_key` is read up to its newest message, once per newest
     /// message. What [`Chat::report_read`] does for the open room once the window is in front;
     /// "Mark all as read" does it for each room it marks, whatever the window shows.
-    fn report_room_read(&mut self, room_key: &str) {
+    pub(crate) fn report_room_read(&mut self, room_key: &str) {
         if !matches!(self.source, Source::Node(_)) || self.reads_held {
             return;
         }

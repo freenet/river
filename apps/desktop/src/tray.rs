@@ -222,21 +222,8 @@ pub fn menu_model(view: &View) -> Vec<Entry> {
     out
 }
 
-/// Set when a check item was chosen: the next menu update is drawn even if nothing it shows
-/// changed, because the menu may have flipped the tick itself (Windows and macOS do) and the
-/// choice may not have taken (a login item that could not be written).
-static REDRAW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Whether a menu update draws: when something it shows changed, or a check item was chosen.
-fn redraws(changed: bool, forced: bool) -> bool {
-    changed || forced
-}
-
 /// Do what a chosen item says. Never blocks: the app's work runs on its UI thread.
 fn run(handle: &AppHandle<RiverApp>, action: Action) {
-    if action.is_check() {
-        REDRAW.store(true, std::sync::atomic::Ordering::Release);
-    }
     match action {
         Action::Open => handle.open(),
         Action::OpenRoom(key) => {
@@ -460,13 +447,28 @@ impl Tracker {
         }
     }
 
+    /// Fold a new menu in: the view to draw. `forced` draws even if nothing changed, for after a
+    /// check item was chosen (the menu may have flipped its own tick, and the choice may not
+    /// have taken).
+    fn apply_menu(&self, menu: TrayMenu, forced: bool) -> Option<View> {
+        let changed = self.change(|v| v.menu = menu);
+        match changed {
+            Some(view) => Some(view),
+            None if forced => Some(self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()),
+            None => None,
+        }
+    }
+
     /// What the menu lists, from `Notifier::set_menu` on the UI thread.
     pub fn set_menu(&self, menu: TrayMenu) {
-        let forced = REDRAW.swap(false, std::sync::atomic::Ordering::AcqRel);
-        let changed = self.change(|v| v.menu = menu);
-        if redraws(changed.is_some(), forced) {
-            let view =
-                changed.unwrap_or_else(|| self.0.lock().unwrap_or_else(|e| e.into_inner()).clone());
+        if let Some(view) = self.apply_menu(menu, false) {
+            refresh(view);
+        }
+    }
+
+    /// [`Tracker::set_menu`], drawn even if nothing changed.
+    pub fn set_menu_forced(&self, menu: TrayMenu) {
+        if let Some(view) = self.apply_menu(menu, true) {
             refresh(view);
         }
     }
@@ -1403,16 +1405,20 @@ mod tests {
     }
 
     #[test]
-    fn a_chosen_check_item_forces_the_next_menu_update_even_if_nothing_changed() {
-        use std::sync::atomic::Ordering;
+    fn a_forced_menu_update_draws_even_if_nothing_changed_and_a_plain_one_does_not() {
         assert!(Action::ToggleDnd.is_check() && Action::ToggleLogin.is_check());
         assert!(!Action::MarkAllRead.is_check() && !Action::Open.is_check());
-        assert!(redraws(false, true) && redraws(true, false));
-        assert!(!redraws(false, false), "nothing changed, nothing chosen");
         let t = Tracker::default();
-        assert_eq!(t.change(|v| v.menu = TrayMenu::default()), None);
-        REDRAW.store(true, Ordering::Release);
-        t.set_menu(TrayMenu::default());
-        assert!(!REDRAW.load(Ordering::Acquire), "taken by the update");
+        let menu = TrayMenu {
+            dnd: true,
+            ..Default::default()
+        };
+        assert!(t.apply_menu(menu.clone(), false).is_some(), "a change");
+        assert!(
+            t.apply_menu(menu.clone(), false).is_none(),
+            "nothing changed"
+        );
+        let forced = t.apply_menu(menu.clone(), true).expect("forced");
+        assert_eq!(forced.menu, menu);
     }
 }

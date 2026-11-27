@@ -272,6 +272,12 @@ impl RiverApp {
     pub(crate) fn mark_everything_read(&mut self) {
         self.chat.mark_all_read();
         self.chat.mark_all_dms_seen();
+        // The open room has nothing unread of its own (it is being read), but what the window
+        // missed while away is on the badge: it is read now, here and on the node.
+        if self.missed.1 > 0 {
+            let room = self.missed.0.clone();
+            self.chat.report_room_read(&room);
+        }
         self.missed.1 = 0;
     }
 }

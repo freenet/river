@@ -133,6 +133,11 @@ pub trait Notifier {
     fn set_connection(&self, _: crate::chat::node_status::Connection) {}
     /// What the tray menu lists besides those. Called when it changes.
     fn set_menu(&self, _: TrayMenu) {}
+    /// [`Notifier::set_menu`] for a menu that must be drawn again even if it is the one already
+    /// shown: a check item was chosen, and the menu may have flipped its own tick.
+    fn set_menu_forced(&self, menu: TrayMenu) {
+        self.set_menu(menu);
+    }
 }
 
 /// The notifier of a headless run or a shell without one: shows nothing.
