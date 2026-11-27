@@ -34,8 +34,8 @@ authors = ["Freenet Project"]
 [workspace.dependencies]
 # Rune is pre-release and git-only. Pin a rev of its `dev` branch (which is
 # never rewritten) and bump it deliberately, re-rendering the snapshots.
-rune = { git = "https://github.com/anomalyco/rune", rev = "eff95e80c328943deeeef0355485c06c3d71ecf0" }
-rune-kit = { git = "https://github.com/anomalyco/rune", rev = "eff95e80c328943deeeef0355485c06c3d71ecf0" }
+rune = { git = "https://github.com/anomalyco/rune", rev = "0a135f72459c9f11648cf2bfc9f751ecdcdc416e" }
+rune-kit = { git = "https://github.com/anomalyco/rune", rev = "0a135f72459c9f11648cf2bfc9f751ecdcdc416e" }
 river-app = { path = "river-app" }
 
 # The signature and hash crates are slow unoptimized, and the room tests verify
@@ -65,9 +65,9 @@ lto = "thin"
 # added or dropped. The source-scrape test `rune_revs_agree_in_apps_cargo_toml`
 # (river-app/src/lib.rs) fails if the revs differ.
 [patch.crates-io]
-winit = { git = "https://github.com/anomalyco/rune", rev = "eff95e80c328943deeeef0355485c06c3d71ecf0" }
-wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "eff95e80c328943deeeef0355485c06c3d71ecf0" }
-parley_engine = { git = "https://github.com/anomalyco/rune", rev = "eff95e80c328943deeeef0355485c06c3d71ecf0" }
-sctk-adwaita = { git = "https://github.com/anomalyco/rune", rev = "eff95e80c328943deeeef0355485c06c3d71ecf0" }
-accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "eff95e80c328943deeeef0355485c06c3d71ecf0" }
-accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "eff95e80c328943deeeef0355485c06c3d71ecf0" }
+winit = { git = "https://github.com/anomalyco/rune", rev = "0a135f72459c9f11648cf2bfc9f751ecdcdc416e" }
+wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "0a135f72459c9f11648cf2bfc9f751ecdcdc416e" }
+parley_engine = { git = "https://github.com/anomalyco/rune", rev = "0a135f72459c9f11648cf2bfc9f751ecdcdc416e" }
+sctk-adwaita = { git = "https://github.com/anomalyco/rune", rev = "0a135f72459c9f11648cf2bfc9f751ecdcdc416e" }
+accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "0a135f72459c9f11648cf2bfc9f751ecdcdc416e" }
+accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "0a135f72459c9f11648cf2bfc9f751ecdcdc416e" }

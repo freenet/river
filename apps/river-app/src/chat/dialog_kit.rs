@@ -119,7 +119,14 @@ impl DialogSpec {
 
     pub fn build(self, k: &Kit, layer: &mut Vec<El>) {
         let p = st::palette();
-        let mut body = col().key(self.body_key).w_full().gap(self.gap);
+        // Shrinks with Rune's dialog body (which is bounded by the window), so a scroll view
+        // inside it that also shrinks gives up height before the footer is cut off.
+        let mut body = col()
+            .key(self.body_key)
+            .w_full()
+            .gap(self.gap)
+            .shrink()
+            .min_h(0.0);
         if !self.flush {
             body = body.px(16.0).pb(16.0);
         }

@@ -5991,6 +5991,52 @@ fn scene_runtime(scene: &str) -> Runtime<RiverApp> {
     render(state, scene_size(scene))
 }
 
+/// Rune bounds a dialog by the window (less a 16 pt margin). A room-details footer that grows
+/// (the owner's leave warning, the warning before lowering a limit) takes its height from the
+/// scrolling fields, so the buttons stay inside the window instead of being cut off at its
+/// bottom edge.
+#[test]
+fn the_room_details_buttons_stay_inside_the_window_when_the_footer_grows() {
+    for (scene, keys) in [
+        (
+            "chat-room-leave-owner",
+            ["details-leave-cancel", "details-leave-confirm"],
+        ),
+        (
+            "chat-room-leave-member",
+            ["details-leave-cancel", "details-leave-confirm"],
+        ),
+        (
+            "chat-room-details-confirm",
+            ["details-back", "details-confirm-save"],
+        ),
+        (
+            "chat-room-details-editing",
+            ["details-cancel", "details-save"],
+        ),
+    ] {
+        // The scene window, the narrow layout and a short one.
+        for size in [scene_size(scene), NARROW_SCENE_SIZE, (1280.0, 600.0)] {
+            let (_, apply) = SCENES
+                .iter()
+                .find(|(name, _)| *name == scene)
+                .expect("scene");
+            let mut state = RiverApp::detached();
+            apply(&mut state);
+            let rt = render(state, size);
+            let win_h = size.1;
+            for key in keys {
+                let [_, y, _, h] = rect_of(&rt, key);
+                assert!(
+                    y >= 0.0 && y + h <= win_h,
+                    "{scene} at {size:?}: {key} spans {y}..{}",
+                    y + h
+                );
+            }
+        }
+    }
+}
+
 fn focused_key(rt: &Runtime<RiverApp>) -> Option<String> {
     rt.elements()
         .into_iter()
@@ -6240,7 +6286,7 @@ fn enter_on_ban_user_asks_once_and_the_opener_goes() {
 // the ratchet for the next bump: a changed line means Rune changed, so read its changelog.
 mod rune_bump {
     use super::*;
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     use rune::{PhysicalInput, PhysicalKeyCode};
 
     /// The key of the element Rune says has the keyboard (`Tx::focused`), not River's mirror
@@ -6307,19 +6353,23 @@ mod rune_bump {
         rt
     }
 
-    // ---- word motion (UAX #29) ---------------------------------------------------------------
+    // ---- word motion (Chromium) -----------------------------------------------------------------
 
-    /// Words are Unicode's: `maya.chen` and `x.org` are one word each, `@`, `://` and `/` are
-    /// not. Backwards is the same on every platform: to the word's start.
+    /// Word stops are Chromium's (Rune since 2026-11-22, anomalyco/rune#1423): letters and
+    /// digits make a word, a run of punctuation is a stop of its own (`maya.chen` is `maya`, `.`,
+    /// `chen`; `://` is one stop), and spaces are stepped over. Backwards is the same on every
+    /// platform: to the start of the word or punctuation before the caret.
+    const BACK_STOPS: [usize; 12] = [28, 27, 24, 23, 22, 19, 15, 10, 9, 5, 4, 0];
+
     #[test]
-    fn word_left_and_word_backspace_stop_at_unicode_word_starts() {
+    fn word_left_and_word_backspace_stop_at_chromiums_word_starts() {
         let mut rt = typed_line();
         let mut stops = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..BACK_STOPS.len() {
             word_key(&mut rt, Key::Left, false);
             stops.push(composer(&rt).2);
         }
-        assert_eq!(stops, [28, 22, 15, 5, 0]);
+        assert_eq!(stops, BACK_STOPS);
         let mut rt = typed_line();
         let mut left = Vec::new();
         for _ in 0..3 {
@@ -6330,23 +6380,23 @@ mod rune_bump {
             left,
             [
                 "see @maya.chen http://x.org/",
-                "see @maya.chen http://",
-                "see @maya.chen "
+                "see @maya.chen http://x.org",
+                "see @maya.chen http://x."
             ]
         );
     }
 
-    /// Forward word keys: off macOS (Windows and Linux alike, for now) the start of the next
-    /// word, Rune's rule since 2026-11-12; on macOS the end of the word. Backwards is the start
-    /// of the word everywhere. Ian wants end-of-word on Linux too (GTK, Qt, Chromium); that
+    /// Forward word keys: off macOS (Windows and Linux alike, for now) the end of the word or
+    /// punctuation run plus the spaces after it (Rune since 2026-11-12, stops since 2026-11-22); on macOS the end
+    /// of the next word or punctuation run. Backwards is the start everywhere. Ian wants end-of-word on Linux too (GTK, Qt, Chromium); that
     /// lands in a follow-up change, which will give Linux its own block here.
     #[cfg(target_os = "macos")]
-    const FORWARD_STOPS: [usize; 5] = [3, 14, 19, 27, 29];
+    const FORWARD_STOPS: [usize; 12] = [3, 5, 9, 10, 14, 19, 22, 23, 24, 27, 28, 29];
     #[cfg(not(target_os = "macos"))]
-    const FORWARD_STOPS: [usize; 5] = [5, 15, 22, 28, 29];
+    const FORWARD_STOPS: [usize; 12] = [4, 5, 9, 10, 15, 19, 22, 23, 24, 27, 28, 29];
 
     fn to_start(rt: &mut Runtime<RiverApp>) {
-        for _ in 0..5 {
+        for _ in 0..BACK_STOPS.len() {
             word_key(rt, Key::Left, false);
         }
         assert_eq!(composer(rt).2, 0);
@@ -6357,7 +6407,7 @@ mod rune_bump {
         let mut rt = typed_line();
         to_start(&mut rt);
         let mut stops = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..FORWARD_STOPS.len() {
             word_key(&mut rt, Key::Right, false);
             stops.push(composer(&rt).2);
         }
@@ -6369,7 +6419,7 @@ mod rune_bump {
         let mut rt = typed_line();
         to_start(&mut rt);
         let mut ends = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..FORWARD_STOPS.len() {
             word_key(&mut rt, Key::Right, true);
             ends.push(composer(&rt).2);
         }
@@ -6388,7 +6438,7 @@ mod rune_bump {
         #[cfg(target_os = "macos")]
         assert_eq!(composer(&rt), (" @maya.chen http://x.org/a", 0, 0));
         #[cfg(not(target_os = "macos"))]
-        assert_eq!(composer(&rt), ("maya.chen http://x.org/a", 0, 0));
+        assert_eq!(composer(&rt), ("@maya.chen http://x.org/a", 0, 0));
     }
 
     /// With a selection, Ctrl+Delete deletes the selection and nothing more.
@@ -6401,7 +6451,7 @@ mod rune_bump {
         #[cfg(target_os = "macos")]
         assert_eq!(composer(&rt), (" @maya.chen http://x.org/a", 0, 0));
         #[cfg(not(target_os = "macos"))]
-        assert_eq!(composer(&rt), ("maya.chen http://x.org/a", 0, 0));
+        assert_eq!(composer(&rt), ("@maya.chen http://x.org/a", 0, 0));
     }
 
     /// A word key edits through the field's own change hook, so a warning about the text before
@@ -6701,7 +6751,7 @@ mod rune_bump {
 
     // ---- Ctrl+Shift sets a field's direction ----------------------------------------------------
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     fn chord(rt: &mut Runtime<RiverApp>, shift: PhysicalKeyCode) {
         let mods = |ctrl: bool, shift: bool| rune::Mods {
             ctrl,
@@ -6724,13 +6774,16 @@ mod rune_bump {
         phys(PhysicalKeyCode::ControlLeft, mods(true, false), false);
     }
 
-    /// Characterisation, not a wish: Rune (2026-11-12, Windows and Linux) makes Ctrl+Left Shift
-    /// and Ctrl+Right Shift, pressed together and released with no key between, set the focused
-    /// field's direction. That is also a common keyboard-layout switch chord, and River cannot
-    /// opt out. The direction stays after a send. Tracked in freenet/river#955.
-    #[cfg(not(target_os = "macos"))]
+    /// Rune (2026-11-24, anomalyco/rune#1804) runs the Ctrl+Left Shift / Ctrl+Right Shift
+    /// direction chord only on Windows with a right-to-left keyboard layout installed, so on
+    /// Linux and macOS it does nothing: the composer keeps its natural direction and no text is
+    /// typed, and the OS layout-switch chord is left alone (freenet/river#955). Pinned on
+    /// Linux only. On Windows the answer depends on an OS query of the installed layouts, which a
+    /// River test cannot control (Rune's override is `cfg(test)` inside Rune). macOS was never
+    /// pinned.
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     #[test]
-    fn the_ctrl_shift_chord_sets_the_composers_direction_and_it_survives_a_send() {
+    fn the_ctrl_shift_chord_does_not_set_the_composers_direction_on_linux() {
         let mut rt = render(connected(), WINDOW_SIZE);
         type_text(&mut rt, "abc");
         // The direction's type is Rune's internal one, so it is compared by its name.
@@ -6739,19 +6792,22 @@ mod rune_bump {
         chord(&mut rt, PhysicalKeyCode::ShiftRight);
         assert_eq!(
             dir(&rt),
-            "Some(Rtl)",
-            "Ctrl+Right Shift flips the composer to right to left"
+            "None",
+            "Ctrl+Right Shift leaves the direction alone"
         );
         assert_eq!(rt.state.chat.composer.text, "abc", "no text is typed");
         chord(&mut rt, PhysicalKeyCode::ShiftLeft);
-        assert_eq!(dir(&rt), "Some(Ltr)");
-        chord(&mut rt, PhysicalKeyCode::ShiftRight);
+        assert_eq!(
+            dir(&rt),
+            "None",
+            "Ctrl+Left Shift leaves the direction alone"
+        );
         key(&mut rt, Key::Enter);
         assert_eq!(rt.state.chat.composer.text, "", "sent");
         assert_eq!(
             dir(&rt),
-            "Some(Rtl)",
-            "the next draft is still right to left"
+            "None",
+            "the next draft keeps its natural direction"
         );
     }
 }

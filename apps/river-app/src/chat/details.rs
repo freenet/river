@@ -1223,6 +1223,11 @@ pub(super) fn details_modal(
         .w_full()
         // The dialog's title and footer and the window's margins take the rest of the window.
         .max_h((win_h - 240.0).clamp(60.0, 700.0))
+        // A tall footer (the owner's leave warning, the lowering warning) takes height from the
+        // fields, not from the buttons: Rune bounds a dialog by the window, and a body that does
+        // not shrink is cut off at the window's bottom edge.
+        .shrink()
+        .min_h(0.0)
         .scroll(rune::ScrollSpec {
             stick_bottom: false,
         })
