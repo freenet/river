@@ -772,16 +772,27 @@ impl RiverApp {
         }
     }
 
-    /// What the tray menu lists besides the connection and the total.
+    /// What the tray menu lists besides the connection and the total: rows that add up to the
+    /// badge (the open room's missed messages on its row, direct messages on theirs), up to the
+    /// cap on rooms.
     pub fn tray_menu(&self) -> notify::TrayMenu {
         let listed = matches!(self.chat.source, chat::Source::Node(_));
         notify::TrayMenu {
             unread_rooms: if listed {
-                self.chat.unread_rooms(notify::TRAY_UNREAD_ROOMS)
+                self.chat.unread_rooms(
+                    notify::TRAY_UNREAD_ROOMS,
+                    (self.missed.0.as_str(), self.missed.1),
+                )
             } else {
                 Vec::new()
             },
             dnd: self.chat.dnd.active(),
+            dnd_switch: self.chat.dnd.settings.manual,
+            dm_unread: if listed {
+                self.chat.dm_unread_counted()
+            } else {
+                0
+            },
             update_ready: self.chat.update.ready().is_some(),
             start_at_login: self.chat.start_at_login(),
         }
@@ -796,20 +807,31 @@ impl RiverApp {
         }
     }
 
-    /// The tray's "Mark all as read": the rooms the tray lists (those that count), as the
-    /// overview's button does.
+    /// Tell the notifier the tray menu's contents again even if they did not change: after a
+    /// check item was chosen, so a menu that flipped its own tick shows the real state.
+    pub fn resend_tray_menu(&mut self) {
+        self.reported_menu = None;
+        self.sync_tray_menu();
+    }
+
+    /// The tray's "Mark all as read": the rooms the tray lists (those that count) are marked
+    /// and reported to the node, and so are the direct messages.
     pub fn tray_mark_all_read(&mut self) {
         self.mark_everything_read();
     }
 
-    /// The tray's "Do not disturb": flips the switch Settings has. When only the daily
-    /// schedule has it on, flipping the switch would change nothing visible, so this opens the
-    /// settings where the schedule can be changed and returns true: the caller shows the window.
-    pub fn tray_toggle_dnd(&mut self) -> bool {
-        self.refresh_dnd_clock();
-        let to_settings = !self.chat.dnd.settings.manual && self.chat.dnd.active();
-        self.chat.quick_dnd();
-        to_settings
+    /// The tray's "Do Not Disturb": flips the switch Settings has.
+    pub fn tray_toggle_dnd(&mut self) {
+        self.chat.toggle_dnd();
+    }
+
+    /// The tray's "Direct messages": open the first thread with unread messages. False if there
+    /// is none (read since the menu was drawn).
+    pub fn tray_open_direct_messages(&mut self) -> bool {
+        match self.chat.first_unread_dm() {
+            Some((room, peer)) => self.open_dm_thread(&room, &peer),
+            None => false,
+        }
     }
 
     /// The tray's "Update available - restart": what the update block's Restart does.
@@ -817,9 +839,16 @@ impl RiverApp {
         self.restart_to_update();
     }
 
-    /// The tray's "Start River when I log in": the Settings switch.
+    /// The tray's "Start River when I log in": the Settings switch. A failure has no Settings
+    /// page open to show it on, so it is said as a notification.
     pub fn tray_toggle_start_at_login(&mut self) {
         self.chat.toggle_start_at_login();
+        if let Some(why) = self.chat.start_at_login_error().map(str::to_owned) {
+            self.send_notice(
+                "Couldn't change Start at login".into(),
+                format!("Couldn't change Start at login: {why}"),
+            );
+        }
     }
 
     /// Keep the node status dialog current while it is open. Does nothing, and schedules
@@ -891,10 +920,6 @@ impl RiverApp {
             u.host().confirm_started();
         }
         self.setup = setup;
-        if connected {
-            // Setup is over: a first run's ticked box writes the login item now.
-            self.chat.finish_first_run();
-        }
         // The node answered as Freenet: now the address is worth remembering.
         if connected
             && let Some(choice) = self.pending_save.take()
@@ -3425,14 +3450,8 @@ fn screen(s: &RiverApp, cx: &mut Cx<RiverApp>) -> El {
     // Before the rooms show, the node status says why River is not connected yet.
     let mut layer = Vec::new();
     chat::node_status::dialog(&s.chat, &k, &mut layer);
-    // A first run offers to start River at login, ticked; the box writes nothing until setup ends.
-    let root = root.child(body);
-    let root = match s.chat.background.as_ref().and_then(|b| b.first_run_login) {
-        Some(on) => root.child(first_run_login_box(on, &k)),
-        None => root,
-    };
     rune_kit::root(
-        root.child(
+        root.child(body).child(
             Button::new("Node status")
                 .variant(ButtonVariant::Ghost)
                 .on_press(|s: &mut RiverApp| s.chat.status.open())
@@ -3440,18 +3459,6 @@ fn screen(s: &RiverApp, cx: &mut Cx<RiverApp>) -> El {
                 .key("node-status-open"),
         ),
         layer,
-    )
-}
-
-/// The first run's "Start River when I log in", under the setup card.
-fn first_run_login_box(on: bool, k: &Kit) -> El {
-    row().key("first-run-login-row").w(PANEL_W + 64.0).child(
-        rune_kit::Checkbox::new(on)
-            .label("Start River when I log in")
-            .description("Applied when setup finishes. You can change it in Settings.")
-            .on_toggle(|s: &mut RiverApp| s.chat.toggle_first_run_login())
-            .build(k)
-            .key("first-run-login"),
     )
 }
 

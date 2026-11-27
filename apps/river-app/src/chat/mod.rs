@@ -644,6 +644,20 @@ impl Chat {
         let Some(room) = self.room() else {
             return;
         };
+        let key = room.key.clone();
+        self.report_room_read(&key);
+    }
+
+    /// Tell the node the room keyed `room_key` is read up to its newest message, once per newest
+    /// message. What [`Chat::report_read`] does for the open room once the window is in front;
+    /// "Mark all as read" does it for each room it marks, whatever the window shows.
+    fn report_room_read(&mut self, room_key: &str) {
+        if !matches!(self.source, Source::Node(_)) || self.reads_held {
+            return;
+        }
+        let Some(room) = self.rooms.iter().find(|r| r.key == room_key) else {
+            return;
+        };
         // Not a message of yours still on its way: the node does not have it yet.
         let Some(newest) = room.messages.iter().rev().find(|m| m.pending.is_none()) else {
             return;
@@ -1042,11 +1056,17 @@ impl Chat {
     /// Up to `cap` rooms that count toward [`Chat::unread_total`], the one with the newest
     /// message first (rooms with no message last, then by key). A room [`Chat::unread_of`]
     /// gives nothing for (read, muted, or mentions-only with no mention) is not listed.
-    pub fn unread_rooms(&self, cap: usize) -> Vec<crate::notify::UnreadRoom> {
+    ///
+    /// `extra` is the open room's messages the window missed while away, `(room key, count)`:
+    /// they are on the badge, so they are on that room's row.
+    pub fn unread_rooms(&self, cap: usize, extra: (&str, usize)) -> Vec<crate::notify::UnreadRoom> {
         let mut v: Vec<(&Room, usize)> = self
             .rooms
             .iter()
-            .map(|r| (r, self.unread_of(r)))
+            .map(|r| {
+                let more = if r.key == extra.0 { extra.1 } else { 0 };
+                (r, self.unread_of(r) + more)
+            })
             .filter(|(_, n)| *n > 0)
             .collect();
         v.sort_by(|(a, _), (b, _)| {

@@ -90,12 +90,51 @@ pub enum Action {
     Open,
     /// Show the window with this room (by key) open.
     OpenRoom(String),
+    /// Show the window with the first thread that has unread direct messages open.
+    OpenDms,
     MarkAllRead,
     ToggleDnd,
     ToggleLogin,
     /// Restart into the downloaded update.
     Update,
     Quit,
+}
+
+impl Action {
+    /// The item's id on Windows and macOS: the same for the same action however often the menu
+    /// is rebuilt, so a click on an item of an older menu still means what it did.
+    #[cfg(any(test, windows, target_os = "macos"))]
+    fn id(&self) -> String {
+        match self {
+            Action::Open => "open".into(),
+            Action::OpenRoom(key) => format!("room:{key}"),
+            Action::OpenDms => "dms".into(),
+            Action::MarkAllRead => "mark-all-read".into(),
+            Action::ToggleDnd => "dnd".into(),
+            Action::ToggleLogin => "login".into(),
+            Action::Update => "update".into(),
+            Action::Quit => "quit".into(),
+        }
+    }
+
+    #[cfg(any(test, windows, target_os = "macos"))]
+    fn from_id(id: &str) -> Option<Action> {
+        Some(match id {
+            "open" => Action::Open,
+            "dms" => Action::OpenDms,
+            "mark-all-read" => Action::MarkAllRead,
+            "dnd" => Action::ToggleDnd,
+            "login" => Action::ToggleLogin,
+            "update" => Action::Update,
+            "quit" => Action::Quit,
+            other => Action::OpenRoom(other.strip_prefix("room:")?.to_owned()),
+        })
+    }
+
+    /// Whether choosing it flips a tick the menu draws.
+    fn is_check(&self) -> bool {
+        matches!(self, Action::ToggleDnd | Action::ToggleLogin)
+    }
 }
 
 /// One line of the tray menu.
@@ -139,7 +178,7 @@ pub fn menu_model(view: &View) -> Vec<Entry> {
             .map_or("Connecting", Connection::text)
             .to_owned(),
     )];
-    if !m.unread_rooms.is_empty() {
+    if !m.unread_rooms.is_empty() || m.dm_unread > 0 {
         for r in &m.unread_rooms {
             out.push(item(
                 &format!("{} ({})", shortened(&r.name), r.count),
@@ -147,11 +186,27 @@ pub fn menu_model(view: &View) -> Vec<Entry> {
                 None,
             ));
         }
+        if m.dm_unread > 0 {
+            out.push(item(
+                &format!("Direct messages ({})", m.dm_unread),
+                Action::OpenDms,
+                None,
+            ));
+        }
         out.push(item("Mark all as read", Action::MarkAllRead, None));
     }
     out.push(Entry::Separator);
     out.push(item("Open River", Action::Open, None));
-    out.push(item("Do Not Disturb", Action::ToggleDnd, Some(m.dnd)));
+    if m.dnd && !m.dnd_switch {
+        // Only the daily schedule has it on: there is nothing here to untick.
+        out.push(Entry::Status("Do Not Disturb (scheduled)".into()));
+    } else {
+        out.push(item(
+            "Do Not Disturb",
+            Action::ToggleDnd,
+            Some(m.dnd_switch),
+        ));
+    }
     if let Some(on) = m.start_at_login {
         out.push(item(
             "Start River when I log in",
@@ -167,24 +222,40 @@ pub fn menu_model(view: &View) -> Vec<Entry> {
     out
 }
 
+/// Set when a check item was chosen: the next menu update is drawn even if nothing it shows
+/// changed, because the menu may have flipped the tick itself (Windows and macOS do) and the
+/// choice may not have taken (a login item that could not be written).
+static REDRAW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Do what a chosen item says. Never blocks: the app's work runs on its UI thread.
 fn run(handle: &AppHandle<RiverApp>, action: Action) {
+    if action.is_check() {
+        REDRAW.store(true, std::sync::atomic::Ordering::Release);
+    }
     match action {
         Action::Open => handle.open(),
         Action::OpenRoom(key) => {
-            handle.update(move |app, _| app.open_room(&key));
+            // As a click on a notification does: a room that is gone just shows the window.
+            handle.update(move |app, _| {
+                app.open_message(&key, "");
+            });
+            handle.open();
+        }
+        Action::OpenDms => {
+            handle.update(|app, _| {
+                app.tray_open_direct_messages();
+            });
             handle.open();
         }
         Action::MarkAllRead => handle.update(|app, _| app.tray_mark_all_read()),
-        Action::ToggleDnd => {
-            let window = handle.clone();
-            handle.update(move |app, _| {
-                if app.tray_toggle_dnd() {
-                    window.open();
-                }
-            });
-        }
-        Action::ToggleLogin => handle.update(|app, _| app.tray_toggle_start_at_login()),
+        Action::ToggleDnd => handle.update(|app, _| {
+            app.tray_toggle_dnd();
+            app.resend_tray_menu();
+        }),
+        Action::ToggleLogin => handle.update(|app, _| {
+            app.tray_toggle_start_at_login();
+            app.resend_tray_menu();
+        }),
         Action::Update => {
             // A restart that would lose something asks first, in the window.
             handle.open();
@@ -386,8 +457,11 @@ impl Tracker {
 
     /// What the menu lists, from `Notifier::set_menu` on the UI thread.
     pub fn set_menu(&self, menu: TrayMenu) {
-        if let Some(view) = self.change(|v| v.menu = menu) {
-            refresh(view);
+        let redraw = REDRAW.swap(false, std::sync::atomic::Ordering::AcqRel);
+        match self.change(|v| v.menu = menu) {
+            Some(view) => refresh(view),
+            None if redraw => refresh(self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()),
+            None => {}
         }
     }
 
@@ -651,8 +725,6 @@ mod linux {
 #[cfg(any(windows, target_os = "macos"))]
 mod native {
     use std::cell::RefCell;
-    use std::sync::Mutex;
-
     use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
     use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
     #[cfg(windows)]
@@ -666,9 +738,6 @@ mod native {
         static TRAY: RefCell<(Option<TrayIcon>, Vec<u8>)> = const { RefCell::new((None, Vec::new())) };
     }
 
-    /// What each item of the menu now showing does, for the menu event handler.
-    static ACTIONS: Mutex<Vec<(MenuId, Action)>> = Mutex::new(Vec::new());
-
     /// A label as the menu shows it: Windows reads `&` as the mark of a shortcut letter, and `&&`
     /// is a literal one.
     fn label_safe(label: &str) -> String {
@@ -679,10 +748,10 @@ mod native {
         }
     }
 
-    /// The menu for `view`, and what its items do.
-    fn build_menu(view: &View) -> Result<(Menu, Vec<(MenuId, Action)>), tray_icon::menu::Error> {
+    /// The menu for `view`. Each item's id is its action's ([`Action::id`]), so a click on an
+    /// item of a menu that has since been rebuilt still resolves.
+    fn build_menu(view: &View) -> Result<Menu, tray_icon::menu::Error> {
         let menu = Menu::new();
-        let mut actions = Vec::new();
         for entry in menu_model(view) {
             match entry {
                 Entry::Separator => menu.append(&PredefinedMenuItem::separator())?,
@@ -693,23 +762,26 @@ mod native {
                     label,
                     action,
                     checked: None,
-                } => {
-                    let item = MenuItem::new(label_safe(&label), true, None);
-                    menu.append(&item)?;
-                    actions.push((item.id().clone(), action));
-                }
+                } => menu.append(&MenuItem::with_id(
+                    MenuId::new(action.id()),
+                    label_safe(&label),
+                    true,
+                    None,
+                ))?,
                 Entry::Item {
                     label,
                     action,
                     checked: Some(on),
-                } => {
-                    let item = CheckMenuItem::new(label_safe(&label), true, on, None);
-                    menu.append(&item)?;
-                    actions.push((item.id().clone(), action));
-                }
+                } => menu.append(&CheckMenuItem::with_id(
+                    MenuId::new(action.id()),
+                    label_safe(&label),
+                    true,
+                    on,
+                    None,
+                ))?,
             }
         }
-        Ok((menu, actions))
+        Ok(menu)
     }
 
     /// Show a new view: the icon, the tooltip and the menu. Runs on the UI thread, which is the
@@ -724,10 +796,7 @@ mod native {
             }
             let _ = tray.set_tooltip(Some(tooltip(&view)));
             match build_menu(&view) {
-                Ok((menu, actions)) => {
-                    *ACTIONS.lock().unwrap_or_else(|e| e.into_inner()) = actions;
-                    tray.set_menu(Some(Box::new(menu)));
-                }
+                Ok(menu) => tray.set_menu(Some(Box::new(menu))),
                 Err(e) => river_app::diag!("river: the tray menu could not be updated: {e}"),
             }
         });
@@ -747,23 +816,16 @@ mod native {
                 return false;
             }
         };
-        let (menu, actions) = match build_menu(&view) {
+        let menu = match build_menu(&view) {
             Ok(m) => m,
             Err(e) => {
                 river_app::diag!("river: the tray menu could not be made: {e}");
                 return false;
             }
         };
-        *ACTIONS.lock().unwrap_or_else(|e| e.into_inner()) = actions;
         let on_menu = handle.clone();
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-            let action = ACTIONS
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .iter()
-                .find(|(id, _)| *id == event.id)
-                .map(|(_, a)| a.clone());
-            if let Some(action) = action {
+            if let Some(action) = Action::from_id(&event.id.0) {
                 run(&on_menu, action);
             }
         }));
@@ -1163,6 +1225,7 @@ mod tests {
     fn do_not_disturb_and_login_show_their_state_and_the_update_item_appears_when_ready() {
         let mut v = live();
         v.menu.dnd = true;
+        v.menu.dnd_switch = true;
         v.menu.start_at_login = Some(true);
         v.menu.update_ready = true;
         assert_eq!(
@@ -1262,5 +1325,87 @@ mod tests {
             badge[mid * 4..mid * 4 + 4],
             badged(&plain, 4)[mid * 4..mid * 4 + 4]
         );
+    }
+
+    #[test]
+    fn direct_messages_get_a_row_and_count_toward_mark_all_read() {
+        let mut v = live();
+        v.menu.dm_unread = 2;
+        assert_eq!(
+            labels(&v)[..4],
+            [
+                "status:Connected",
+                "Direct messages (2)",
+                "Mark all as read",
+                "---"
+            ]
+        );
+        v.menu.unread_rooms = vec![room("a", "Alpha", 3)];
+        assert_eq!(
+            labels(&v)[1..4],
+            ["Alpha (3)", "Direct messages (2)", "Mark all as read"]
+        );
+    }
+
+    #[test]
+    fn a_schedule_alone_is_a_line_of_text_and_a_switch_is_a_tick() {
+        let mut v = live();
+        v.menu.dnd = true;
+        let l = labels(&v);
+        assert!(
+            l.contains(&"status:Do Not Disturb (scheduled)".to_owned()),
+            "{l:?}"
+        );
+        assert!(!l.iter().any(|x| x.starts_with("Do Not Disturb[")));
+        v.menu.dnd_switch = true;
+        assert!(labels(&v).contains(&"Do Not Disturb[x]".to_owned()));
+    }
+
+    #[test]
+    fn an_item_keeps_its_id_across_rebuilds_and_the_id_names_its_action() {
+        let mut a = live();
+        a.menu.unread_rooms = vec![room("k1", "One", 1)];
+        let mut b = a.clone();
+        b.menu.unread_rooms = vec![room("k1", "One", 9), room("k2", "Two", 1)];
+        let ids = |v: &View| -> Vec<String> {
+            menu_model(v)
+                .into_iter()
+                .filter_map(|e| match e {
+                    Entry::Item { action, .. } => Some(action.id()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert!(ids(&b).contains(&"room:k1".to_owned()));
+        assert!(
+            ids(&a)
+                .iter()
+                .all(|i| ids(&b).contains(i) || i.starts_with("room:"))
+        );
+        for v in [&a, &b] {
+            for e in menu_model(v) {
+                if let Entry::Item { action, .. } = e {
+                    assert_eq!(Action::from_id(&action.id()), Some(action));
+                }
+            }
+        }
+        assert_eq!(
+            Action::from_id("room:"),
+            Some(Action::OpenRoom(String::new()))
+        );
+        assert_eq!(Action::from_id("nonsense"), None);
+    }
+
+    #[test]
+    fn a_chosen_check_item_forces_the_next_menu_update_even_if_nothing_changed() {
+        use std::sync::atomic::Ordering;
+        assert!(Action::ToggleDnd.is_check() && Action::ToggleLogin.is_check());
+        assert!(!Action::MarkAllRead.is_check() && !Action::Open.is_check());
+        // The tracker alone says nothing changed; the flag is what asks for the redraw.
+        let t = Tracker::default();
+        assert_eq!(t.change(|v| v.menu = TrayMenu::default()), None);
+        REDRAW.store(true, Ordering::Release);
+        t.set_menu(TrayMenu::default());
+        assert!(!REDRAW.load(Ordering::Acquire), "taken by the update");
     }
 }

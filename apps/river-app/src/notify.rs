@@ -105,6 +105,11 @@ pub struct TrayMenu {
     pub unread_rooms: Vec<UnreadRoom>,
     /// Whether do not disturb is on now (the switch or the schedule).
     pub dnd: bool,
+    /// Whether the switch is on (the item can be unticked); with `dnd` and no switch, only the
+    /// daily schedule has it on.
+    pub dnd_switch: bool,
+    /// Unread direct messages (the part of the badge the rooms do not account for).
+    pub dm_unread: usize,
     /// Whether a downloaded update is waiting for a restart.
     pub update_ready: bool,
     /// Whether River starts at login; `None` where the shell has no such setting.

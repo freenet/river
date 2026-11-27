@@ -580,6 +580,9 @@ fn rooms(chat: &Chat, logo: Option<&Pixels>, narrow: bool, p: &Palette, k: &Kit)
     for w in &chat.work {
         footer = footer.child(work_row(w, p, k));
     }
+    if let Some(card) = super::background::first_run_card(chat, p, k) {
+        footer = footer.child(card);
+    }
     if let Some(block) = super::update_view::update_block(&chat.update, chat.settings.open, p, k) {
         footer = footer.child(block);
     }

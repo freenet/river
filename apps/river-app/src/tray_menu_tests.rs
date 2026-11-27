@@ -136,16 +136,16 @@ fn the_menu_item_flips_the_same_switch_as_settings() {
     s.chat.dnd.pinned = true;
     s.chat.dnd.now = 12 * 60;
     assert!(!s.tray_menu().dnd);
-    assert!(!s.tray_toggle_dnd(), "no need to show the window");
+    s.tray_toggle_dnd();
     assert!(s.chat.dnd.settings.manual);
-    assert!(s.tray_menu().dnd);
+    assert!(s.tray_menu().dnd && s.tray_menu().dnd_switch);
     s.tray_toggle_dnd();
     assert!(!s.chat.dnd.settings.manual);
     assert!(!s.tray_menu().dnd);
 }
 
 #[test]
-fn when_only_the_schedule_has_it_on_the_item_opens_settings_instead() {
+fn when_only_the_schedule_has_it_on_the_menu_says_so_and_the_switch_is_off() {
     let mut s = app_with(rooms(1, 0));
     s.chat.dnd.pinned = true;
     s.chat.dnd.now = 23 * 60;
@@ -153,9 +153,10 @@ fn when_only_the_schedule_has_it_on_the_item_opens_settings_instead() {
         start: 22 * 60,
         end: 7 * 60,
     });
-    assert!(s.tray_menu().dnd);
-    assert!(s.tray_toggle_dnd(), "the caller shows the window");
-    assert!(!s.chat.dnd.settings.manual, "the switch is not touched");
+    let m = s.tray_menu();
+    assert!(m.dnd && !m.dnd_switch, "on by the schedule alone");
+    s.tray_toggle_dnd();
+    assert!(s.tray_menu().dnd_switch, "a manual switch on top of it");
 }
 
 #[test]
@@ -242,50 +243,183 @@ fn connected(s: &mut RiverApp) {
 }
 
 #[test]
-fn a_first_run_is_ticked_and_completing_setup_turns_the_login_item_on() {
+fn a_first_run_has_a_ticked_card_and_reaching_the_node_writes_nothing() {
     let host = Host::new(true);
     let mut s = RiverApp::detached().with_background(host.clone());
     assert_eq!(
         s.chat.background.as_ref().unwrap().first_run_login,
         Some(true)
     );
-    assert!(
-        host.calls().is_empty(),
-        "nothing is written before setup ends"
-    );
     connected(&mut s);
+    connected(&mut s);
+    assert!(host.calls().is_empty(), "{:?}", host.calls());
+    assert_eq!(
+        s.chat.background.as_ref().unwrap().first_run_login,
+        Some(true),
+        "still waiting for OK"
+    );
+}
+
+#[test]
+fn ok_with_the_box_ticked_writes_the_login_item_once_and_retires_the_card() {
+    let host = Host::new(true);
+    let mut s = RiverApp::detached().with_background(host.clone());
+    connected(&mut s);
+    s.chat.confirm_first_run();
     assert_eq!(host.calls(), ["login true", "done"]);
     assert_eq!(s.chat.background.as_ref().unwrap().first_run_login, None);
     assert_eq!(s.tray_menu().start_at_login, Some(true));
-    // Reaching the node again changes nothing.
-    connected(&mut s);
+    s.chat.confirm_first_run();
     assert_eq!(host.calls(), ["login true", "done"]);
 }
 
 #[test]
-fn unticking_on_the_setup_screen_writes_nothing() {
+fn ok_with_the_box_unticked_writes_nothing_and_retires_the_card() {
     let host = Host::new(true);
     let mut s = RiverApp::detached().with_background(host.clone());
     s.chat.toggle_first_run_login();
-    assert_eq!(
-        s.chat.background.as_ref().unwrap().first_run_login,
-        Some(false)
-    );
-    connected(&mut s);
-    assert_eq!(
-        host.calls(),
-        ["done"],
-        "no login item, and not offered again"
-    );
+    s.chat.confirm_first_run();
+    assert_eq!(host.calls(), ["done"]);
+    assert_eq!(s.chat.background.as_ref().unwrap().first_run_login, None);
     assert_eq!(s.tray_menu().start_at_login, Some(false));
 }
 
 #[test]
-fn a_run_that_is_not_the_first_never_writes_the_login_item() {
+fn a_run_that_is_not_the_first_has_no_card_and_never_writes_the_login_item() {
     let host = Host::new(false);
     let mut s = RiverApp::detached().with_background(host.clone());
     assert_eq!(s.chat.background.as_ref().unwrap().first_run_login, None);
     s.chat.toggle_first_run_login();
+    s.chat.confirm_first_run();
     connected(&mut s);
     assert!(host.calls().is_empty(), "{:?}", host.calls());
+}
+
+#[test]
+fn choosing_the_tray_or_settings_toggle_while_the_card_waits_is_the_answer() {
+    let host = Host::new(true);
+    let mut s = RiverApp::detached().with_background(host.clone());
+    s.tray_toggle_start_at_login();
+    assert_eq!(host.calls(), ["login true", "done"]);
+    assert_eq!(s.chat.background.as_ref().unwrap().first_run_login, None);
+    // The card does not write it again.
+    s.chat.confirm_first_run();
+    assert_eq!(host.calls(), ["login true", "done"]);
+}
+
+#[test]
+fn a_failed_login_change_from_the_tray_is_said_as_a_notification() {
+    #[derive(Clone, Default)]
+    struct Said(Rc<RefCell<Vec<String>>>);
+    impl Notifier for Said {
+        fn notify(&self, n: Notification) -> bool {
+            self.0.borrow_mut().push(n.body);
+            true
+        }
+        fn set_unread(&self, _: usize) {}
+    }
+    struct Refusing;
+    impl chat::BackgroundHost for Refusing {
+        fn tray_available(&self) -> bool {
+            true
+        }
+        fn close_to_tray(&self) -> bool {
+            true
+        }
+        fn set_close_to_tray(&self, _: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn start_at_login(&self) -> bool {
+            false
+        }
+        fn set_start_at_login(&self, _: bool) -> Result<(), String> {
+            Err("no permission".into())
+        }
+    }
+    let said = Said::default();
+    let mut s = RiverApp::detached()
+        .with_notifier(Box::new(said.clone()))
+        .with_background(Arc::new(Refusing));
+    s.tray_toggle_start_at_login();
+    assert_eq!(
+        *said.0.borrow(),
+        ["Couldn't change Start at login: no permission"]
+    );
+    assert_eq!(
+        s.tray_menu().start_at_login,
+        Some(false),
+        "the tick is the truth"
+    );
+}
+
+#[test]
+fn a_chosen_room_opens_through_the_notification_click_path_and_closes_the_overview() {
+    let mut s = app_with(rooms(3, 1));
+    s.chat.toggle_overview();
+    assert!(s.chat.overview);
+    assert!(s.open_message("r2", ""));
+    assert_eq!(s.chat.room().unwrap().key, "r2");
+    assert!(!s.chat.overview);
+    assert!(
+        !s.open_message("gone", ""),
+        "a room that has gone opens nothing"
+    );
+}
+
+fn reported_reads(s: &mut RiverApp) -> Vec<(String, String)> {
+    std::mem::take(&mut s.chat.reported)
+        .into_iter()
+        .filter_map(|c| match c.action {
+            crate::rooms::outbox::Action::MarkRead { up_to } => Some((c.room, up_to)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn mark_all_read_tells_the_node_for_every_room_it_marks() {
+    // r0 is the open room, read already; r2 is muted.
+    let mut s = app_with(rooms(4, 4));
+    s.chat.reported.clear();
+    s.chat.set_mode("r2", NotificationMode::Muted);
+    s.tray_mark_all_read();
+    let mut got = reported_reads(&mut s);
+    got.sort();
+    let newest = |k: &str| {
+        s.chat
+            .rooms()
+            .iter()
+            .find(|r| r.key == k)
+            .unwrap()
+            .messages
+            .last()
+            .unwrap()
+            .key
+            .clone()
+    };
+    assert_eq!(
+        got,
+        [
+            ("r1".to_owned(), newest("r1")),
+            ("r3".to_owned(), newest("r3"))
+        ],
+        "each marked room, up to its newest message; the muted one is left alone"
+    );
+    // Marking again reports nothing new.
+    s.tray_mark_all_read();
+    assert!(reported_reads(&mut s).is_empty());
+}
+
+#[test]
+fn the_open_rooms_missed_messages_are_on_its_row() {
+    let mut s = app_with(rooms(2, 0));
+    s.missed = ("r1".into(), 3);
+    let m = s.tray_menu();
+    assert_eq!(names(&m), [("r1", 3)]);
+    assert_eq!(
+        m.unread_rooms.iter().map(|r| r.count).sum::<usize>(),
+        s.unread()
+    );
+    s.tray_mark_all_read();
+    assert_eq!(s.unread(), 0);
 }

@@ -127,9 +127,9 @@ impl super::Chat {
         }
     }
 
-    /// Setup is over (the node answered): on a first run, write the login item if the box is
-    /// still ticked, and never offer it again. Does nothing when it is not a first run.
-    pub fn finish_first_run(&mut self) {
+    /// The first-run card's OK: write the login item if its box is still ticked, and never show
+    /// the card again. Does nothing when there is no card.
+    pub fn confirm_first_run(&mut self) {
         if let Some(b) = &mut self.background
             && let Some(on) = b.first_run_login.take()
         {
@@ -139,6 +139,11 @@ impl super::Chat {
             b.host.first_run_done();
             b.refresh();
         }
+    }
+
+    /// Why the last change of the login item failed, if it did.
+    pub fn start_at_login_error(&self) -> Option<&str> {
+        self.background.as_ref().and_then(|b| b.error.as_deref())
     }
 
     /// Whether River starts at login, as last read; `None` without a shell that offers it.
@@ -152,8 +157,45 @@ impl super::Chat {
             let want = !b.start_at_login;
             b.error = b.host.set_start_at_login(want).err();
             b.refresh();
+            // Choosing it here, in Settings or in the tray, is the answer the card asks for.
+            if b.first_run_login.take().is_some() {
+                b.host.first_run_done();
+            }
         }
     }
+}
+
+/// The one-time card in the room list on a first run: "Start River when I log in", ticked,
+/// applied only when OK is pressed. `None` when there is nothing to ask.
+pub(super) fn first_run_card(chat: &super::Chat, p: &Palette, k: &Kit) -> Option<El> {
+    let on = chat.background.as_ref()?.first_run_login?;
+    Some(
+        col()
+            .key("first-run-card")
+            .w_full()
+            .padding(10.0)
+            .gap(8.0)
+            .radius(8.0)
+            .fill(p.surface)
+            .border(1.0, p.line)
+            .child(
+                rune_kit::Checkbox::new(on)
+                    .label("Start River when I log in")
+                    .description("River starts in the tray. You can change this in Settings.")
+                    .on_toggle(|s: &mut RiverApp| s.chat.toggle_first_run_login())
+                    .build(k)
+                    .key("first-run-login"),
+            )
+            .child(
+                rune::row().child(
+                    rune_kit::Button::new("OK")
+                        .variant(rune_kit::ButtonVariant::Contrast)
+                        .on_press(|s: &mut RiverApp| s.chat.confirm_first_run())
+                        .build(k)
+                        .key("first-run-ok"),
+                ),
+            ),
+    )
 }
 
 /// The section's body. Empty without a shell that offers it (the list does not show it then).
