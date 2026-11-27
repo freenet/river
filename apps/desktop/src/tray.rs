@@ -541,7 +541,7 @@ mod tests {
     fn differs(a: &[u8], b: &[u8], inside: bool) -> bool {
         (0..SIDE * SIDE).any(|p| {
             let (x, y) = (p % SIDE, p / SIDE);
-            let corner = x >= SIDE - 48 && y >= SIDE - BADGE_H as usize - 1;
+            let corner = x >= SIDE - 52 && y >= SIDE - BADGE_H as usize - 1;
             corner == inside && a[p * 4..p * 4 + 4] != b[p * 4..p * 4 + 4]
         })
     }

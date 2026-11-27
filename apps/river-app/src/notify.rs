@@ -1512,7 +1512,8 @@ mod tests {
     fn the_notifier_hears_the_connection_state_once_per_change() {
         use crate::chat::node_status::{Connection, connection_of};
         let rec = Recorder::default();
-        let s = RiverApp::detached().with_notifier(Box::new(rec.clone()));
+        let mut s = RiverApp::detached().with_notifier(Box::new(rec.clone()));
+        s.chat.source = crate::chat::Source::Node(LinkStatus::Live);
         let first = connection_of(&s.setup, &s.access, s.chat.source);
         let mut rt = Runtime::new(
             s,
