@@ -11528,11 +11528,7 @@ pub(crate) fn on_load_worker_settled() {
         match settle_terminal(room_count_zero, saw) {
             Some(state) => write_load_state_now(state),
             None if room_count_zero => schedule_idle_resolution(armed_gen, armed_attempt),
-            None => {
-                // Rooms present → List renders, leave the state. A user with
-                // rooms is not a "swept, found nothing" user.
-                super::legacy_sweep_marker::clear_marker_now();
-            }
+            None => {} // rooms present → List renders, leave the state
         }
     });
 }
@@ -11699,7 +11695,7 @@ pub(crate) fn retry_rooms_load() {
     // BEFORE the re-setup so `fire_legacy_migration_request` sees it cleared.
     LEGACY_MIGRATION_ATTEMPTED.store(false, Ordering::Relaxed);
     // A user retrying wants a real sweep, whatever an earlier one concluded.
-    super::legacy_sweep_marker::clear_marker_now();
+    super::legacy_sweep_marker::request_fresh_sweep();
     crate::util::safe_spawn_local(async {
         // set_up_chat_delegate_registering begins the fresh attempt AND
         // re-registers up front (freenet/river#757: a normal setup lists first
@@ -11895,7 +11891,7 @@ pub(crate) fn arm_legacy_migration_recovery() -> bool {
     }
     LEGACY_MIGRATION_ATTEMPTED.store(false, Ordering::Relaxed);
     // An interrupted migration means data exists: the marker is wrong.
-    super::legacy_sweep_marker::clear_marker_now();
+    super::legacy_sweep_marker::request_fresh_sweep();
     true
 }
 
@@ -11918,15 +11914,6 @@ pub(crate) fn arm_legacy_migration_recovery() -> bool {
 /// (probes fired — a migration might still arrive) or resolve to `Loaded`
 /// (nothing more is coming) — see [`load_state_after_probe_legacy`].
 pub(crate) async fn fire_legacy_migration_request() -> bool {
-    // A previous sweep of exactly this node and generation set proved every
-    // generation empty (freenet/river#972): nothing to find, so resolve as a
-    // sweep that found nothing. Checked before the per-session guard so a
-    // matching marker never consumes it. Any storage trouble reads as "no
-    // marker" and the sweep runs.
-    if super::legacy_sweep_marker::marker_matches_now() {
-        info!("Legacy sweep already found nothing for this node and delegate set, skipping");
-        return false;
-    }
     // Only attempt migration once per session to avoid error spam on reconnect.
     // If the legacy delegates aren't installed, retrying won't help. The one
     // exception: a sweep still pacing its waves for an EARLIER load attempt
@@ -11946,6 +11933,17 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
     };
     if !start {
         info!("Legacy migration already attempted this session, skipping");
+        return false;
+    }
+    // A previous sweep with this delegate and generation set proved every
+    // generation empty (freenet/river#972): nothing to find, so resolve as a
+    // sweep that found nothing. Read from the current delegate's store, only
+    // when a sweep would otherwise start (so a reconnect refused by the session
+    // guard pays no read). Any failure or timeout reads as "no marker".
+    if !super::legacy_sweep_marker::take_fresh_sweep_request()
+        && super::legacy_sweep_marker::marker_matches_now().await
+    {
+        info!("Legacy sweep already found nothing for this delegate set, skipping");
         return false;
     }
     let epoch = SWEEP_EPOCH.fetch_add(1, Ordering::Relaxed) + 1;

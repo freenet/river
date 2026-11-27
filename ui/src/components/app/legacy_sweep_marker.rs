@@ -1,65 +1,75 @@
 //! A persistent "swept every legacy delegate generation, found nothing" marker,
-//! so the legacy room sweep runs at most once per browser and node instead of
-//! on every page load of a user with no rooms.
+//! so the legacy room sweep runs at most once per user and node instead of on
+//! every page load of a user with no rooms (freenet/river#972).
 //!
-//! The marker is a claim that no legacy generation holds data for this
-//! browser's identity on this node. It is only worth anything if it is never
-//! wrong in the dangerous direction (skipping a sweep that would have found
-//! rooms), so:
+//! # Where it lives
 //!
-//! * It is keyed by the node (the WebSocket URL the UI talks to), the CURRENT
-//!   delegate key and the whole ordered legacy generation list. A re-key adds a
-//!   generation and turns the current delegate into one, which changes the
-//!   fingerprint, so a user who was new when the marker was written is swept
-//!   after the re-key.
+//! In the CURRENT chat delegate's key-value store, under
+//! [`LEGACY_SWEEP_MARKER_KEY`], through the same plain `GetRequest`,
+//! `StoreRequest` and `DeleteRequest` the UI uses for room data. NOT in browser
+//! storage: the River UI runs in a sandboxed opaque-origin iframe where every
+//! browser-storage access throws, so a browser-side marker can never be written
+//! (the first attempt, #1067, was inert for that reason). The delegate store is
+//! per node and, on the hosted node, per user, and a delegate re-key starts a
+//! new, empty store, so a re-key resets the marker without any bookkeeping.
+//!
+//! # Why it is safe
+//!
+//! The marker is a claim that no legacy generation holds data. It is only worth
+//! anything if it is never wrong in the dangerous direction (skipping a sweep
+//! that would have found rooms), so:
+//!
+//! * It records the CURRENT delegate key and the whole ordered legacy
+//!   generation list. A re-key changes both (the node scope comes from the
+//!   store itself).
 //! * It is written only when [`SweepLedger::complete_and_empty`] holds: the
-//!   sweep sent every wave, every generation gave a definitive "nothing here"
-//!   answer to all three of its requests, no generation held data, and no
-//!   fetch failed. Silence, a timed-out wave, a refusal that is not a typed
-//!   "delegate missing", a transport failure and a superseded sweep all leave
-//!   it unwritten.
-//! * Any storage failure, or a value that is not exactly this build's
-//!   fingerprint, reads as "no marker": the sweep runs as it always did.
+//!   sweep sent every wave, every generation answered all three of its requests
+//!   with a typed "delegate missing" (or an explicit empty answer), no
+//!   generation held data, and no fetch failed. Silence, a timed-out wave, a
+//!   refusal that is not a typed "missing", an empty reply, a transport failure
+//!   and a superseded sweep all leave it unwritten.
+//! * It carries its write time and is ignored after seven days.
+//! * Any read or write failure, a timeout, or a value that is not exactly this
+//!   build's format and fingerprint reads as "no marker": the sweep runs as it
+//!   always did.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use river_core::chat_delegate::ChatDelegateResponseMsg;
+use futures::future::{select, Either};
+use river_core::chat_delegate::{ChatDelegateKey, ChatDelegateRequestMsg, ChatDelegateResponseMsg};
 
 use super::chat_delegate::{
-    current_delegate_key, legacy_delegate_pairs, OUTBOUND_DMS_STORAGE_KEY, ROOMS_STORAGE_KEY,
+    await_delegate_response, current_delegate_key, enqueue_delegate_request, legacy_delegate_pairs,
+    send_delegate_request, OUTBOUND_DMS_STORAGE_KEY, ROOMS_STORAGE_KEY,
 };
-use super::freenet_api::constants::get_websocket_url;
 
-/// The localStorage key holding the marker.
-#[cfg(target_arch = "wasm32")]
-const STORAGE_KEY: &str = "river.legacy_sweep_empty";
-/// Format version of the stored value (`v2:<fingerprint>:<written at, ms>`). A
-/// value with any other prefix is ignored.
-const VALUE_PREFIX: &str = "v2:";
+/// The current delegate's storage key for the marker. A bookkeeping key: never
+/// migrated, never counted as room data (`is_migration_bookkeeping_key`).
+pub(crate) const LEGACY_SWEEP_MARKER_KEY: &[u8] = b"__river_legacy_sweep_empty__";
+
+/// Format version of the stored value (`v3:<fingerprint hex>:<written at, ms>`).
+/// A value with any other prefix is ignored.
+const VALUE_PREFIX: &str = "v3:";
 
 /// How long a marker is believed. It bounds a wrong marker in time: rooms
-/// written later to a legacy generation by an old tab or an old desktop build,
-/// or a node whose data changed behind the same URL, are found again by the
-/// next sweep after this.
+/// written later to a legacy generation by an old tab or an old desktop build
+/// are found again by the next sweep after this.
 const MARKER_MAX_AGE_MS: f64 = 7.0 * 24.0 * 60.0 * 60.0 * 1000.0;
 /// A stamp this far ahead of the clock is not believed (clock changed).
 const MARKER_FUTURE_SLACK_MS: f64 = 60.0 * 1000.0;
 
-/// Where the marker lives. Every method can fail (private mode, quota).
-pub(crate) trait MarkerStore {
-    fn get(&self) -> Result<Option<String>, ()>;
-    fn set(&self, value: &str) -> Result<(), ()>;
-    fn remove(&self) -> Result<(), ()>;
-}
+/// The longest the load waits for the marker read. The delegate answers in one
+/// round trip when it is up; this only bounds the failure case, after which the
+/// sweep runs as it always did.
+const MARKER_READ_TIMEOUT_MS: u64 = 2_000;
 
-/// The fingerprint of "what this marker covers": node, current delegate and
-/// the ordered legacy generation list. Length-prefixed so no two inputs share
-/// an encoding.
-pub(crate) fn fingerprint(node: &str, current: &[u8], legacy: &[[u8; 32]]) -> String {
+/// The fingerprint of "what this marker covers": the current delegate and the
+/// ordered legacy generation list. Length-prefixed so no two inputs share an
+/// encoding.
+pub(crate) fn fingerprint(current: &[u8], legacy: &[[u8; 32]]) -> String {
     let mut h = blake3::Hasher::new();
-    h.update(b"river-legacy-sweep-empty-v1");
-    h.update(&(node.len() as u64).to_le_bytes());
-    h.update(node.as_bytes());
+    h.update(b"river-legacy-sweep-empty-v3");
     h.update(&(current.len() as u64).to_le_bytes());
     h.update(current);
     h.update(&(legacy.len() as u64).to_le_bytes());
@@ -104,21 +114,43 @@ fn now_ms() -> f64 {
     }
 }
 
-/// Whether the store holds `fingerprint`, written within the last seven days.
-/// Any failure or any other value (older format, other node, other generation
-/// set, too old) is `false`.
-pub(crate) fn marker_matches(store: &dyn MarkerStore, fingerprint: &str, now_ms: f64) -> bool {
-    matches!(store.get(), Ok(Some(v)) if value_is_fresh_match(&v, fingerprint, now_ms))
+/// Whether the delegate's reply to the marker `GetRequest` is a fresh marker
+/// for `fingerprint`. A failed request, any other reply, an absent value, bytes
+/// that are not UTF-8 and every unrecognised or stale value read as no marker.
+/// Pure.
+pub(crate) fn marker_from_read(
+    reply: Result<ChatDelegateResponseMsg, String>,
+    fingerprint: &str,
+    now_ms: f64,
+) -> bool {
+    match reply {
+        Ok(ChatDelegateResponseMsg::GetResponse {
+            value: Some(bytes), ..
+        }) => {
+            std::str::from_utf8(&bytes).is_ok_and(|v| value_is_fresh_match(v, fingerprint, now_ms))
+        }
+        _ => false,
+    }
 }
 
-/// Write the marker, stamped `now_ms`; `false` if the store refused.
-pub(crate) fn write_marker(store: &dyn MarkerStore, fingerprint: &str, now_ms: f64) -> bool {
-    store.set(&stored_value(fingerprint, now_ms)).is_ok()
+fn marker_get_request() -> ChatDelegateRequestMsg {
+    ChatDelegateRequestMsg::GetRequest {
+        key: ChatDelegateKey::new(LEGACY_SWEEP_MARKER_KEY.to_vec()),
+    }
 }
 
-/// Remove the marker (best effort).
-pub(crate) fn clear_marker(store: &dyn MarkerStore) {
-    let _ = store.remove();
+/// The request that writes the marker, stamped `now_ms`.
+pub(crate) fn marker_store_request(fingerprint: &str, now_ms: f64) -> ChatDelegateRequestMsg {
+    ChatDelegateRequestMsg::StoreRequest {
+        key: ChatDelegateKey::new(LEGACY_SWEEP_MARKER_KEY.to_vec()),
+        value: stored_value(fingerprint, now_ms).into_bytes(),
+    }
+}
+
+fn marker_delete_request() -> ChatDelegateRequestMsg {
+    ChatDelegateRequestMsg::DeleteRequest {
+        key: ChatDelegateKey::new(LEGACY_SWEEP_MARKER_KEY.to_vec()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -167,7 +199,9 @@ pub(crate) fn classify_reply(response: &ChatDelegateResponseMsg) -> Reply {
             }
         }
         ChatDelegateResponseMsg::ListResponse { keys } => {
-            if keys.is_empty() {
+            // The marker is this delegate's own bookkeeping: once the delegate
+            // is a legacy generation its marker must not count as room data.
+            if keys.iter().all(|k| k.as_bytes() == LEGACY_SWEEP_MARKER_KEY) {
                 Reply::ListEmpty
             } else {
                 Reply::Data
@@ -296,6 +330,7 @@ pub(crate) fn note_legacy_reply(delegate: &[u8], response: &ChatDelegateResponse
     };
     let reply = classify_reply(response);
     if reply == Reply::Data {
+        // Found data: forget any marker rather than wait for it to age out.
         clear_marker_now();
     }
     with_ledger(|l| l.note_reply(generation, reply));
@@ -308,19 +343,55 @@ pub(crate) fn note_legacy_absent(delegate: &[u8]) {
     }
 }
 
-/// Whether the stored marker covers this node, current delegate and
-/// generation list.
-pub(crate) fn marker_matches_now() -> bool {
-    marker_matches(&BrowserStore, &current_fingerprint(), now_ms())
+/// Set by a Retry or an interrupted-migration recovery: the next sweep must
+/// not trust (or wait for a read of) the marker.
+static FRESH_SWEEP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// The user asked to look again (Retry, "Look for rooms from older versions")
+/// or a migration was interrupted: the next sweep ignores the marker and
+/// removes it. Synchronous, so it cannot race the read it replaces.
+pub(crate) fn request_fresh_sweep() {
+    FRESH_SWEEP_REQUESTED.store(true, Ordering::Relaxed);
 }
 
-/// Remove the marker: a Retry, an interrupted-migration recovery, found data.
+/// Consume [`request_fresh_sweep`]; when it was set, also remove the stored
+/// marker (best effort, in the background).
+pub(crate) fn take_fresh_sweep_request() -> bool {
+    let requested = FRESH_SWEEP_REQUESTED.swap(false, Ordering::Relaxed);
+    if requested {
+        clear_marker_now();
+    }
+    requested
+}
+
+/// Whether the current delegate holds a fresh marker covering this delegate
+/// and generation list. Costs one delegate round trip, bounded by
+/// [`MARKER_READ_TIMEOUT_MS`]; any failure or timeout is `false`.
+pub(crate) async fn marker_matches_now() -> bool {
+    let fingerprint = current_fingerprint();
+    let read = Box::pin(async {
+        let pending = enqueue_delegate_request(marker_get_request()).await?;
+        await_delegate_response(pending).await
+    });
+    let timeout = Box::pin(crate::util::sleep(std::time::Duration::from_millis(
+        MARKER_READ_TIMEOUT_MS,
+    )));
+    match select(read, timeout).await {
+        Either::Left((reply, _)) => marker_from_read(reply, &fingerprint, now_ms()),
+        Either::Right(_) => false,
+    }
+}
+
+/// Remove the marker from the current delegate, in the background.
 pub(crate) fn clear_marker_now() {
-    clear_marker(&BrowserStore);
+    crate::util::safe_spawn_local(async {
+        let _ = send_delegate_request(marker_delete_request()).await;
+    });
 }
 
-/// Write the marker if the latest sweep proved every generation empty.
-/// Called only where the load resolves to a genuine Empty.
+/// Write the marker if the latest sweep proved every generation empty. Called
+/// only where the load resolves to a genuine Empty. The write itself runs in
+/// the background; its failure leaves no marker.
 pub(crate) fn write_marker_if_sweep_proved_empty(
     latest_epoch: u64,
     current_attempt: u32,
@@ -335,115 +406,48 @@ pub(crate) fn write_marker_if_sweep_proved_empty(
             rooms_empty,
         )
     });
-    proved && write_marker(&BrowserStore, &current_fingerprint(), now_ms())
+    if proved {
+        let request = marker_store_request(&current_fingerprint(), now_ms());
+        crate::util::safe_spawn_local(async move {
+            let _ = send_delegate_request(request).await;
+        });
+    }
+    proved
 }
 
 fn current_fingerprint() -> String {
-    fingerprint_for(
-        &get_websocket_url(),
-        current_delegate_key().bytes(),
-        legacy_delegate_pairs(),
-    )
+    fingerprint_for(current_delegate_key().bytes(), legacy_delegate_pairs())
 }
 
 /// [`fingerprint`] over the generated registry (`(key, code hash)` pairs).
-fn fingerprint_for(node: &str, current: &[u8], registry: &[([u8; 32], [u8; 32])]) -> String {
+fn fingerprint_for(current: &[u8], registry: &[([u8; 32], [u8; 32])]) -> String {
     let legacy: Vec<[u8; 32]> = registry.iter().map(|(k, _)| *k).collect();
-    fingerprint(node, current, &legacy)
-}
-
-/// The browser's localStorage. Natively (unit tests) every call fails, which
-/// reads as "no marker".
-struct BrowserStore;
-
-#[cfg(target_arch = "wasm32")]
-impl BrowserStore {
-    fn storage() -> Result<web_sys::Storage, ()> {
-        web_sys::window()
-            .ok_or(())?
-            .local_storage()
-            .map_err(|_| ())?
-            .ok_or(())
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-impl MarkerStore for BrowserStore {
-    fn get(&self) -> Result<Option<String>, ()> {
-        Self::storage()?.get_item(STORAGE_KEY).map_err(|_| ())
-    }
-    fn set(&self, value: &str) -> Result<(), ()> {
-        Self::storage()?
-            .set_item(STORAGE_KEY, value)
-            .map_err(|_| ())
-    }
-    fn remove(&self) -> Result<(), ()> {
-        Self::storage()?.remove_item(STORAGE_KEY).map_err(|_| ())
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl MarkerStore for BrowserStore {
-    fn get(&self) -> Result<Option<String>, ()> {
-        Err(())
-    }
-    fn set(&self, _value: &str) -> Result<(), ()> {
-        Err(())
-    }
-    fn remove(&self) -> Result<(), ()> {
-        Err(())
-    }
+    fingerprint(current, &legacy)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
-
-    #[derive(Default)]
-    struct MemStore {
-        value: RefCell<Option<String>>,
-        fail: bool,
-    }
-    impl MarkerStore for MemStore {
-        fn get(&self) -> Result<Option<String>, ()> {
-            if self.fail {
-                Err(())
-            } else {
-                Ok(self.value.borrow().clone())
-            }
-        }
-        fn set(&self, v: &str) -> Result<(), ()> {
-            if self.fail {
-                return Err(());
-            }
-            *self.value.borrow_mut() = Some(v.to_string());
-            Ok(())
-        }
-        fn remove(&self) -> Result<(), ()> {
-            if self.fail {
-                return Err(());
-            }
-            *self.value.borrow_mut() = None;
-            Ok(())
-        }
-    }
 
     const T0: f64 = 1_800_000_000_000.0;
     const DAY: f64 = 24.0 * 60.0 * 60.0 * 1000.0;
-
-    const NODE: &str = "wss://node-a.example/v1/contract/command";
 
     fn gens(n: u8) -> Vec<[u8; 32]> {
         (0..n).map(|i| [i; 32]).collect()
     }
 
+    fn get_reply(value: Option<&str>) -> Result<ChatDelegateResponseMsg, String> {
+        Ok(ChatDelegateResponseMsg::GetResponse {
+            key: ChatDelegateKey::new(LEGACY_SWEEP_MARKER_KEY.to_vec()),
+            value: value.map(|v| v.as_bytes().to_vec()),
+        })
+    }
+
     #[test]
     fn fingerprint_changes_when_a_generation_is_added() {
-        let a = fingerprint(NODE, &[9; 32], &gens(3));
-        let b = fingerprint(NODE, &[9; 32], &gens(4));
-        assert_ne!(a, b);
-        assert_eq!(a, fingerprint(NODE, &[9; 32], &gens(3)));
+        let a = fingerprint(&[9; 32], &gens(3));
+        assert_ne!(a, fingerprint(&[9; 32], &gens(4)));
+        assert_eq!(a, fingerprint(&[9; 32], &gens(3)));
     }
 
     #[test]
@@ -451,16 +455,16 @@ mod tests {
         let mut swapped = gens(3);
         swapped.swap(0, 1);
         assert_ne!(
-            fingerprint(NODE, &[9; 32], &gens(3)),
-            fingerprint(NODE, &[9; 32], &swapped)
+            fingerprint(&[9; 32], &gens(3)),
+            fingerprint(&[9; 32], &swapped)
         );
     }
 
     #[test]
     fn fingerprint_changes_when_the_current_delegate_changes() {
         assert_ne!(
-            fingerprint(NODE, &[9; 32], &gens(3)),
-            fingerprint(NODE, &[8; 32], &gens(3))
+            fingerprint(&[9; 32], &gens(3)),
+            fingerprint(&[8; 32], &gens(3))
         );
     }
 
@@ -468,92 +472,119 @@ mod tests {
     /// installs a new current: both inputs move, and the marker stops matching.
     #[test]
     fn a_rekey_invalidates_the_marker() {
-        let before = fingerprint(NODE, &[9; 32], &gens(3));
+        let before = fingerprint(&[9; 32], &gens(3));
         let mut after_legacy = gens(3);
         after_legacy.push([9; 32]);
-        let after = fingerprint(NODE, &[10; 32], &after_legacy);
-        assert_ne!(before, after);
+        assert_ne!(before, fingerprint(&[10; 32], &after_legacy));
     }
 
     #[test]
-    fn fingerprint_is_per_node() {
-        assert_ne!(
-            fingerprint(NODE, &[9; 32], &gens(3)),
-            fingerprint(
-                "wss://node-b.example/v1/contract/command",
-                &[9; 32],
-                &gens(3)
-            )
-        );
-    }
-
-    #[test]
-    fn marker_matches_only_the_exact_fingerprint() {
-        let store = MemStore::default();
-        let fp = fingerprint(NODE, &[9; 32], &gens(3));
-        assert!(!marker_matches(&store, &fp, T0), "empty store");
-        assert!(write_marker(&store, &fp, T0));
-        assert!(marker_matches(&store, &fp, T0 + 1.0));
-        assert!(!marker_matches(
-            &store,
-            &fingerprint(NODE, &[9; 32], &gens(4)),
+    fn a_read_matches_only_the_exact_fresh_fingerprint() {
+        let fp = fingerprint(&[9; 32], &gens(3));
+        let stored = stored_value(&fp, T0);
+        assert!(marker_from_read(get_reply(Some(&stored)), &fp, T0 + 1.0));
+        assert!(!marker_from_read(
+            get_reply(Some(&stored)),
+            &fingerprint(&[9; 32], &gens(4)),
             T0 + 1.0
         ));
+        assert!(!marker_from_read(get_reply(None), &fp, T0), "no value");
     }
 
     #[test]
     fn an_unrecognised_value_is_no_marker() {
-        let store = MemStore::default();
-        let fp = fingerprint(NODE, &[9; 32], &gens(3));
+        let fp = fingerprint(&[9; 32], &gens(3));
         for junk in ["", "1", "v2:abc", "true", &fp[VALUE_PREFIX.len()..]] {
-            *store.value.borrow_mut() = Some(junk.to_string());
-            assert!(!marker_matches(&store, &fp, T0), "{junk:?}");
+            assert!(
+                !marker_from_read(get_reply(Some(junk)), &fp, T0),
+                "{junk:?}"
+            );
         }
+        let not_utf8 = Ok(ChatDelegateResponseMsg::GetResponse {
+            key: ChatDelegateKey::new(LEGACY_SWEEP_MARKER_KEY.to_vec()),
+            value: Some(vec![0xff, 0xfe]),
+        });
+        assert!(!marker_from_read(not_utf8, &fp, T0));
     }
 
+    /// A failed or odd reply is "no marker": the sweep runs.
     #[test]
-    fn storage_failure_means_sweep() {
-        let store = MemStore {
-            fail: true,
-            ..Default::default()
-        };
-        let fp = fingerprint(NODE, &[9; 32], &gens(3));
-        assert!(!marker_matches(&store, &fp, T0));
-        assert!(!write_marker(&store, &fp, T0));
-        clear_marker(&store); // must not panic
+    fn a_failed_read_means_sweep() {
+        let fp = fingerprint(&[9; 32], &gens(3));
+        assert!(!marker_from_read(Err("Timeout".into()), &fp, T0));
+        assert!(!marker_from_read(
+            Ok(ChatDelegateResponseMsg::ListResponse { keys: vec![] }),
+            &fp,
+            T0
+        ));
     }
 
     #[test]
     fn a_marker_older_than_seven_days_is_absent() {
-        let store = MemStore::default();
-        let fp = fingerprint(NODE, &[9; 32], &gens(3));
-        assert!(write_marker(&store, &fp, T0));
-        assert!(marker_matches(&store, &fp, T0 + 6.9 * DAY));
-        assert!(!marker_matches(&store, &fp, T0 + 7.0 * DAY));
-        assert!(!marker_matches(&store, &fp, T0 + 30.0 * DAY));
+        let fp = fingerprint(&[9; 32], &gens(3));
+        let stored = stored_value(&fp, T0);
+        assert!(marker_from_read(
+            get_reply(Some(&stored)),
+            &fp,
+            T0 + 6.9 * DAY
+        ));
+        assert!(!marker_from_read(
+            get_reply(Some(&stored)),
+            &fp,
+            T0 + 7.0 * DAY
+        ));
+        assert!(!marker_from_read(
+            get_reply(Some(&stored)),
+            &fp,
+            T0 + 30.0 * DAY
+        ));
     }
 
     #[test]
     fn a_marker_stamped_in_the_future_is_absent() {
-        let store = MemStore::default();
-        let fp = fingerprint(NODE, &[9; 32], &gens(3));
-        assert!(write_marker(&store, &fp, T0 + DAY));
-        assert!(!marker_matches(&store, &fp, T0));
+        let fp = fingerprint(&[9; 32], &gens(3));
+        let stored = stored_value(&fp, T0 + DAY);
+        assert!(!marker_from_read(get_reply(Some(&stored)), &fp, T0));
     }
 
     #[test]
     fn a_marker_without_a_valid_stamp_is_absent() {
-        let store = MemStore::default();
-        let fp = fingerprint(NODE, &[9; 32], &gens(3));
+        let fp = fingerprint(&[9; 32], &gens(3));
         for junk in [
             fp.clone(),
             format!("{fp}:"),
             format!("{fp}:x"),
             format!("{fp}:-5"),
         ] {
-            *store.value.borrow_mut() = Some(junk.clone());
-            assert!(!marker_matches(&store, &fp, T0), "{junk:?}");
+            assert!(
+                !marker_from_read(get_reply(Some(&junk)), &fp, T0),
+                "{junk:?}"
+            );
         }
+    }
+
+    /// What is written is what is read back, under the bookkeeping key.
+    #[test]
+    fn the_store_request_round_trips_through_the_read() {
+        let fp = fingerprint(&[9; 32], &gens(3));
+        let ChatDelegateRequestMsg::StoreRequest { key, value } = marker_store_request(&fp, T0)
+        else {
+            panic!("the marker is written with a plain StoreRequest");
+        };
+        assert_eq!(key.as_bytes(), LEGACY_SWEEP_MARKER_KEY);
+        let reply = Ok(ChatDelegateResponseMsg::GetResponse {
+            key,
+            value: Some(value),
+        });
+        assert!(marker_from_read(reply, &fp, T0 + 1.0));
+        assert!(matches!(
+            marker_get_request(),
+            ChatDelegateRequestMsg::GetRequest { key } if key.as_bytes() == LEGACY_SWEEP_MARKER_KEY
+        ));
+        assert!(matches!(
+            marker_delete_request(),
+            ChatDelegateRequestMsg::DeleteRequest { key } if key.as_bytes() == LEGACY_SWEEP_MARKER_KEY
+        ));
     }
 
     /// The real key must cover the real registry and the current delegate:
@@ -563,39 +594,69 @@ mod tests {
         let registry = legacy_delegate_pairs();
         assert!(!registry.is_empty(), "the generated registry is not empty");
         let current = [7u8; 32];
-        let full = fingerprint_for(NODE, &current, registry);
+        let full = fingerprint_for(&current, registry);
         assert_ne!(
             full,
-            fingerprint_for(NODE, &current, &registry[1..]),
+            fingerprint_for(&current, &registry[1..]),
             "dropping a generation changes the key"
         );
         assert_ne!(
             full,
-            fingerprint_for(NODE, &[8u8; 32], registry),
+            fingerprint_for(&[8u8; 32], registry),
             "changing the current delegate changes the key"
         );
-        assert_ne!(full, fingerprint_for(NODE, &[], registry));
-        assert_ne!(full, fingerprint_for("wss://other/", &current, registry));
+        assert_ne!(full, fingerprint_for(&[], registry));
         let keys: Vec<[u8; 32]> = registry.iter().map(|(k, _)| *k).collect();
-        assert_eq!(full, fingerprint(NODE, &current, &keys));
+        assert_eq!(full, fingerprint(&current, &keys));
         // And the production entry point goes through it.
         let src = include_str!("legacy_sweep_marker.rs");
         let body = fn_body(src, "fn current_fingerprint() -> String {");
         assert!(body.contains("current_delegate_key().bytes()"));
         assert!(body.contains("legacy_delegate_pairs()"));
-        assert!(body.contains("get_websocket_url()"));
         let body = fn_body(src, "fn fingerprint_for(");
         assert!(body.contains("registry.iter().map(|(k, _)| *k)"));
-        assert!(body.contains("fingerprint(node, current, &legacy)"));
+        assert!(body.contains("fingerprint(current, &legacy)"));
     }
 
+    /// The marker lives in the delegate. The UI iframe has no browser storage,
+    /// so any use of it here would be inert (#1067).
     #[test]
-    fn clear_removes_the_marker() {
-        let store = MemStore::default();
-        let fp = fingerprint(NODE, &[9; 32], &gens(3));
-        write_marker(&store, &fp, T0);
-        clear_marker(&store);
-        assert!(!marker_matches(&store, &fp, T0));
+    fn the_marker_never_touches_browser_storage() {
+        let src = include_str!("legacy_sweep_marker.rs");
+        let production = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        for needle in [
+            ["local", "_storage"].concat(),
+            ["local", "Storage"].concat(),
+            ["session", "_storage"].concat(),
+            ["session", "Storage"].concat(),
+            ["web_sys", "::Storage"].concat(),
+            ["Indexed", "Db"].concat(),
+            ["document", ".cookie"].concat(),
+        ] {
+            assert!(
+                !production.contains(&needle),
+                "browser storage use: {needle}"
+            );
+        }
+    }
+
+    /// The new key is bookkeeping: the walk never copies it, the room load
+    /// swallows its reply, and a listing of only this key is not room data.
+    #[test]
+    fn the_marker_key_is_bookkeeping() {
+        use super::super::freenet_api::delegate_migration::is_migration_bookkeeping_key;
+        assert!(is_migration_bookkeeping_key(LEGACY_SWEEP_MARKER_KEY));
+        let only_marker = ChatDelegateResponseMsg::ListResponse {
+            keys: vec![ChatDelegateKey::new(LEGACY_SWEEP_MARKER_KEY.to_vec())],
+        };
+        assert_eq!(classify_reply(&only_marker), Reply::ListEmpty);
+        let with_room = ChatDelegateResponseMsg::ListResponse {
+            keys: vec![
+                ChatDelegateKey::new(LEGACY_SWEEP_MARKER_KEY.to_vec()),
+                ChatDelegateKey::new(b"room:x".to_vec()),
+            ],
+        };
+        assert_eq!(classify_reply(&with_room), Reply::Data);
     }
 
     // ---- when the marker may be written ----
@@ -747,12 +808,22 @@ mod tests {
             "pub(crate) async fn fire_legacy_migration_request() -> bool {",
         );
         let skip = body
-            .find("legacy_sweep_marker::marker_matches_now()")
+            .find("legacy_sweep_marker::marker_matches_now().await")
             .expect("fire_legacy_migration_request must consult the marker");
+        let fresh = body
+            .find("legacy_sweep_marker::take_fresh_sweep_request()")
+            .expect("a Retry or recovery bypasses the marker");
+        assert!(fresh < skip, "the bypass is decided before the read");
         let swap = body
             .find("LEGACY_MIGRATION_ATTEMPTED.swap(")
             .expect("guard swap");
-        assert!(skip < swap, "the marker is checked before the sweep starts");
+        let epoch = body
+            .find("SWEEP_EPOCH.fetch_add(")
+            .expect("the sweep's epoch");
+        assert!(
+            swap < skip && skip < epoch,
+            "the marker is read when a sweep would start, before it does"
+        );
         assert!(body.contains("legacy_sweep_marker::begin_sweep("));
         assert_eq!(
             body.matches("legacy_sweep_marker::note_all_waves_sent(")
@@ -800,13 +871,16 @@ mod tests {
     }
 
     #[test]
-    fn retry_and_recovery_clear_the_marker() {
+    fn retry_and_recovery_ask_for_a_fresh_sweep() {
         let src = include_str!("chat_delegate.rs");
         for sig in [
             "pub(crate) fn retry_rooms_load() {",
             "pub(crate) fn arm_legacy_migration_recovery() -> bool {",
         ] {
-            assert!(fn_body(src, sig).contains("clear_marker_now()"), "{sig}");
+            assert!(
+                fn_body(src, sig).contains("legacy_sweep_marker::request_fresh_sweep()"),
+                "{sig}"
+            );
         }
     }
 
@@ -846,14 +920,20 @@ mod tests {
         let arm = &arm[..arm.find("RoomListDisplay::LoadFailed").unwrap()];
         assert!(arm.contains("Look for rooms from older versions"));
         assert!(arm.contains("onclick: move |_| retry_rooms_load()"));
-        // `retry_rooms_load` clears the marker and the session guard, then
-        // re-runs the load, which sweeps.
+        // `retry_rooms_load` asks for a fresh sweep (ignore and remove the
+        // marker), clears the session guard, then re-runs the load.
         let body = fn_body(
             include_str!("chat_delegate.rs"),
             "pub(crate) fn retry_rooms_load() {",
         );
         assert!(body.contains("LEGACY_MIGRATION_ATTEMPTED.store(false"));
-        assert!(body.contains("clear_marker_now()"));
+        assert!(body.contains("request_fresh_sweep()"));
         assert!(body.contains("set_up_chat_delegate_registering()"));
+        // And the sweep consumes the request and removes the stored marker.
+        let take = fn_body(
+            include_str!("legacy_sweep_marker.rs"),
+            "pub(crate) fn take_fresh_sweep_request() -> bool {",
+        );
+        assert!(take.contains("clear_marker_now()"));
     }
 }

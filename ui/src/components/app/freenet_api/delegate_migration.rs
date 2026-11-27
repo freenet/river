@@ -264,6 +264,7 @@ pub(crate) fn is_migration_bookkeeping_key(key: &[u8]) -> bool {
         || key == SHORT_INDEX_KEY
         || key == KEY_INDEX_STORAGE_KEY
         || key == KV_INTENT_STORAGE_KEY
+        || key == super::super::legacy_sweep_marker::LEGACY_SWEEP_MARKER_KEY
 }
 
 /// The delegate's crash-recovery intent record, as a plain `GetRequest` key
