@@ -94,10 +94,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - name: Install pinned Rust toolchain + target
+      - name: Install Rust toolchain + target
         shell: bash
         run: |
-          rustup toolchain install       # installs the channel from rust-toolchain.toml
+          # rust-toolchain.toml names no channel, so install stable explicitly.
+          rustup toolchain install stable --profile minimal
+          rustup default stable
           rustup target add "${{ matrix.target }}"
       - name: Build riverctl
         run: cargo build --release -p riverctl --target ${{ matrix.target }}
@@ -127,8 +129,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - name: Install pinned Rust toolchain
-        run: rustup toolchain install   # installs the channel from rust-toolchain.toml
+      - name: Install Rust toolchain
+        # rust-toolchain.toml names no channel, so install stable explicitly.
+        run: rustup toolchain install stable --profile minimal && rustup default stable
       - name: Publish river-core then riverctl (skip if already on crates.io)
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

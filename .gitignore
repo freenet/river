@@ -9,9 +9,9 @@ docs/plans/
 # Cargo.lock IS committed (deliberately, since freenet/river#2776 A1).
 # River builds byte-reproducible contract/delegate WASM whose bytes define the
 # room-contract and chat-delegate keys (key = BLAKE3(BLAKE3(wasm) || params)).
-# A committed lock + the pinned toolchain (rust-toolchain.toml) makes those
-# builds deterministic, so a rebuild no longer silently re-keys the contract via
-# a drifted transitive dependency. Build the key-defining WASMs with `--locked`
+# The committed WASMs fix the keys. A committed lock makes an intentional
+# rebuild (sync-wasm) use the reviewed dependency graph, so it cannot also pick
+# up a drifted transitive dependency. Build the key-defining WASMs with `--locked`
 # (see scripts/sync-wasm.sh and the build-room-contract / build-chat-delegate
 # tasks in Makefile.toml). Do NOT re-add Cargo.lock here.
 

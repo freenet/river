@@ -4,8 +4,10 @@
 
 These commands will pick up rebuilt WASM binaries from `ui/public/contracts/` and
 `cli/contracts/`. WASM builds are **non-reproducible** — rebuilding produces different
-binaries with different hashes, which changes delegate/contract keys and breaks room
-data access.
+binaries with different hashes (the compiler version, absolute paths and the
+dependency graph all change the bytes), which changes delegate/contract keys and
+breaks room data access. The committed WASMs, not a toolchain pin, fix the keys;
+the root `rust-toolchain.toml` deliberately has no `channel`.
 
 **Always add files by name:**
 ```bash

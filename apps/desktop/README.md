@@ -56,7 +56,10 @@ For a faster build while you experiment, leave out `--release` (`cargo run -p ri
 binary is then `apps/target/debug/river`, and it runs slower.
 
 `apps` is its own Cargo workspace with its own `Cargo.lock`, so run these commands from the `apps`
-directory, not from the top of the repository.
+directory, not from the top of the repository. The top-level workspace has no compiler pin and
+uses your default stable toolchain, while `apps/rust-toolchain.toml` pins the 1.98.1 that Rune
+needs. A stable older than 1.98.1 therefore fails to build `apps` from the top level with syntax
+errors; run it from `apps` and rustup installs the right compiler.
 
 On Windows, the release build has no console. `river.exe` returns your prompt immediately and
 prints nothing; use `--node-check` from a debug build if you need console output.
