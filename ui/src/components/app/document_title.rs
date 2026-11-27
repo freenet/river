@@ -1502,7 +1502,12 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(owner_a_vk, room_a);
         map.insert(owner_b_vk, room_b);
-        let modes = HashMap::new();
+        // Explicit All: this test counts every message, and a room with no
+        // entry is MentionsAndReplies.
+        let modes = HashMap::from([
+            (owner_a_vk, NotificationMode::All),
+            (owner_b_vk, NotificationMode::All),
+        ]);
 
         // Excluding room A (2 unread) leaves only room B's single unread.
         assert_eq!(
