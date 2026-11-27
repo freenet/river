@@ -531,6 +531,50 @@ fn ViewedRoomDescription(text: String) -> Element {
         let mut overflows = overflows;
         crate::util::defer(move || note_description_overflow(&mut overflows));
     });
+    // Width changes do not change the text, so watch the column (as the
+    // member header does) and remeasure.
+    #[cfg(target_arch = "wasm32")]
+    {
+        use std::{cell::RefCell, rc::Rc};
+        use wasm_bindgen::prelude::*;
+        type Watch = (
+            web_sys::Element,
+            web_sys::ResizeObserver,
+            Closure<dyn FnMut(js_sys::Array)>,
+        );
+        let watch = use_hook(|| Rc::new(RefCell::new(None::<Watch>)));
+        {
+            let watch = watch.clone();
+            use_drop(move || {
+                if let Some((_, observer, _)) = watch.borrow_mut().take() {
+                    observer.disconnect();
+                }
+            });
+        }
+        use_effect(move || {
+            let _ = html.read();
+            let Some(column) = crate::components::conversation::header_column_element() else {
+                return;
+            };
+            if watch
+                .borrow()
+                .as_ref()
+                .is_some_and(|(attached, _, _)| attached == &column)
+            {
+                return;
+            }
+            if let Some((_, observer, _)) = watch.borrow_mut().take() {
+                observer.disconnect();
+            }
+            let cb = Closure::wrap(Box::new(move |_: js_sys::Array| {
+                crate::util::defer(move || note_description_overflow(&mut { overflows }));
+            }) as Box<dyn FnMut(js_sys::Array)>);
+            if let Ok(observer) = web_sys::ResizeObserver::new(cb.as_ref().unchecked_ref()) {
+                observer.observe(&column);
+                *watch.borrow_mut() = Some((column, observer, cb));
+            }
+        });
+    }
     let is_expanded = *expanded.read();
     let can_toggle = is_expanded || *overflows.read();
     let label = if is_expanded {
@@ -654,7 +698,7 @@ fn PublicRoomView(
                     onclick: move |_| crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Rooms),
                     {line_icon(MENU_ICON_PATH, 20)}
                 }
-                div { class: "min-w-0 flex-1",
+                div { id: "room-header-column", class: "min-w-0 flex-1",
                     h2 {
                         class: "text-[16px] leading-6 font-semibold text-text truncate",
                         "data-testid": "viewed-room-name",
@@ -1456,6 +1500,7 @@ mod description_tests {
         assert!(comp.contains("room_description_class(is_expanded, can_toggle)"));
         assert!(comp.contains("note_description_overflow("));
         assert!(comp.contains("viewed-room-description-toggle"));
+        assert!(comp.contains("ResizeObserver::new"));
         let view = &src[end..];
         let view = &view[..view.find("\n#[cfg(test)]").unwrap_or(view.len())];
         assert!(view.contains("ViewedRoomDescription { text: description }"));

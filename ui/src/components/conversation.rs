@@ -1240,7 +1240,7 @@ fn header_description_element() -> Option<web_sys::Element> {
         .get_element_by_id("room-header-description")
 }
 
-fn header_column_element() -> Option<web_sys::Element> {
+pub(crate) fn header_column_element() -> Option<web_sys::Element> {
     web_sys::window()?
         .document()?
         .get_element_by_id("room-header-column")
