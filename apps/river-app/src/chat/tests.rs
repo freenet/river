@@ -7059,7 +7059,10 @@ fn key_with(rt: &mut Runtime<RiverApp>, key: Key, mods: rune::Mods) {
 
 /// Tab to the room list's one stop (the open room), then arrow to `want`.
 fn focus_room(rt: &mut Runtime<RiverApp>, keys: &[String], want: &str) {
-    let at = keys.iter().position(|k| *k == rt.state.chat.selected).unwrap();
+    let at = keys
+        .iter()
+        .position(|k| *k == rt.state.chat.selected)
+        .unwrap();
     let to = keys.iter().position(|k| k == want).unwrap();
     assert!(tab_to(rt, &row_key(&keys[at])));
     for _ in 0..at.abs_diff(to) {
@@ -7073,8 +7076,17 @@ fn tab_reaches_a_room_row_and_enter_or_space_opens_it() {
     for open in [Key::Enter, Key::Text(" ".into())] {
         let mut rt = node_rooms(|_| {});
         let keys = keys_in_order(&rt);
-        let at = keys.iter().position(|k| *k == rt.state.chat.selected).unwrap();
-        assert!(tab_to(&mut rt, &row_key(&keys[at])), "Tab reaches the open room");
+        // The list's one Tab stop is the open room, wherever it is.
+        press(&mut rt, &row_key(&keys[2]));
+        let at = keys
+            .iter()
+            .position(|k| *k == rt.state.chat.selected)
+            .unwrap();
+        assert_eq!(at, 2);
+        assert!(
+            tab_to(&mut rt, &row_key(&keys[at])),
+            "Tab reaches the open room"
+        );
         key(&mut rt, Key::Down);
         let target = &keys[at + 1];
         assert_eq!(focused_key(&rt), Some(row_key(target)));
@@ -7127,7 +7139,10 @@ fn a_global_shortcut_still_works_with_a_room_row_focused() {
     let keys = keys_in_order(&rt);
     focus_room(&mut rt, &keys, &keys[1]);
     key(&mut rt, Key::Command('k'));
-    assert!(rt.state.chat.switcher.is_some(), "Ctrl+K opens the switcher");
+    assert!(
+        rt.state.chat.switcher.is_some(),
+        "Ctrl+K opens the switcher"
+    );
 }
 
 #[test]
@@ -7142,4 +7157,36 @@ fn arrows_on_a_focused_room_row_move_focus_without_selecting() {
     key(&mut rt, Key::Up);
     assert_eq!(focused_key(&rt), Some(row_key(&keys[at])));
     assert_eq!(rt.state.chat.selected, selected, "arrows do not select");
+}
+
+#[test]
+fn the_room_menu_opened_by_keyboard_works_by_keyboard_and_returns_focus_to_the_row() {
+    let mut rt = node_rooms(|_| {});
+    let keys = keys_in_order(&rt);
+    focus_room(&mut rt, &keys, &keys[2]);
+    key_with(
+        &mut rt,
+        Key::Function(10),
+        rune::Mods {
+            shift: true,
+            ..Default::default()
+        },
+    );
+    assert!(rt.state.chat.room_menu.is_some());
+    key(&mut rt, Key::Escape);
+    assert!(rt.state.chat.room_menu.is_none(), "Escape closes the menu");
+    assert_eq!(
+        focused_key(&rt),
+        Some(row_key(&keys[2])),
+        "focus returns to the row"
+    );
+
+    focus_room(&mut rt, &keys, &keys[2]);
+    key_with(&mut rt, Key::ContextMenu, Default::default());
+    key(&mut rt, Key::Enter);
+    assert_eq!(
+        keys_in_order(&rt)[1],
+        keys[2],
+        "Enter picks the first item, Move up"
+    );
 }

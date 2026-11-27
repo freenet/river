@@ -864,13 +864,7 @@ fn preview_chars(row_width: f32, badge: bool) -> usize {
 
 /// A row in the room list: keyboard focusable, Enter or Space opens the room, and Shift+F10 or the
 /// Menu key open its menu, as a right-click does.
-fn room_row(
-    room: &Room,
-    unread_count: usize,
-    selected: bool,
-    width: f32,
-    p: &Palette,
-) -> El {
+fn room_row(room: &Room, unread_count: usize, selected: bool, width: f32, p: &Palette) -> El {
     let key = room.key.clone();
     let menu_key = room.key.clone();
     let unread = unread_count > 0 && !selected;
