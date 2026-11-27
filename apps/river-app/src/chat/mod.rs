@@ -864,6 +864,7 @@ impl Chat {
     /// Give every room in `rooms` an explicit `All` mode, as if the user had picked it, so a
     /// fixture that counts every message still does now that a room with no entry is
     /// [`NotificationMode::MentionsAndReplies`]. Nothing is sent to be stored.
+    #[cfg(test)]
     pub fn notify_all_in(&mut self, rooms: &[Room]) {
         for r in rooms {
             self.modes.insert(r.key.clone(), NotificationMode::All);
