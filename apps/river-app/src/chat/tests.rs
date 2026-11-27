@@ -6774,6 +6774,21 @@ mod rune_bump {
         phys(PhysicalKeyCode::ControlLeft, mods(true, false), false);
     }
 
+    /// A direction Ctrl+Shift forced on the composer (Windows with a right-to-left layout
+    /// installed) goes with the sent message: the next draft starts in its natural direction.
+    /// freenet/river#955.
+    #[test]
+    fn a_send_drops_a_forced_direction_from_the_composer() {
+        let mut rt = render(connected(), WINDOW_SIZE);
+        type_text(&mut rt, "abc");
+        rt.update(|s, _| s.chat.composer.force_dir(rune::text::Flow::Rtl));
+        let dir = |rt: &Runtime<RiverApp>| format!("{:?}", rt.state.chat.composer.forced_dir());
+        assert_eq!(dir(&rt), "Some(Rtl)");
+        key(&mut rt, Key::Enter);
+        assert_eq!(rt.state.chat.composer.text, "", "sent");
+        assert_eq!(dir(&rt), "None");
+    }
+
     /// Rune (2026-11-24, anomalyco/rune#1804) runs the Ctrl+Left Shift / Ctrl+Right Shift
     /// direction chord only on Windows with a right-to-left keyboard layout installed, so on
     /// Linux and macOS it does nothing: the composer keeps its natural direction and no text is

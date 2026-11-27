@@ -194,7 +194,7 @@ impl DmCompose {
 /// it, which is shown for the user to deal with, not guessed at.
 fn take_sent(edit: &mut rune::TextEdit, sent: &str) {
     if edit.text == sent {
-        edit.clear();
+        super::clear_sent(edit);
     }
 }
 
@@ -314,7 +314,7 @@ impl Chat {
         if matches!(self.source, Source::Example) {
             // The example sends nothing: it only shows the box emptying.
             if let Some(d) = self.dm.compose.drafts.get_mut(&key) {
-                d.clear();
+                super::clear_sent(d);
             }
             return true;
         }

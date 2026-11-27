@@ -2140,6 +2140,54 @@ mod sending {
         assert!(sent(&rt).is_empty());
     }
 
+    /// A direction Ctrl+Shift forced on the thread's box goes with the sent text, on the node
+    /// (when the send is answered) and in the example (at once). freenet/river#955.
+    #[test]
+    fn a_sent_message_takes_a_forced_direction_with_it() {
+        let dir = |rt: &mut Runtime<RiverApp>| {
+            let mut out = String::new();
+            rt.update(|s, _| out = format!("{:?}", s.chat.dm.compose_edit().forced_dir()));
+            out
+        };
+        let (mut rt, uid) = open_with("Jonas");
+        rt.update(|s, _| {
+            s.chat.dm_write("first");
+            s.chat.dm.compose_edit().force_dir(rune::text::Flow::Rtl);
+        });
+        assert_eq!(dir(&mut rt), "Some(Rtl)");
+        assert!(rt.state.chat.dm_send());
+        let Action::SendDm { ticket, .. } = sent(&rt)[0].1.clone() else {
+            panic!()
+        };
+        rt.update({
+            let uid = uid.clone();
+            move |s, _| {
+                s.chat.dm_sent(ROOM, &uid, ticket, Ok(()));
+            }
+        });
+        assert_eq!(the_box(&rt, ROOM, &uid), "");
+        assert_eq!(
+            dir(&mut rt),
+            "None",
+            "the next message starts in its natural direction"
+        );
+
+        let mut rt = app();
+        let uid = uid_of(&rt, "Jonas");
+        rt.update({
+            let uid = uid.clone();
+            move |s, _| assert!(s.chat.open_dm(ROOM, &uid))
+        });
+        rt.frame(0.2);
+        rt.update(|s, _| {
+            s.chat.dm.compose_edit().replace_text("hello");
+            s.chat.dm.compose_edit().force_dir(rune::text::Flow::Rtl);
+        });
+        assert!(rt.state.chat.dm_send());
+        assert_eq!(the_box(&rt, ROOM, &uid), "");
+        assert_eq!(dir(&mut rt), "None", "the example drops it too");
+    }
+
     #[test]
     fn nothing_the_composer_holds_is_printed() {
         let (mut rt, _) = open_with("Jonas");

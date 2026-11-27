@@ -1239,7 +1239,7 @@ impl Chat {
                 },
             ),
         }
-        self.composer.clear();
+        clear_sent(&mut self.composer);
         true
     }
 
@@ -2247,6 +2247,14 @@ impl Chat {
             self.members_open
         }
     }
+}
+
+/// Empties a box whose text was just sent, and drops a direction Ctrl+Shift forced on it (Rune
+/// runs that chord on Windows when a right-to-left layout is installed), so the next message
+/// starts in its natural direction. freenet/river#955.
+pub(crate) fn clear_sent(edit: &mut rune::TextEdit) {
+    edit.clear();
+    edit.clear_dir();
 }
 
 #[cfg(test)]
