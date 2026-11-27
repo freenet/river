@@ -130,6 +130,8 @@ fn main() {
     // Whether the start has no window (decided below, before `init` runs).
     let windowless = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let windowless_in = windowless.clone();
+    let badge = notify::Badge::default();
+    let badge_in = badge.clone();
     let app = river_app::app(move |handle| {
         // The tray icon is made here on Windows and macOS: init runs on the thread that handles
         // the window system's events, which they need. A failure leaves the window up.
@@ -151,7 +153,7 @@ fn main() {
                 report.update(move |s, _| s.apply_update(event))
             })
         });
-        let notifier = notify::DesktopNotifier::new(handle.clone());
+        let notifier = notify::DesktopNotifier::new(handle.clone(), badge_in.clone());
         let rooms = handle.clone();
         let node = startup.choice.clone();
         let link = river_app::rooms::Link::for_node(
@@ -209,7 +211,10 @@ fn main() {
     let tray_expected = true;
     // Closing the window hides it; `on_close` quits when there is no tray or the person asked
     // for closing to quit. Started at login, there is no window until the tray asks for one.
-    let mut app = app.keep_running().on_close(background::on_close);
+    let mut app = app
+        .keep_running()
+        .on_close(background::on_close)
+        .on_window(move |window| badge.attach(window));
     if background_start && tray_expected {
         windowless.store(true, std::sync::atomic::Ordering::Release);
         app = app.windowless();
