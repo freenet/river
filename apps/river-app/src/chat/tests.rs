@@ -6015,15 +6015,24 @@ fn the_room_details_buttons_stay_inside_the_window_when_the_footer_grows() {
             ["details-cancel", "details-save"],
         ),
     ] {
-        let rt = scene_runtime(scene);
-        let (_, win_h) = scene_size(scene);
-        for key in keys {
-            let [_, y, _, h] = rect_of(&rt, key);
-            assert!(
-                y >= 0.0 && y + h <= win_h,
-                "{scene}: {key} spans {y}..{} in a window {win_h} high",
-                y + h
-            );
+        // The scene window, the narrow layout and a short one.
+        for size in [scene_size(scene), NARROW_SCENE_SIZE, (1280.0, 600.0)] {
+            let (_, apply) = SCENES
+                .iter()
+                .find(|(name, _)| *name == scene)
+                .expect("scene");
+            let mut state = RiverApp::detached();
+            apply(&mut state);
+            let rt = render(state, size);
+            let win_h = size.1;
+            for key in keys {
+                let [_, y, _, h] = rect_of(&rt, key);
+                assert!(
+                    y >= 0.0 && y + h <= win_h,
+                    "{scene} at {size:?}: {key} spans {y}..{}",
+                    y + h
+                );
+            }
         }
     }
 }
@@ -6378,7 +6387,7 @@ mod rune_bump {
     }
 
     /// Forward word keys: off macOS (Windows and Linux alike, for now) the end of the word or
-    /// punctuation run plus the spaces after it, Rune's rule since 2026-11-12; on macOS the end
+    /// punctuation run plus the spaces after it (Rune since 2026-11-12, stops since 2026-11-22); on macOS the end
     /// of the next word or punctuation run. Backwards is the start everywhere. Ian wants end-of-word on Linux too (GTK, Qt, Chromium); that
     /// lands in a follow-up change, which will give Linux its own block here.
     #[cfg(target_os = "macos")]
