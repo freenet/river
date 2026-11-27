@@ -630,8 +630,15 @@ impl RiverApp {
 
     /// The tray hid the window (not the close button, so the close policy did not run): it no
     /// longer has focus, and a hidden window gets no focus-lost event to say so.
+    ///
+    /// A hidden window is never in front (read marking and notification suppression depend on
+    /// it). `focus_known` is left as it was, so a platform that never reports focus keeps the
+    /// shown-window fallback for the next time the tray shows the window.
     pub fn hidden_by_tray(&mut self) {
+        let known = self.focus_known;
         self.focus_changed(false);
+        self.focus_known = known;
+        self.window_shown = false;
         self.blurred_at = None;
     }
 

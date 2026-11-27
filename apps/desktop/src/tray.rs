@@ -257,6 +257,8 @@ impl Tracker {
 /// click arrives. Where focus is never reported at all, a window the tray (or the start)
 /// showed counts as in front until the first focus event, so a click hides it. macOS has no
 /// click toggle: its click opens the menu.
+// Accepted edge: a window that is visible behind another app, and lost focus less than this long
+// before the click, is hidden by that click instead of brought forward; the next click shows it.
 const CLICK_GRACE: Duration = Duration::from_millis(500);
 
 /// The window, as the toggle drives it.
@@ -797,5 +799,38 @@ mod tests {
         assert_eq!(latest.take().unread, 5);
         latest.put(View::default());
         assert_eq!(latest.take(), View::default());
+    }
+
+    struct Flip(std::cell::Cell<bool>, std::cell::RefCell<Vec<&'static str>>);
+    impl Window for Flip {
+        fn visible(&self) -> bool {
+            self.0.get()
+        }
+        fn hide(&self) {
+            self.0.set(false);
+            self.1.borrow_mut().push("hide");
+        }
+        fn open(&self) {
+            self.0.set(true);
+            self.1.borrow_mut().push("open");
+        }
+    }
+
+    /// A platform that never reports focus: show, hide, show, hide, each click doing the
+    /// opposite of the one before, and a hidden window never counted as in front.
+    #[test]
+    fn repeated_clicks_alternate_without_any_focus_event() {
+        let mut app = RiverApp::detached();
+        let w = Flip(std::cell::Cell::new(false), Default::default());
+        for _ in 0..3 {
+            apply_toggle(&mut app, &w, Instant::now());
+            assert!(app.window_in_front(), "shown");
+            apply_toggle(&mut app, &w, Instant::now());
+            assert!(!app.window_in_front(), "a hidden window is not in front");
+        }
+        assert_eq!(
+            *w.1.borrow(),
+            ["open", "hide", "open", "hide", "open", "hide"]
+        );
     }
 }
