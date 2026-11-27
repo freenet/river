@@ -1476,9 +1476,9 @@ mod tests {
         assert_eq!(rt.state.unread(), 0);
     }
 
-    /// A node switch resets what was reported, so the badge hears the count again.
+    /// Resetting the reported count (as a node switch does) makes the badge hear it again.
     #[test]
-    fn the_badge_hears_the_count_again_after_the_rooms_are_replaced() {
+    fn resetting_the_reported_count_makes_the_badge_hear_it_again() {
         let rec = Recorder::default();
         let mut s = RiverApp::detached().with_notifier(Box::new(rec.clone()));
         s.chat.source = crate::chat::Source::Node(LinkStatus::Live);
