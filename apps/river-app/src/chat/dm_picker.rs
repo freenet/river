@@ -20,8 +20,8 @@
 
 use std::time::Instant;
 
-use rune::{El, icon, row};
-use rune_kit::{Kit, TextInput};
+use rune::{El, col, icon, row};
+use rune_kit::{Kit, ScrollBar, TextInput};
 
 use super::dialog_kit::{self as dk, DialogSpec};
 use super::icons;
@@ -324,7 +324,8 @@ pub(super) fn dialog(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
             .w_full(),
         );
     } else {
-        body = body
+        let mut list = col().key("dm-invite-scroll").w_full().gap(12.0);
+        list = list
             .child(
                 label(
                     format!(
@@ -339,7 +340,7 @@ pub(super) fn dialog(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
             )
             .child(label("Which room?", st::SMALL_STRONG, p.text_muted));
         for r in &candidates {
-            body = body.child(room_row(
+            list = list.child(room_row(
                 r,
                 open.selected.as_deref() == Some(&r.key),
                 waiting,
@@ -347,12 +348,12 @@ pub(super) fn dialog(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
             ));
         }
         let over = chat.invite_note_refusal();
-        body = body.child(label(
+        list = list.child(label(
             "Personal note (optional)",
             st::SMALL_STRONG,
             p.text_muted,
         ));
-        body = body.child(
+        list = list.child(
             TextInput::new(&chat.dm.invite.picker.note)
                 .label("Personal note (optional)")
                 .placeholder("e.g. Thought you would enjoy this room")
@@ -367,19 +368,29 @@ pub(super) fn dialog(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
         );
         let chars = chat.dm.invite.picker.note.text.chars().count();
         if let Some(why) = over {
-            body = body.child(
+            list = list.child(
                 label(why, st::SMALL, p.danger)
                     .key("dm-invite-note-error")
                     .wrap()
                     .w_full(),
             );
         } else if chars > MAX_NOTE_CHARS / 5 * 4 {
-            body = body.child(
+            list = list.child(
                 label(format!("{chars}/{MAX_NOTE_CHARS}"), st::SMALL, p.text_muted)
                     .key("dm-invite-note-count")
                     .self_end(),
             );
         }
+        // The rooms and the note scroll when they are taller than the window, so Cancel and
+        // Send stay in view.
+        body = body.child(
+            list.scroll(rune::ScrollSpec {
+                stick_bottom: false,
+            })
+            .shrink()
+            .min_h(0.0)
+            .scroll_bar(k),
+        );
     }
     if let Some(why) = &open.error {
         body = body.child(

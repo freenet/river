@@ -27,7 +27,7 @@
 use std::time::{Duration, Instant};
 
 use rune::{El, col};
-use rune_kit::{Button, ButtonVariant, Kit};
+use rune_kit::{Button, ButtonVariant, Kit, ScrollBar};
 
 use super::dialog_kit::{self as dk, DialogSpec, label_value};
 use super::style::{self as st, Palette};
@@ -1326,12 +1326,13 @@ pub(crate) fn dialog(chat: &super::Chat, k: &Kit, layer: &mut Vec<El>) {
         return;
     }
     let p = st::palette();
-    let mut spec = DialogSpec::new("node-status", "Node status", |s: &mut RiverApp| {
+    let spec = DialogSpec::new("node-status", "Node status", |s: &mut RiverApp| {
         s.chat.close_node_status()
     })
     .body_key("ns-body")
     .width(520.0)
     .gap(10.0);
+    let mut rows = col().key("ns-scroll").w_full().gap(10.0);
     for l in lines(chat) {
         let color = match l.tone {
             Tone::Plain => p.text,
@@ -1339,9 +1340,9 @@ pub(crate) fn dialog(chat: &super::Chat, k: &Kit, layer: &mut Vec<El>) {
             Tone::Bad => p.danger,
             Tone::Muted => p.text_muted,
         };
-        spec = spec.child(line(l.key, l.name, l.value, color, l.note, &p));
+        rows = rows.child(line(l.key, l.name, l.value, color, l.note, &p));
     }
-    spec.child(
+    rows = rows.child(
         label(
             "Copy diagnostics copies versions, the OS, the node's host and port, the connection \
              state, counts and the kind and time of recent errors. It leaves out room names, \
@@ -1352,6 +1353,15 @@ pub(crate) fn dialog(chat: &super::Chat, k: &Kit, layer: &mut Vec<El>) {
         .wrap()
         .w_full()
         .key("ns-copy-note"),
+    );
+    // The lines scroll when the window is short, so Close and Copy stay in view.
+    spec.child(
+        rows.scroll(rune::ScrollSpec {
+            stick_bottom: false,
+        })
+        .shrink()
+        .min_h(0.0)
+        .scroll_bar(k),
     )
     .footer(dk::footer(
         Vec::new(),
