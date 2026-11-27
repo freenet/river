@@ -11940,10 +11940,26 @@ pub(crate) async fn fire_legacy_migration_request() -> bool {
     // sweep that found nothing. Read from the current delegate's store, only
     // when a sweep would otherwise start (so a reconnect refused by the session
     // guard pays no read). Any failure or timeout reads as "no marker".
+    //
+    // The read awaits, so a Retry or reconnect can begin a new load attempt
+    // meanwhile. Capture the attempt and the sweep epoch BEFORE it.
+    let attempt_at_read = LOAD_ATTEMPT_GEN.load(Ordering::Relaxed);
+    let epoch_at_read = SWEEP_EPOCH.load(Ordering::Relaxed);
     if !super::legacy_sweep_marker::take_fresh_sweep_request()
         && super::legacy_sweep_marker::marker_matches_now().await
     {
         info!("Legacy sweep already found nothing for this delegate set, skipping");
+        return false;
+    }
+    if !load_attempt_is_current(attempt_at_read) {
+        // A newer attempt began during the read and runs its own load and
+        // sweep: this one must not start (or supersede) a sweep. If this call
+        // took the session guard and no sweep has started since, hand it back
+        // so the newer attempt is not refused.
+        if !already && SWEEP_EPOCH.load(Ordering::Relaxed) == epoch_at_read {
+            LEGACY_MIGRATION_ATTEMPTED.store(false, Ordering::Relaxed);
+        }
+        info!("Load attempt changed during the legacy marker read, not sweeping");
         return false;
     }
     let epoch = SWEEP_EPOCH.fetch_add(1, Ordering::Relaxed) + 1;

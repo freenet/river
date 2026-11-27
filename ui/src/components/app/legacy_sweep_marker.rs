@@ -39,6 +39,8 @@ use std::sync::Mutex;
 use futures::future::{select, Either};
 use river_core::chat_delegate::{ChatDelegateKey, ChatDelegateRequestMsg, ChatDelegateResponseMsg};
 
+use super::freenet_api::delegate_migration::is_migration_bookkeeping_key;
+
 use super::chat_delegate::{
     await_delegate_response, current_delegate_key, enqueue_delegate_request, legacy_delegate_pairs,
     send_delegate_request, OUTBOUND_DMS_STORAGE_KEY, ROOMS_STORAGE_KEY,
@@ -199,9 +201,13 @@ pub(crate) fn classify_reply(response: &ChatDelegateResponseMsg) -> Reply {
             }
         }
         ChatDelegateResponseMsg::ListResponse { keys } => {
-            // The marker is this delegate's own bookkeeping: once the delegate
-            // is a legacy generation its marker must not count as room data.
-            if keys.iter().all(|k| k.as_bytes() == LEGACY_SWEEP_MARKER_KEY) {
+            // Keys that are only this delegate's own bookkeeping (the marker,
+            // the walk's markers, cadence and journal records): once the
+            // delegate is a legacy generation they must not count as room data.
+            if keys
+                .iter()
+                .all(|k| is_migration_bookkeeping_key(k.as_bytes()))
+            {
                 Reply::ListEmpty
             } else {
                 Reply::Data
@@ -644,7 +650,6 @@ mod tests {
     /// swallows its reply, and a listing of only this key is not room data.
     #[test]
     fn the_marker_key_is_bookkeeping() {
-        use super::super::freenet_api::delegate_migration::is_migration_bookkeeping_key;
         assert!(is_migration_bookkeeping_key(LEGACY_SWEEP_MARKER_KEY));
         let only_marker = ChatDelegateResponseMsg::ListResponse {
             keys: vec![ChatDelegateKey::new(LEGACY_SWEEP_MARKER_KEY.to_vec())],
@@ -657,6 +662,46 @@ mod tests {
             ],
         };
         assert_eq!(classify_reply(&with_room), Reply::Data);
+    }
+
+    /// Once this generation is a legacy one, its walk markers, cadence and
+    /// journal records are not room data either; real data keys still are.
+    #[test]
+    fn a_listing_of_only_bookkeeping_keys_is_not_data() {
+        use super::super::freenet_api::delegate_migration::{
+            KEY_INDEX_STORAGE_KEY, KV_INTENT_STORAGE_KEY, MIGRATE_PRED_DONE_PREFIX,
+            SHORT_INDEX_KEY, TOPUP_WINDOW_KEY, WALK_CADENCE_KEY,
+        };
+        let list = |keys: Vec<Vec<u8>>| ChatDelegateResponseMsg::ListResponse {
+            keys: keys.into_iter().map(ChatDelegateKey::new).collect(),
+        };
+        let mut pred_done = MIGRATE_PRED_DONE_PREFIX.to_vec();
+        pred_done.extend_from_slice(b"abc");
+        let bookkeeping = vec![
+            LEGACY_SWEEP_MARKER_KEY.to_vec(),
+            WALK_CADENCE_KEY.to_vec(),
+            TOPUP_WINDOW_KEY.to_vec(),
+            SHORT_INDEX_KEY.to_vec(),
+            KEY_INDEX_STORAGE_KEY.to_vec(),
+            KV_INTENT_STORAGE_KEY.to_vec(),
+            pred_done,
+        ];
+        assert_eq!(classify_reply(&list(bookkeeping.clone())), Reply::ListEmpty);
+        for data in [
+            ROOMS_STORAGE_KEY.to_vec(),
+            OUTBOUND_DMS_STORAGE_KEY.to_vec(),
+            b"rooms_meta".to_vec(),
+            b"room:x".to_vec(),
+        ] {
+            let mut keys = bookkeeping.clone();
+            keys.push(data.clone());
+            assert_eq!(
+                classify_reply(&list(keys)),
+                Reply::Data,
+                "{:?}",
+                String::from_utf8_lossy(&data)
+            );
+        }
     }
 
     // ---- when the marker may be written ----
@@ -868,6 +913,59 @@ mod tests {
             .find("write_marker_if_sweep_proved_empty(")
             .expect("the idle resolution writes the marker");
         assert!(write > failed, "not on the failure branch");
+    }
+
+    /// A Retry or reconnect that begins a new attempt while the marker read is
+    /// pending must not let the old call start or supersede a sweep.
+    #[test]
+    fn a_new_attempt_during_the_marker_read_stops_the_old_call() {
+        let body = fn_body(
+            include_str!("chat_delegate.rs"),
+            "pub(crate) async fn fire_legacy_migration_request() -> bool {",
+        );
+        let capture = body
+            .find("let attempt_at_read = LOAD_ATTEMPT_GEN.load(")
+            .expect("the attempt is captured before the read");
+        let read = body
+            .find("legacy_sweep_marker::marker_matches_now().await")
+            .expect("the read");
+        let recheck = body
+            .find("if !load_attempt_is_current(attempt_at_read) {")
+            .expect("the attempt is rechecked after the read");
+        let epoch = body.find("SWEEP_EPOCH.fetch_add(").expect("sweep start");
+        assert!(capture < read && read < recheck && recheck < epoch);
+        let stale = &body[recheck..epoch];
+        assert!(
+            stale.contains("return false;"),
+            "a stale call starts nothing"
+        );
+        // The session guard this call took is handed back, but only when no
+        // sweep started meanwhile.
+        assert!(stale.contains("!already && SWEEP_EPOCH.load(Ordering::Relaxed) == epoch_at_read"));
+        assert!(stale.contains("LEGACY_MIGRATION_ATTEMPTED.store(false"));
+    }
+
+    /// `note_legacy_absent` may be reached only from the typed "delegate
+    /// missing for a legacy generation" arm, never from the generic error path
+    /// that also sees refusals and execution errors.
+    #[test]
+    fn absence_is_noted_only_for_a_typed_missing_legacy_delegate() {
+        let sync = include_str!("freenet_api/freenet_synchronizer.rs");
+        let production = sync.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        assert_eq!(
+            production
+                .matches("legacy_sweep_marker::note_legacy_absent(")
+                .count(),
+            1
+        );
+        let arm = production
+            .find("if let Some(key) = legacy_not_installed_key(&e) {")
+            .expect("the typed legacy-missing arm");
+        let call = production
+            .find("legacy_sweep_marker::note_legacy_absent(")
+            .unwrap();
+        let arm_end = arm + production[arm..].find("} else if ").expect("arm end");
+        assert!(arm < call && call < arm_end, "inside the typed-missing arm");
     }
 
     #[test]
