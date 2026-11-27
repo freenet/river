@@ -1434,6 +1434,9 @@ mod tests {
         let rec = Recorder::default();
         let mut s = RiverApp::detached().with_notifier(Box::new(rec.clone()));
         s.chat.source = crate::chat::Source::Node(LinkStatus::Live);
+        // Explicit `All`: these tests count every unread message.
+        let all = s.chat.rooms().to_vec();
+        s.chat.notify_all_in(&all);
         s.chat
             .edit_rooms(|r| r.iter_mut().for_each(|r| r.unread = 0));
         let mut rt = Runtime::new(
@@ -1493,6 +1496,9 @@ mod tests {
         let rec = Recorder::default();
         let mut s = RiverApp::detached().with_notifier(Box::new(rec.clone()));
         s.chat.source = crate::chat::Source::Node(LinkStatus::Live);
+        // Explicit `All`: these tests count every unread message.
+        let all = s.chat.rooms().to_vec();
+        s.chat.notify_all_in(&all);
         s.chat
             .edit_rooms(|r| r.iter_mut().for_each(|r| r.unread = 0));
         let mut rt = Runtime::new(
