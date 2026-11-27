@@ -1254,8 +1254,8 @@ pub fn notify_new_messages(
     //
     // Read ONCE, and fallibly: `.read()` panics on a re-entrant borrow
     // (`.claude/rules/dioxus-signal-safety.md`), and this runs from
-    // `apply_delta`. The fallback is `return`, NOT `unwrap_or_default()` — the
-    // default is `All`, so defaulting here would notify a MUTED room, which is
+    // `apply_delta`. The fallback is `return`, NOT `unwrap_or_default()`: a
+    // default mode would notify a MUTED room if the read failed, which is
     // exactly the setting the user chose to prevent. A missed notification on
     // an unreadable signal is the safe direction.
     //
@@ -1266,11 +1266,7 @@ pub fn notify_new_messages(
         warn!("ROOMS unreadable while deciding notifications; skipping");
         return;
     };
-    let mode = rooms
-        .notification_modes
-        .get(room_key)
-        .copied()
-        .unwrap_or_default();
+    let mode = rooms.notification_mode(room_key);
     if mode == crate::room_data::NotificationMode::Muted {
         drop(rooms);
         info!(
@@ -2402,15 +2398,32 @@ mod notify_gate_tests {
              target, so NO reaction would notify (#598)"
         );
         // The gate must run for EVERY mode, not just inside the
-        // MentionsAndReplies arm — `All` is the default, and it is where the
-        // reported symptom occurred.
+        // MentionsAndReplies arm — `All` is where the reported symptom
+        // occurred.
         let mode_match = body
             .find("matchmode{")
             .expect("the per-room NotificationMode filter is a `match mode`");
         assert!(
             gate < mode_match,
             "the action gate moved to or below the mode match, so rooms left \
-             on the default `All` mode notify on every reaction again (#598)"
+             on `All` mode notify on every reaction again (#598)"
+        );
+    }
+
+    /// The notification decision must take the room's mode from
+    /// `Rooms::notification_mode`, which falls back to the default
+    /// (`MentionsAndReplies`) for a room with no entry. Reading the map
+    /// directly with its own fallback would let the two drift.
+    #[test]
+    fn notify_new_messages_reads_the_mode_through_the_default_fallback() {
+        let body = notify_new_messages_body();
+        assert!(
+            body.contains("rooms.notification_mode(room_key)"),
+            "the decision no longer reads the mode through `Rooms::notification_mode`"
+        );
+        assert!(
+            !body.contains(".notification_modes"),
+            "the decision reads `notification_modes` directly"
         );
     }
 

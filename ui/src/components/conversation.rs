@@ -1648,20 +1648,16 @@ pub fn Conversation() -> Element {
     let panel_unread = use_memo(count_unread_behind_rooms_panel);
 
     // The current room's notification mode, for the header bell icon + tooltip.
-    // Absent entry means the default (`All`).
+    // Absent entry means the default (`MentionsAndReplies`).
     let current_notification_mode = use_memo(move || {
         // freenet/river#555: anchor before the fallible ROOMS read.
         crate::util::signal_guard::anchor();
         let current_room = CURRENT_ROOM.read();
         let Some(key) = current_room.owner_key else {
-            return NotificationMode::All;
+            return NotificationMode::default();
         };
         match ROOMS.try_read() {
-            Ok(rooms) => rooms
-                .notification_modes
-                .get(&key)
-                .copied()
-                .unwrap_or_default(),
+            Ok(rooms) => rooms.notification_mode(&key),
             Err(_) => {
                 crate::util::signal_guard::schedule_nudge();
                 NotificationMode::default()

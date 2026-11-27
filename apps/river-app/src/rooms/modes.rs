@@ -4,7 +4,7 @@
 //! `notification_modes` field of `RoomsMeta`, the CBOR value stored under the chat delegate's
 //! `rooms_meta` key beside `room_order`, the open room and the legacy identity sources: a map
 //! from the room owner's verifying key to the mode, where a room with no entry is
-//! [`NotificationMode::All`]. This app reads and writes that same field, so a room muted in the
+//! [`NotificationMode::MentionsAndReplies`] (the default; an explicit `All` is a stored entry). This app reads and writes that same field, so a room muted in the
 //! browser is muted here and the other way round.
 //!
 //! The types are defined here, not in `river-core`: `NotificationMode` and `RoomsMeta` live in
@@ -42,10 +42,12 @@ pub const MODES_FIELD: &str = "notification_modes";
 /// names, which are what is stored.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NotificationMode {
-    /// Every message from another member (the default).
-    #[default]
+    /// Every message from another member. Not the default: it is in effect only as a stored
+    /// entry the user picked.
     All,
-    /// Only messages that mention you or reply to one of yours.
+    /// Only messages that mention you or reply to one of yours (the default, for a room with
+    /// no entry).
+    #[default]
     MentionsAndReplies,
     /// Never.
     Muted,
@@ -82,7 +84,7 @@ impl NotificationMode {
 
 /// The modes a stored `rooms_meta` value holds, by room. A value that can't be read, a field
 /// that is not a map, or an entry that is not a key with a mode this build knows gives nothing
-/// for that part: a room with no readable entry is [`NotificationMode::All`], and the stored
+/// for that part: a room with no readable entry is [`NotificationMode::default`], and the stored
 /// value is never rewritten from what is returned here ([`meta_with_mode`] edits it in place).
 pub fn decode_modes(bytes: &[u8]) -> HashMap<VerifyingKey, NotificationMode> {
     let Ok(Value::Map(entries)) = ciborium::de::from_reader::<Value, _>(bytes) else {

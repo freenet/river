@@ -77,7 +77,7 @@ test.describe("Per-room notification bell", () => {
 
     await page.getByTestId("notification-modal-close").click();
     await expect(modal).toHaveCount(0, { timeout: 5_000 });
-    // No stored preference here, so All is the default (#500 seeds only "Your Private Room" as Muted).
+    // The example data stores an explicit All for this room (#500 seeds "Your Private Room" as Muted).
     await expect(
       page.getByTestId("notification-bell-button")
     ).toHaveAttribute("title", "Notifications: All messages");

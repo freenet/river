@@ -2118,14 +2118,26 @@ impl PartialEq for CurrentRoom {
 /// browser notification fires for new messages in a room.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub enum NotificationMode {
-    /// Notify for every message from another member (the historical default).
-    #[default]
+    /// Notify for every message from another member. Only in effect when the
+    /// user picked it: it is stored as an entry, since it is not the default.
     All,
     /// Notify only for messages that @mention the local user or reply to one
-    /// of their messages.
+    /// of their messages. The default for a room with no stored entry.
+    #[default]
     MentionsAndReplies,
     /// Never notify for this room.
     Muted,
+}
+
+/// The mode `room` notifies under: its entry in `modes`, or the default
+/// ([`NotificationMode::MentionsAndReplies`]) when it has none. Every reader of
+/// `notification_modes` goes through this or [`Rooms::notification_mode`], so
+/// the fallback lives in one place.
+pub fn notification_mode_in(
+    modes: &HashMap<VerifyingKey, NotificationMode>,
+    room: &VerifyingKey,
+) -> NotificationMode {
+    modes.get(room).copied().unwrap_or_default()
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -2161,7 +2173,10 @@ pub struct Rooms {
     #[serde(default)]
     pub removed_rooms: std::collections::HashSet<VerifyingKey>,
     /// Per-room notification preference (a local user setting), keyed by room
-    /// owner key. An absent entry means [`NotificationMode::All`]. Persisted
+    /// owner key. An absent entry means [`NotificationMode::default`]
+    /// (`MentionsAndReplies`); read it through [`Rooms::notification_mode`] or
+    /// [`notification_mode_in`]. Nothing writes an entry except the user's pick
+    /// in the notification dialog, so an explicit `All` stays `All`. Persisted
     /// alongside `map` inside the `rooms_data` delegate blob — the same
     /// local-per-room-state pattern as `removed_rooms`, so it needs no new
     /// delegate storage key and survives delegate migration. A stale entry for
@@ -2348,6 +2363,11 @@ pub fn lower_identity_ranks(
 }
 
 impl Rooms {
+    /// The notification mode of `room` ([`notification_mode_in`]).
+    pub fn notification_mode(&self, room: &VerifyingKey) -> NotificationMode {
+        notification_mode_in(&self.notification_modes, room)
+    }
+
     /// Project the list-level view preferences into a [`RoomsMeta`] for the
     /// `rooms_meta` delegate key. (`identity_sources` is filled by the save,
     /// which holds the rank registry.)
@@ -3600,8 +3620,31 @@ mod tests {
     }
 
     #[test]
-    fn notification_mode_defaults_to_all() {
-        assert_eq!(NotificationMode::default(), NotificationMode::All);
+    fn notification_mode_defaults_to_mentions_and_replies() {
+        assert_eq!(
+            NotificationMode::default(),
+            NotificationMode::MentionsAndReplies
+        );
+    }
+
+    #[test]
+    fn a_room_with_no_entry_is_mentions_and_replies_and_explicit_picks_stay() {
+        let all = SigningKey::from_bytes(&[31u8; 32]).verifying_key();
+        let muted = SigningKey::from_bytes(&[32u8; 32]).verifying_key();
+        let none = SigningKey::from_bytes(&[33u8; 32]).verifying_key();
+        let modes = HashMap::from([
+            (all, NotificationMode::All),
+            (muted, NotificationMode::Muted),
+        ]);
+        assert_eq!(notification_mode_in(&modes, &all), NotificationMode::All);
+        assert_eq!(
+            notification_mode_in(&modes, &muted),
+            NotificationMode::Muted
+        );
+        assert_eq!(
+            notification_mode_in(&modes, &none),
+            NotificationMode::MentionsAndReplies
+        );
     }
 
     #[test]
