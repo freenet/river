@@ -219,6 +219,10 @@ fn main() {
         windowless.store(true, std::sync::atomic::Ordering::Release);
         app = app.windowless();
     }
+    // The id panels match the window to its .desktop entry by (Wayland app_id, X11 WM_CLASS).
+    // The same id the notifications use; the entry is packaging/linux/org.freenet.River.desktop.
+    #[cfg(target_os = "linux")]
+    rune::set_app_id("org.freenet.River");
     app.run();
     // The window closed normally: this start was not a failed one.
     if let Some(u) = on_exit {

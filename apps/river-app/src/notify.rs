@@ -97,6 +97,8 @@ pub trait Notifier {
     /// The number of unread messages across all rooms, for a dock badge or taskbar overlay.
     /// Called when the number changes, with 0 when everything is read.
     fn set_unread(&self, total: usize);
+    /// How the connection to the node stands, for a tray tooltip. Called when it changes.
+    fn set_connection(&self, _: crate::chat::node_status::Connection) {}
 }
 
 /// The notifier of a headless run or a shell without one: shows nothing.
@@ -734,6 +736,7 @@ mod tests {
     struct Recorder {
         shown: Rc<RefCell<Vec<Notification>>>,
         unread: Rc<RefCell<Vec<usize>>>,
+        connection: Rc<RefCell<Vec<crate::chat::node_status::Connection>>>,
         /// Refuse to queue, as a backed-up shell does.
         full: Rc<std::cell::Cell<bool>>,
     }
@@ -748,6 +751,9 @@ mod tests {
         }
         fn set_unread(&self, total: usize) {
             self.unread.borrow_mut().push(total);
+        }
+        fn set_connection(&self, c: crate::chat::node_status::Connection) {
+            self.connection.borrow_mut().push(c);
         }
     }
 
@@ -1517,6 +1523,77 @@ mod tests {
         let heard = rec.unread.borrow().len();
         frame_of(&mut rt, &rec);
         assert_eq!(rec.unread.borrow().len(), heard + 1);
+    }
+
+    #[test]
+    fn the_notifier_hears_the_connection_state_once_per_change() {
+        use crate::chat::node_status::{Connection, connection_of};
+        let rec = Recorder::default();
+        // Example rooms (no node source): the gate that stops the count here must not stop this.
+        let s = RiverApp::detached().with_notifier(Box::new(rec.clone()));
+        assert!(matches!(s.chat.source, crate::chat::Source::Example));
+        let first = connection_of(&s.setup, &s.access, s.chat.source);
+        let mut rt = Runtime::new(
+            s,
+            view,
+            (900.0, 700.0),
+            Env {
+                system_dark: true,
+                scale: 1.0,
+            },
+        );
+        rt.poll = crate::spec().poll;
+        rt.frame(1.0 / 60.0);
+        rt.frame(1.0 / 60.0);
+        assert_eq!(*rec.connection.borrow(), vec![first]);
+        rt.state.setup = crate::Setup::Connected {
+            version: String::new(),
+        };
+        rt.state.access = crate::Access::Unreachable(String::new());
+        rt.frame(1.0 / 60.0);
+        rt.frame(1.0 / 60.0);
+        assert_eq!(
+            *rec.connection.borrow(),
+            vec![first, Connection::Unreachable]
+        );
+    }
+
+    #[test]
+    fn a_click_just_after_focus_was_lost_still_finds_the_window_in_front() {
+        use std::time::Duration;
+        let grace = Duration::from_millis(500);
+        let mut s = RiverApp::detached();
+        let now = Instant::now();
+        assert!(
+            !s.recently_in_front(now, grace),
+            "windowless start, no focus yet"
+        );
+        s.shown_by_tray();
+        assert!(
+            s.recently_in_front(now, grace),
+            "shown, and no focus event ever came"
+        );
+        let mut s = RiverApp::detached();
+        s.focus_changed(true);
+        s.focus_changed(false);
+        let lost = s.blurred_at.expect("the loss is stamped");
+        assert!(s.recently_in_front(lost + Duration::from_millis(100), grace));
+        assert!(!s.recently_in_front(lost + Duration::from_millis(900), grace));
+        s.focus_changed(true);
+        s.hidden_by_tray();
+        assert!(
+            !s.recently_in_front(Instant::now(), grace),
+            "hiding clears it"
+        );
+        // With no focus event ever, hiding still leaves the next show on the fallback.
+        let mut s = RiverApp::detached();
+        s.shown_by_tray();
+        s.hidden_by_tray();
+        assert!(!s.window_in_front());
+        s.shown_by_tray();
+        assert!(s.window_in_front(), "focus_known was not set by the hide");
+        s.hidden_by_tray();
+        assert!(!s.window_in_front());
     }
 
     #[test]

@@ -7,3 +7,5 @@ Exec=river
 Icon=river
 Terminal=false
 Categories=Network;Chat;InstantMessaging;
+# The window's app id (set in src/main.rs), so panels match the window to this entry.
+StartupWMClass=org.freenet.River

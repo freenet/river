@@ -3,8 +3,8 @@
 #
 #   package-linux.sh <river binary> <version> <output dir>
 #
-# The tarball holds one directory with the binary, river.desktop, a 512 px icon, the
-# licence and a README that says where to copy them. It does not install anything.
+# The tarball holds one directory with the binary, org.freenet.River.desktop, a 512 px icon,
+# the licence and a README that says where to copy them. It does not install anything.
 # Run by .github/workflows/release-desktop.yml; also fine to run locally.
 
 set -euo pipefail
@@ -38,7 +38,7 @@ DIR="$STAGE/$NAME"
 mkdir -p "$DIR"
 
 install -m 0755 "$BIN" "$DIR/river"
-install -m 0644 "$HERE/linux/river.desktop" "$DIR/river.desktop"
+install -m 0644 "$HERE/linux/org.freenet.River.desktop" "$DIR/org.freenet.River.desktop"
 install -m 0644 "$HERE/icons/river.png" "$DIR/river.png"
 install -m 0644 "$REPO_ROOT/LICENSE" "$DIR/LICENSE"
 cat > "$DIR/README.txt" <<EOF
@@ -59,10 +59,15 @@ To add River to your applications menu:
 
   mkdir -p ~/.local/bin ~/.local/share/applications ~/.local/share/icons/hicolor/512x512/apps
   cp river ~/.local/bin/
-  cp river.desktop ~/.local/share/applications/
+  cp org.freenet.River.desktop ~/.local/share/applications/
   cp river.png ~/.local/share/icons/hicolor/512x512/apps/
 
 ~/.local/bin must be on your PATH for the menu entry to start it.
+
+If you installed an earlier River, then after copying the files above remove its old menu
+entry, which had another name and would show River twice:
+
+  rm -f ~/.local/share/applications/river.desktop
 
 River needs libxkbcommon and libwayland-client (installed on most desktops) and a
 GPU driver with Vulkan support. It also loads libfontconfig.so.1 (package libfontconfig1
