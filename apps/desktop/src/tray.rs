@@ -4,14 +4,16 @@
 //! GNOME with its AppIndicator extension all speak. A desktop without it has no tray, which
 //! [`start`] reports, and River then quits when its window closes. Windows and macOS use
 //! `tray-icon`, which must be made on the thread that runs the window system's events, so
-//! [`start`] is called from the app's init there. Both draw the unread count on the icon, say it
-//! and the connection in the tooltip, and toggle the window on a left click.
+//! [`start`] is called from the app's init there. Both draw the unread count on the icon (dimmed
+//! while do not disturb is on), say it and the connection in the tooltip, toggle the window on a
+//! left click, and build the menu from [`menu_model`].
 
 #[cfg(any(test, not(target_os = "macos")))]
 use std::time::{Duration, Instant};
 
 use river_app::RiverApp;
 use river_app::chat::node_status::Connection;
+use river_app::notify::TrayMenu;
 use rune::AppHandle;
 
 const TOOLTIP: &str = "River";
@@ -73,17 +75,126 @@ fn shrink(rgba: &[u8], from: usize, to: usize) -> Option<Vec<u8>> {
 }
 
 /// What the tray shows: the unread count the window title and the Dock or taskbar badge show
-/// (it comes from the same `Notifier::set_unread` call), and how the connection to the node
-/// stands.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// (it comes from the same `Notifier::set_unread` call), how the connection to the node
+/// stands, and what the menu lists besides.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct View {
     pub unread: usize,
     pub connection: Option<Connection>,
+    pub menu: TrayMenu,
+}
+
+/// What choosing a menu item does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Action {
+    Open,
+    /// Show the window with this room (by key) open.
+    OpenRoom(String),
+    MarkAllRead,
+    ToggleDnd,
+    ToggleLogin,
+    /// Restart into the downloaded update.
+    Update,
+    Quit,
+}
+
+/// One line of the tray menu.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Entry {
+    /// Text that does nothing when chosen.
+    Status(String),
+    Item {
+        label: String,
+        action: Action,
+        /// `Some` for an item with a tick.
+        checked: Option<bool>,
+    },
+    Separator,
+}
+
+/// The longest room name the menu shows before cutting it, in characters.
+const ROOM_NAME_CHARS: usize = 40;
+
+fn shortened(name: &str) -> String {
+    let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
+    if name.chars().count() <= ROOM_NAME_CHARS {
+        return name;
+    }
+    let cut: String = name.chars().take(ROOM_NAME_CHARS - 1).collect();
+    format!("{}…", cut.trim_end())
+}
+
+/// The menu, top to bottom: the connection; the rooms with unread messages and Mark all as read
+/// (when there are any); Open River, Do not disturb, Start River when I log in (where the shell
+/// has it), Update available (when one is ready); Quit.
+pub fn menu_model(view: &View) -> Vec<Entry> {
+    let item = |label: &str, action: Action, checked: Option<bool>| Entry::Item {
+        label: label.to_owned(),
+        action,
+        checked,
+    };
+    let m = &view.menu;
+    let mut out = vec![Entry::Status(
+        view.connection.map_or("Connecting", Connection::text).to_owned(),
+    )];
+    if !m.unread_rooms.is_empty() {
+        for r in &m.unread_rooms {
+            out.push(item(
+                &format!("{} ({})", shortened(&r.name), r.count),
+                Action::OpenRoom(r.key.clone()),
+                None,
+            ));
+        }
+        out.push(item("Mark all as read", Action::MarkAllRead, None));
+    }
+    out.push(Entry::Separator);
+    out.push(item("Open River", Action::Open, None));
+    out.push(item("Do Not Disturb", Action::ToggleDnd, Some(m.dnd)));
+    if let Some(on) = m.start_at_login {
+        out.push(item(
+            "Start River when I log in",
+            Action::ToggleLogin,
+            Some(on),
+        ));
+    }
+    if m.update_ready {
+        out.push(item("Update available - restart", Action::Update, None));
+    }
+    out.push(Entry::Separator);
+    out.push(item("Quit", Action::Quit, None));
+    out
+}
+
+/// Do what a chosen item says. Never blocks: the app's work runs on its UI thread.
+fn run(handle: &AppHandle<RiverApp>, action: Action) {
+    match action {
+        Action::Open => handle.open(),
+        Action::OpenRoom(key) => {
+            handle.update(move |app, _| app.open_room(&key));
+            handle.open();
+        }
+        Action::MarkAllRead => handle.update(|app, _| app.tray_mark_all_read()),
+        Action::ToggleDnd => {
+            let window = handle.clone();
+            handle.update(move |app, _| {
+                if app.tray_toggle_dnd() {
+                    window.open();
+                }
+            });
+        }
+        Action::ToggleLogin => handle.update(|app, _| app.tray_toggle_start_at_login()),
+        Action::Update => {
+            // A restart that would lose something asks first, in the window.
+            handle.open();
+            handle.update(|app, _| app.tray_restart_to_update());
+        }
+        Action::Quit => handle.quit(),
+    }
 }
 
 /// The tooltip: "River", with the count when there is one and the connection state, in the
 /// words of the node status dialog, when it is not live.
-pub fn tooltip(view: View) -> String {
+pub fn tooltip(view: &View) -> String {
     let mut text = String::from(TOOLTIP);
     match view.unread {
         0 => {}
@@ -222,6 +333,28 @@ fn badged(plain: &[u8], count: usize) -> Vec<u8> {
     out
 }
 
+/// How much of its opacity the logo keeps while do not disturb is on.
+const DIMMED_ALPHA: f32 = 0.4;
+
+/// `plain` with its opacity reduced to [`DIMMED_ALPHA`], colours unchanged.
+fn dimmed(plain: &[u8]) -> Vec<u8> {
+    let mut out = plain.to_vec();
+    for px in out.as_chunks_mut::<4>().0 {
+        px[3] = (f32::from(px[3]) * DIMMED_ALPHA).round() as u8;
+    }
+    out
+}
+
+/// The icon for `view`: the logo, dimmed while do not disturb is on, with the unread count in
+/// its badge (drawn after dimming, so the count stays fully visible).
+fn icon_for(plain: &[u8], view: &View) -> Vec<u8> {
+    if view.menu.dnd {
+        badged(&dimmed(plain), view.unread)
+    } else {
+        badged(plain, view.unread)
+    }
+}
+
 /// The view the tray last showed, so it redraws only on a change. Cloned handles share it.
 #[derive(Clone, Default)]
 pub struct Tracker(std::sync::Arc<std::sync::Mutex<View>>);
@@ -230,9 +363,9 @@ impl Tracker {
     /// Fold a change in; the new view if anything changed, which is when the tray redraws.
     fn change(&self, f: impl FnOnce(&mut View)) -> Option<View> {
         let mut view = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let before = *view;
+        let before = view.clone();
         f(&mut view);
-        (*view != before).then_some(*view)
+        (*view != before).then(|| view.clone())
     }
 
     /// The unread count, from `Notifier::set_unread` on the UI thread.
@@ -249,9 +382,16 @@ impl Tracker {
         }
     }
 
+    /// What the menu lists, from `Notifier::set_menu` on the UI thread.
+    pub fn set_menu(&self, menu: TrayMenu) {
+        if let Some(view) = self.change(|v| v.menu = menu) {
+            refresh(view);
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn view(&self) -> View {
-        *self.0.lock().unwrap()
+        self.0.lock().unwrap().clone()
     }
 }
 
@@ -362,13 +502,19 @@ mod linux {
     impl RiverTray {
         /// ARGB32, as the protocol wants.
         fn argb(&self) -> Vec<u8> {
-            badged(&self.plain, self.view.unread)
+            icon_for(&self.plain, &self.view)
                 .as_chunks::<4>()
                 .0
                 .iter()
                 .flat_map(|p| [p[3], p[0], p[1], p[2]])
                 .collect()
         }
+    }
+
+    /// A label as the panel shows it: D-Bus menus read `_` as the mark of a shortcut letter, and
+    /// `__` is a literal one.
+    fn mnemonic_safe(label: &str) -> String {
+        label.replace('_', "__")
     }
 
     /// The view waiting to be shown. ksni's blocking `update` waits for the tray service's
@@ -400,7 +546,7 @@ mod linux {
 
         fn tool_tip(&self) -> ksni::ToolTip {
             ksni::ToolTip {
-                title: tooltip(self.view),
+                title: tooltip(&self.view),
                 ..Default::default()
             }
         }
@@ -410,22 +556,40 @@ mod linux {
         }
 
         fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
-            use ksni::menu::StandardItem;
-            vec![
-                StandardItem {
-                    label: "Open River".into(),
-                    activate: Box::new(|t: &mut Self| t.handle.open()),
-                    ..Default::default()
-                }
-                .into(),
-                ksni::MenuItem::Separator,
-                StandardItem {
-                    label: "Quit".into(),
-                    activate: Box::new(|t: &mut Self| t.handle.quit()),
-                    ..Default::default()
-                }
-                .into(),
-            ]
+            use ksni::menu::{CheckmarkItem, StandardItem};
+            menu_model(&self.view)
+                .into_iter()
+                .map(|entry| match entry {
+                    Entry::Separator => ksni::MenuItem::Separator,
+                    Entry::Status(label) => StandardItem {
+                        label: mnemonic_safe(&label),
+                        enabled: false,
+                        ..Default::default()
+                    }
+                    .into(),
+                    Entry::Item {
+                        label,
+                        action,
+                        checked: None,
+                    } => StandardItem {
+                        label: mnemonic_safe(&label),
+                        activate: Box::new(move |t: &mut Self| run(&t.handle, action.clone())),
+                        ..Default::default()
+                    }
+                    .into(),
+                    Entry::Item {
+                        label,
+                        action,
+                        checked: Some(checked),
+                    } => CheckmarkItem {
+                        label: mnemonic_safe(&label),
+                        checked,
+                        activate: Box::new(move |t: &mut Self| run(&t.handle, action.clone())),
+                        ..Default::default()
+                    }
+                    .into(),
+                })
+                .collect()
         }
 
         fn watcher_online(&self) {
@@ -485,8 +649,9 @@ mod linux {
 #[cfg(any(windows, target_os = "macos"))]
 mod native {
     use std::cell::RefCell;
+    use std::sync::Mutex;
 
-    use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+    use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
     use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
     #[cfg(windows)]
     use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
@@ -499,17 +664,70 @@ mod native {
         static TRAY: RefCell<(Option<TrayIcon>, Vec<u8>)> = const { RefCell::new((None, Vec::new())) };
     }
 
-    /// Show a new view. Runs on the UI thread, which is the thread that made the icon (see
-    /// [`TRAY`]); anywhere else there is no icon to change and this does nothing.
+    /// What each item of the menu now showing does, for the menu event handler.
+    static ACTIONS: Mutex<Vec<(MenuId, Action)>> = Mutex::new(Vec::new());
+
+    /// A label as the menu shows it: Windows reads `&` as the mark of a shortcut letter, and `&&`
+    /// is a literal one.
+    fn label_safe(label: &str) -> String {
+        if cfg!(windows) {
+            label.replace('&', "&&")
+        } else {
+            label.to_owned()
+        }
+    }
+
+    /// The menu for `view`, and what its items do.
+    fn build_menu(view: &View) -> Result<(Menu, Vec<(MenuId, Action)>), tray_icon::menu::Error> {
+        let menu = Menu::new();
+        let mut actions = Vec::new();
+        for entry in menu_model(view) {
+            match entry {
+                Entry::Separator => menu.append(&PredefinedMenuItem::separator())?,
+                Entry::Status(label) => {
+                    menu.append(&MenuItem::new(label_safe(&label), false, None))?
+                }
+                Entry::Item {
+                    label,
+                    action,
+                    checked: None,
+                } => {
+                    let item = MenuItem::new(label_safe(&label), true, None);
+                    menu.append(&item)?;
+                    actions.push((item.id().clone(), action));
+                }
+                Entry::Item {
+                    label,
+                    action,
+                    checked: Some(on),
+                } => {
+                    let item = CheckMenuItem::new(label_safe(&label), true, on, None);
+                    menu.append(&item)?;
+                    actions.push((item.id().clone(), action));
+                }
+            }
+        }
+        Ok((menu, actions))
+    }
+
+    /// Show a new view: the icon, the tooltip and the menu. Runs on the UI thread, which is the
+    /// thread that made the icon (see [`TRAY`]); anywhere else there is no icon to change and
+    /// this does nothing.
     pub fn refresh(view: View) {
         TRAY.with(|t| {
             let (tray, plain) = &*t.borrow();
             let Some(tray) = tray else { return };
-            if let Ok(icon) = Icon::from_rgba(badged(plain, view.unread), SIDE as u32, SIDE as u32)
-            {
+            if let Ok(icon) = Icon::from_rgba(icon_for(plain, &view), SIDE as u32, SIDE as u32) {
                 let _ = tray.set_icon(Some(icon));
             }
-            let _ = tray.set_tooltip(Some(tooltip(view)));
+            let _ = tray.set_tooltip(Some(tooltip(&view)));
+            match build_menu(&view) {
+                Ok((menu, actions)) => {
+                    *ACTIONS.lock().unwrap_or_else(|e| e.into_inner()) = actions;
+                    tray.set_menu(Some(Box::new(menu)));
+                }
+                Err(e) => river_app::diag!("river: the tray menu could not be updated: {e}"),
+            }
         });
     }
 
@@ -520,27 +738,31 @@ mod native {
             return false;
         };
         let view = View::default();
-        let icon = match Icon::from_rgba(badged(&rgba, view.unread), SIDE as u32, SIDE as u32) {
+        let icon = match Icon::from_rgba(icon_for(&rgba, &view), SIDE as u32, SIDE as u32) {
             Ok(i) => i,
             Err(e) => {
                 river_app::diag!("river: the tray icon could not be made: {e}");
                 return false;
             }
         };
-        let open = MenuItem::new("Open River", true, None);
-        let quit = MenuItem::new("Quit", true, None);
-        let menu = Menu::new();
-        if let Err(e) = menu.append_items(&[&open, &PredefinedMenuItem::separator(), &quit]) {
-            river_app::diag!("river: the tray menu could not be made: {e}");
-            return false;
-        }
-        let (open_id, quit_id) = (open.id().clone(), quit.id().clone());
+        let (menu, actions) = match build_menu(&view) {
+            Ok(m) => m,
+            Err(e) => {
+                river_app::diag!("river: the tray menu could not be made: {e}");
+                return false;
+            }
+        };
+        *ACTIONS.lock().unwrap_or_else(|e| e.into_inner()) = actions;
         let on_menu = handle.clone();
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-            if event.id == open_id {
-                on_menu.open();
-            } else if event.id == quit_id {
-                on_menu.quit();
+            let action = ACTIONS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .find(|(id, _)| *id == event.id)
+                .map(|(_, a)| a.clone());
+            if let Some(action) = action {
+                run(&on_menu, action);
             }
         }));
         // Windows shows the window on a left click and the menu on a right one. The Mac's
@@ -563,7 +785,7 @@ mod native {
         let built = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_menu_on_left_click(cfg!(target_os = "macos"))
-            .with_tooltip(tooltip(view))
+            .with_tooltip(tooltip(&view))
             .with_icon(icon)
             .build();
         match built {
@@ -708,25 +930,29 @@ mod tests {
 
     #[test]
     fn the_tooltip_says_the_count_and_the_connection_when_it_is_not_live() {
-        let v = |unread, connection| View { unread, connection };
-        assert_eq!(tooltip(v(0, None)), "River");
-        assert_eq!(tooltip(v(0, Some(Connection::Connected))), "River");
-        assert_eq!(tooltip(v(0, Some(Connection::Example))), "River");
+        let v = |unread, connection| View {
+            unread,
+            connection,
+            ..Default::default()
+        };
+        assert_eq!(tooltip(&v(0, None)), "River");
+        assert_eq!(tooltip(&v(0, Some(Connection::Connected))), "River");
+        assert_eq!(tooltip(&v(0, Some(Connection::Example))), "River");
         assert_eq!(
-            tooltip(v(1, Some(Connection::Connected))),
+            tooltip(&v(1, Some(Connection::Connected))),
             "River: 1 unread"
         );
         assert_eq!(
-            tooltip(v(3, Some(Connection::Connected))),
+            tooltip(&v(3, Some(Connection::Connected))),
             "River: 3 unread"
         );
-        assert_eq!(tooltip(v(12, None)), "River: 12 unread");
+        assert_eq!(tooltip(&v(12, None)), "River: 12 unread");
         assert_eq!(
-            tooltip(v(0, Some(Connection::Connecting))),
+            tooltip(&v(0, Some(Connection::Connecting))),
             "River (Connecting)"
         );
         assert_eq!(
-            tooltip(v(2, Some(Connection::Unreachable))),
+            tooltip(&v(2, Some(Connection::Unreachable))),
             "River: 2 unread (Disconnected: nothing answers)"
         );
     }
@@ -802,7 +1028,7 @@ mod tests {
         for unread in 1..=5 {
             latest.put(View {
                 unread,
-                connection: None,
+                ..Default::default()
             });
         }
         assert_eq!(latest.take().unread, 5);
@@ -840,6 +1066,184 @@ mod tests {
         assert_eq!(
             *w.1.borrow(),
             ["open", "hide", "open", "hide", "open", "hide"]
+        );
+    }
+
+    use river_app::notify::UnreadRoom;
+
+    fn room(key: &str, name: &str, count: usize) -> UnreadRoom {
+        UnreadRoom {
+            key: key.into(),
+            name: name.into(),
+            count,
+        }
+    }
+
+    fn labels(view: &View) -> Vec<String> {
+        menu_model(view)
+            .into_iter()
+            .map(|e| match e {
+                Entry::Status(t) => format!("status:{t}"),
+                Entry::Separator => "---".into(),
+                Entry::Item { label, checked, .. } => match checked {
+                    None => label,
+                    Some(on) => format!("{label}[{}]", if on { "x" } else { " " }),
+                },
+            })
+            .collect()
+    }
+
+    fn live() -> View {
+        View {
+            connection: Some(Connection::Connected),
+            menu: TrayMenu {
+                start_at_login: Some(false),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn nothing_unread_has_no_room_lines_and_no_mark_all() {
+        assert_eq!(
+            labels(&live()),
+            [
+                "status:Connected",
+                "---",
+                "Open River",
+                "Do Not Disturb[ ]",
+                "Start River when I log in[ ]",
+                "---",
+                "Quit",
+            ]
+        );
+    }
+
+    #[test]
+    fn unread_rooms_come_first_each_with_its_count_then_mark_all_read() {
+        let mut v = live();
+        v.menu.unread_rooms = vec![room("a", "Alpha", 3), room("b", "Beta", 12)];
+        let l = labels(&v);
+        assert_eq!(
+            l[..5],
+            ["status:Connected", "Alpha (3)", "Beta (12)", "Mark all as read", "---"]
+        );
+        let m = menu_model(&v);
+        assert!(matches!(&m[1], Entry::Item { action: Action::OpenRoom(k), .. } if k == "a"));
+        assert!(matches!(&m[3], Entry::Item { action: Action::MarkAllRead, .. }));
+    }
+
+    #[test]
+    fn a_long_room_name_is_cut() {
+        let mut v = live();
+        v.menu.unread_rooms = vec![room("a", &"x".repeat(100), 1)];
+        let Entry::Item { label, .. } = &menu_model(&v)[1] else {
+            panic!("a room line")
+        };
+        assert!(label.chars().count() <= ROOM_NAME_CHARS + 4, "{label}");
+        assert!(label.contains('…') && label.ends_with(" (1)"));
+    }
+
+    #[test]
+    fn do_not_disturb_and_login_show_their_state_and_the_update_item_appears_when_ready() {
+        let mut v = live();
+        v.menu.dnd = true;
+        v.menu.start_at_login = Some(true);
+        v.menu.update_ready = true;
+        assert_eq!(
+            labels(&v),
+            [
+                "status:Connected",
+                "---",
+                "Open River",
+                "Do Not Disturb[x]",
+                "Start River when I log in[x]",
+                "Update available - restart",
+                "---",
+                "Quit",
+            ]
+        );
+        // Where the shell has no login item, there is no such line.
+        v.menu.start_at_login = None;
+        assert!(!labels(&v).iter().any(|l| l.starts_with("Start River")));
+    }
+
+    #[test]
+    fn the_status_line_says_the_connection_in_the_tooltips_words() {
+        for c in [
+            Connection::Connecting,
+            Connection::Reconnecting,
+            Connection::Unreachable,
+            Connection::NotApproved,
+        ] {
+            let mut v = live();
+            v.connection = Some(c);
+            assert_eq!(labels(&v)[0], format!("status:{}", c.text()));
+            assert!(tooltip(&v).contains(c.text()), "same wording as the tooltip");
+        }
+        let mut v = live();
+        v.connection = None;
+        assert_eq!(labels(&v)[0], "status:Connecting");
+    }
+
+    #[test]
+    fn the_status_line_is_text_and_quit_is_last() {
+        let m = menu_model(&live());
+        assert!(matches!(m[0], Entry::Status(_)));
+        assert!(matches!(
+            m.last(),
+            Some(Entry::Item {
+                action: Action::Quit,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn the_menu_is_rebuilt_only_when_something_it_shows_changes() {
+        let t = Tracker::default();
+        let menu = |n| TrayMenu {
+            unread_rooms: vec![room("a", "A", n)],
+            ..Default::default()
+        };
+        assert!(t.change(|v| v.menu = menu(1)).is_some());
+        assert_eq!(t.change(|v| v.menu = menu(1)), None, "the same menu");
+        assert!(t.change(|v| v.menu = menu(2)).is_some());
+        assert!(t.change(|v| v.menu.dnd = true).is_some());
+        assert_eq!(t.change(|v| v.menu.dnd = true), None);
+    }
+
+    #[test]
+    fn do_not_disturb_dims_the_logo_and_keeps_the_count_visible() {
+        let plain = plain();
+        let on = View {
+            menu: TrayMenu {
+                dnd: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let dim = icon_for(&plain, &on);
+        assert_ne!(dim, plain);
+        for (d, p) in dim.as_chunks::<4>().0.iter().zip(plain.as_chunks::<4>().0) {
+            assert_eq!(d[..3], p[..3], "colour unchanged");
+            assert!(d[3] < p[3] || p[3] == 0, "more transparent");
+            assert!(f32::from(d[3]) <= f32::from(p[3]) * DIMMED_ALPHA + 1.0);
+        }
+        let off = View::default();
+        assert_eq!(icon_for(&plain, &off), plain, "not dimmed without it");
+        // The count stays as bright as on a plain icon.
+        let counted = View {
+            unread: 4,
+            ..on.clone()
+        };
+        let badge = icon_for(&plain, &counted);
+        let mid = (SIDE - 18) * SIDE + SIDE - 18;
+        assert_eq!(badge[mid * 4 + 3], 255, "the badge is opaque");
+        assert_eq!(
+            badge[mid * 4..mid * 4 + 4],
+            badged(&plain, 4)[mid * 4..mid * 4 + 4]
         );
     }
 }

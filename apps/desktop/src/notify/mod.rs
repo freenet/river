@@ -268,6 +268,11 @@ impl Badge {
         self.1.set_connection(connection);
     }
 
+    /// What the tray menu lists changed.
+    fn set_menu(&self, menu: river_app::notify::TrayMenu) {
+        self.1.set_menu(menu);
+    }
+
     /// The count changed.
     fn set(&self, total: usize) {
         self.1.set_unread(total);
@@ -320,6 +325,10 @@ impl Notifier for DesktopNotifier {
 
     fn set_connection(&self, connection: river_app::chat::node_status::Connection) {
         self.badge.set_connection(connection);
+    }
+
+    fn set_menu(&self, menu: river_app::notify::TrayMenu) {
+        self.badge.set_menu(menu);
     }
 }
 

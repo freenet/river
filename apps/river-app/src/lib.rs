@@ -812,6 +812,11 @@ impl RiverApp {
         to_settings
     }
 
+    /// The tray's "Update available - restart": what the update block's Restart does.
+    pub fn tray_restart_to_update(&mut self) {
+        self.restart_to_update();
+    }
+
     /// The tray's "Start River when I log in": the Settings switch.
     pub fn tray_toggle_start_at_login(&mut self) {
         self.chat.toggle_start_at_login();

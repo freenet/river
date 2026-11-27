@@ -17,6 +17,9 @@ use rune::Tx;
 use crate::autostart::LoginItem;
 
 const FILE: &str = "background";
+/// Exists from the first start on a computer (one with no config directory yet) until its setup
+/// ends, so a first run interrupted before that is offered the login choice again.
+const FIRST_RUN_FILE: &str = "first-run";
 const KEY: &str = "close-to-tray";
 /// Set once River has told the person that closing the window leaves it running.
 const TOLD_KEY: &str = "close-to-tray-told";
@@ -179,6 +182,26 @@ fn save(dir: &Path, on: bool, told: bool) -> Result<(), String> {
         })
 }
 
+/// Decide whether this start is River's first on this computer, before anything else writes to
+/// the config directory: a missing or empty directory is, and gets the marker that says so
+/// until setup ends. A directory with anything in it (the lock file every earlier start left,
+/// the settings) is not, whatever else it lacks, so nobody who has run River gets a login item
+/// written for them.
+fn note_first_run(dir: &Path) {
+    let new = match std::fs::read_dir(dir) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    };
+    if new
+        && let Err(e) = std::fs::create_dir_all(dir).and_then(|()| {
+            std::fs::write(dir.join(FIRST_RUN_FILE), "setup has not finished\n")
+        })
+    {
+        // Not a first run then, as far as anyone can tell: nothing is written for the person.
+        river_app::diag!("river: couldn't note the first run: {e}");
+    }
+}
+
 /// The desktop's answer to the settings dialog.
 pub struct DesktopBackground {
     dir: Option<PathBuf>,
@@ -189,6 +212,7 @@ impl DesktopBackground {
     /// Read the saved choice into the running app's.
     pub fn new(dir: Option<PathBuf>) -> Self {
         if let Some(d) = &dir {
+            note_first_run(d);
             CLOSE_TO_TRAY.store(load(d), Ordering::Release);
             TOLD.store(load_told(d), Ordering::Release);
             let _ = CONFIG_DIR.set(d.clone());
@@ -239,6 +263,23 @@ impl BackgroundHost for DesktopBackground {
             None => Err("This computer has no place for River's login item.".into()),
         }
     }
+
+    fn first_run(&self) -> bool {
+        self.login.is_some()
+            && self
+                .dir
+                .as_ref()
+                .is_some_and(|d| d.join(FIRST_RUN_FILE).exists())
+    }
+
+    fn first_run_done(&self) {
+        if let Some(d) = &self.dir
+            && let Err(e) = std::fs::remove_file(d.join(FIRST_RUN_FILE))
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            river_app::diag!("river: couldn't clear the first-run note: {e}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -257,6 +298,45 @@ mod tests {
         assert!(hide < quit);
         assert!(body[hide..quit].contains("s.focus_changed(false)"));
         assert!(body[quit..].starts_with("Close::Quit => tx.quit()"));
+    }
+
+    #[test]
+    fn only_a_missing_or_empty_config_directory_is_a_first_run() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("new");
+        note_first_run(&missing);
+        assert!(missing.join(FIRST_RUN_FILE).exists(), "a missing directory");
+        let empty = root.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        note_first_run(&empty);
+        assert!(empty.join(FIRST_RUN_FILE).exists(), "an empty directory");
+        // An earlier run left its lock file: not a first run, whatever else is missing.
+        let old = root.path().join("old");
+        std::fs::create_dir(&old).unwrap();
+        std::fs::write(old.join("river.lock"), "").unwrap();
+        note_first_run(&old);
+        assert!(!old.join(FIRST_RUN_FILE).exists());
+    }
+
+    #[test]
+    fn a_first_run_that_did_not_finish_is_offered_again_and_a_finished_one_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().join("river");
+        let host = DesktopBackground {
+            dir: Some(d.clone()),
+            login: LoginItem::for_this_user(),
+        };
+        note_first_run(&d);
+        assert_eq!(host.first_run(), host.login.is_some());
+        // Started again before setup ended: the marker is the only thing in the directory.
+        note_first_run(&d);
+        assert_eq!(host.first_run(), host.login.is_some());
+        host.first_run_done();
+        assert!(!host.first_run());
+        // The directory now has a file in it from the next start on, but the marker is gone.
+        std::fs::write(d.join("river.lock"), "").unwrap();
+        note_first_run(&d);
+        assert!(!host.first_run());
     }
 
     #[test]
