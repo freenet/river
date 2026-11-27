@@ -49,6 +49,8 @@ The `if: github.event_name == 'push'` conditions on the sign and release jobs ar
 2. `git tag river-desktop-v<version> <main commit> && git push origin river-desktop-v<version>`
 3. Download the draft's assets, check them against `SHA256SUMS.txt`, and run them on a real Mac and a real Windows PC: install Freenet, approve the grant, see rooms, send a message.
 4. Publish the draft with "Set as the latest release" unticked: `gh release edit <tag> --draft=false --latest=false` (API: `make_latest=false`). The workflow cannot enforce this. Every desktop release, from 1.0 on too, stays off "Latest" because riverctl releases hold the repo's "Latest" badge. 0.x versions are prereleases.
+5. Point freenet.org at the new version: bump `$ver` at the top of the chooser section in `hugo-site/themes/freenet/layouts/river/list.html` in freenet/web (one line) and merge it. That page (`https://freenet.org/river/#desktop`) is the stable download link to give people: GitHub's `releases/latest` points at riverctl, and pre-releases are never "Latest". Installed copies update themselves, so this matters for new installs only.
+6. Correct the release notes by hand before publishing if they say something the app no longer does; the text is generated from `release-desktop.yml` and drifts.
 
 To rehearse, run the workflow by hand (`workflow_dispatch`) on any branch. This dry run runs every `verify` check except "the commit is on main", builds, packages and writes the notes header. It does not exercise the secrets check, signing, or the draft-release logic. Those have no rehearsal path other than a real tag, and the draft is what makes a first run safe.
 
