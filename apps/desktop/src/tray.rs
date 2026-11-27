@@ -7,6 +7,7 @@
 //! [`start`] is called from the app's init there. Both draw the unread count on the icon, say it
 //! and the connection in the tooltip, and toggle the window on a left click.
 
+#[cfg(any(test, not(target_os = "macos")))]
 use std::time::{Duration, Instant};
 
 use river_app::RiverApp;
@@ -97,6 +98,7 @@ pub fn tooltip(view: View) -> String {
     text
 }
 
+#[cfg(any(test, not(target_os = "macos")))]
 /// What the tray does with a left click.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Toggle {
@@ -104,6 +106,7 @@ pub enum Toggle {
     Hide,
 }
 
+#[cfg(any(test, not(target_os = "macos")))]
 /// A click hides the window (to the tray, as closing it does) when it is on screen and in
 /// front, and shows it otherwise: hidden, minimised, or behind another window.
 pub fn toggle_action(visible: bool, in_front: bool) -> Toggle {
@@ -252,6 +255,7 @@ impl Tracker {
     }
 }
 
+#[cfg(any(test, not(target_os = "macos")))]
 /// How soon after the window lost focus a click on the icon still finds it in front. Pressing
 /// a tray icon takes focus from the window on Windows and on some Linux panels before the
 /// click arrives. Where focus is never reported at all, a window the tray (or the start)
@@ -261,6 +265,7 @@ impl Tracker {
 // before the click, is hidden by that click instead of brought forward; the next click shows it.
 const CLICK_GRACE: Duration = Duration::from_millis(500);
 
+#[cfg(any(test, not(target_os = "macos")))]
 /// The window, as the toggle drives it.
 trait Window {
     fn visible(&self) -> bool;
@@ -270,6 +275,7 @@ trait Window {
     fn open(&self);
 }
 
+#[cfg(any(test, not(target_os = "macos")))]
 impl Window for AppHandle<RiverApp> {
     fn visible(&self) -> bool {
         self.is_visible()
@@ -282,6 +288,7 @@ impl Window for AppHandle<RiverApp> {
     }
 }
 
+#[cfg(any(test, not(target_os = "macos")))]
 /// Decide and act on a click, on the UI thread, where the app knows about focus.
 fn apply_toggle(app: &mut RiverApp, window: &impl Window, now: Instant) {
     match toggle_action(window.visible(), app.recently_in_front(now, CLICK_GRACE)) {
@@ -296,6 +303,8 @@ fn apply_toggle(app: &mut RiverApp, window: &impl Window, now: Instant) {
     }
 }
 
+// macOS has no click toggle (its click opens the menu), so nothing calls this there.
+#[cfg(not(target_os = "macos"))]
 /// A click on the icon: hide the window if it is showing and in front, else show it.
 fn toggle(handle: &AppHandle<RiverApp>) {
     let window = handle.clone();
