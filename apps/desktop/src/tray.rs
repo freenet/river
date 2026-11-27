@@ -201,7 +201,10 @@ fn badged(plain: &[u8], count: usize) -> Vec<u8> {
                 }
                 for dy in 0..GLYPH_SCALE {
                     for dx in 0..GLYPH_SCALE {
-                        let (x, y) = (gx + col * GLYPH_SCALE + dx, origin_y + row * GLYPH_SCALE + dy);
+                        let (x, y) = (
+                            gx + col * GLYPH_SCALE + dx,
+                            origin_y + row * GLYPH_SCALE + dy,
+                        );
                         if x < SIDE && y < SIDE {
                             let i = (y * SIDE + x) * 4;
                             out[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
@@ -253,12 +256,14 @@ impl Tracker {
 /// `RiverApp::window_in_front`), so a click hides it.
 fn toggle(handle: &AppHandle<RiverApp>) {
     let h = handle.clone();
-    handle.update(move |app, _| match toggle_action(h.is_visible(), app.window_in_front()) {
-        // `close` is what the close button does: it hides to the tray (or quits when there is
-        // none), through `background::on_close`.
-        Toggle::Hide => h.close(),
-        Toggle::Show => h.open(),
-    });
+    handle.update(
+        move |app, _| match toggle_action(h.is_visible(), app.window_in_front()) {
+            // `close` is what the close button does: it hides to the tray (or quits when there is
+            // none), through `background::on_close`.
+            Toggle::Hide => h.close(),
+            Toggle::Show => h.open(),
+        },
+    );
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -593,7 +598,11 @@ mod tests {
     #[test]
     fn the_tray_hears_the_count_the_title_shows_and_redraws_only_on_a_change() {
         let t = Tracker::default();
-        assert_eq!(t.change(|v| v.unread = 0), None, "0 is what it already shows");
+        assert_eq!(
+            t.change(|v| v.unread = 0),
+            None,
+            "0 is what it already shows"
+        );
         assert_eq!(t.change(|v| v.unread = 3).map(|v| v.unread), Some(3));
         assert_eq!(t.change(|v| v.unread = 3), None, "an unchanged count");
         assert_eq!(t.change(|v| v.unread = 0).map(|v| v.unread), Some(0));
@@ -608,8 +617,14 @@ mod tests {
         assert_eq!(tooltip(v(0, None)), "River");
         assert_eq!(tooltip(v(0, Some(Connection::Connected))), "River");
         assert_eq!(tooltip(v(0, Some(Connection::Example))), "River");
-        assert_eq!(tooltip(v(1, Some(Connection::Connected))), "River: 1 unread");
-        assert_eq!(tooltip(v(3, Some(Connection::Connected))), "River: 3 unread");
+        assert_eq!(
+            tooltip(v(1, Some(Connection::Connected))),
+            "River: 1 unread"
+        );
+        assert_eq!(
+            tooltip(v(3, Some(Connection::Connected))),
+            "River: 3 unread"
+        );
         assert_eq!(tooltip(v(12, None)), "River: 12 unread");
         assert_eq!(
             tooltip(v(0, Some(Connection::Connecting))),
