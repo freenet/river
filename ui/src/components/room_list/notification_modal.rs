@@ -45,12 +45,13 @@ const MODES: [(NotificationMode, &str, &str); 3] = [
 ];
 
 /// Read the current notification mode for `room_vk` from `ROOMS`. An absent
-/// entry means [`NotificationMode::All`] (the default).
+/// entry means the default, [`NotificationMode::MentionsAndReplies`], so the
+/// dialog shows that option selected for a room the user never configured.
 fn current_mode(room_vk: &VerifyingKey) -> NotificationMode {
     ROOMS
         .try_read()
         .ok()
-        .and_then(|rooms| rooms.notification_modes.get(room_vk).copied())
+        .map(|rooms| rooms.notification_mode(room_vk))
         .unwrap_or_default()
 }
 

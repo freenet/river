@@ -4091,12 +4091,18 @@ mod tests {
         rt.use_clipboard(board);
         rt.frame(0.0);
         let rooms = chat::example::data().rooms;
+        // Explicit `All`: these tests count every unread message, and a room with no entry is
+        // mentions and replies only.
+        let modes = rooms
+            .iter()
+            .map(|r| (r.key.clone(), rooms::modes::NotificationMode::All))
+            .collect();
         rt.update(move |s, tx| {
             s.apply_rooms(
                 RoomsUpdate::Rooms {
                     rooms,
                     open: None,
-                    modes: Default::default(),
+                    modes,
                     settled: Vec::new(),
                     status: chat::LinkStatus::Live,
                     now: 29_000_000,

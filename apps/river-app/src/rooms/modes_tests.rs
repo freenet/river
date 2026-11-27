@@ -227,5 +227,8 @@ fn the_web_uis_labels_and_help() {
             ("Muted", "Never notify for this room."),
         ]
     );
-    assert_eq!(NotificationMode::default(), NotificationMode::All);
+    assert_eq!(
+        NotificationMode::default(),
+        NotificationMode::MentionsAndReplies
+    );
 }

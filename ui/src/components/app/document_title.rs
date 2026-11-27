@@ -633,7 +633,7 @@ type NotificationModes =
 /// `exclude` (`None` excludes nothing — the document-title total).
 ///
 /// Each room contributes [`count_unread_in_room_data_with_mode`] under its
-/// entry in `modes` (absent = `All`, the same default the notification
+/// entry in `modes` (absent = the default, `MentionsAndReplies`, the same the notification
 /// gate uses), so every unread surface sums identical per-room values
 /// (freenet/river#500).
 ///
@@ -658,7 +658,7 @@ pub fn count_unread_excluding_room(
 }
 
 /// One room's mode-aware unread count: [`count_unread_in_room_data_with_mode`]
-/// under its entry in `modes` (absent = `All`), the per-room value every total
+/// under its entry in `modes` (absent = the default), the per-room value every total
 /// above sums. 0 for a key not in `map`. Same caveat about the mention memo as
 /// [`count_unread_excluding_room`].
 ///
@@ -669,7 +669,7 @@ pub fn count_unread_in_room(
     owner_key: &ed25519_dalek::VerifyingKey,
 ) -> usize {
     map.get(owner_key).map_or(0, |room_data| {
-        let mode = modes.get(owner_key).copied().unwrap_or_default();
+        let mode = crate::room_data::notification_mode_in(modes, owner_key);
         count_unread_in_room_data_with_mode(room_data, mode)
     })
 }
@@ -709,11 +709,7 @@ pub fn count_unread_in_current_room() -> CurrentRoomUnread {
     };
     CurrentRoomUnread {
         count: count_unread_in_room(&rooms.map, &rooms.notification_modes, &current),
-        is_mentions: rooms
-            .notification_modes
-            .get(&current)
-            .copied()
-            .unwrap_or_default()
+        is_mentions: rooms.notification_mode(&current)
             == crate::room_data::NotificationMode::MentionsAndReplies,
     }
 }
@@ -1563,7 +1559,7 @@ mod tests {
 
     #[test]
     fn all_mode_matches_the_plain_count() {
-        // `All` (the default) must be exactly the historical behaviour —
+        // `All` must be exactly the pre-modes behaviour —
         // the same value `count_unread_in_room_data` returns.
         let (self_sk, _) = keypair();
         let (owner_sk, owner_vk) = keypair();
@@ -2088,7 +2084,7 @@ mod tests {
         // room-list badge shows, so every surface agrees.
         let (self_sk, self_vk) = keypair();
         let self_id: MemberId = (&self_vk).into();
-        let (owner_a_sk, owner_a_vk) = keypair(); // All (default): 2 unread
+        let (owner_a_sk, owner_a_vk) = keypair(); // explicit All: 2 unread
         let (owner_b_sk, owner_b_vk) = keypair(); // MentionsAndReplies: 1 of 3 qualifies
         let (owner_c_sk, owner_c_vk) = keypair(); // Muted: 5 unread, counts 0
 
@@ -2123,7 +2119,9 @@ mod tests {
         map.insert(owner_c_vk, room_c);
 
         let mut modes = HashMap::new();
-        // Room A has no entry → defaults to All, like the notification gate.
+        // Room A is an explicit All (only a stored entry gives All now that
+        // the default is MentionsAndReplies).
+        modes.insert(owner_a_vk, NotificationMode::All);
         modes.insert(owner_b_vk, NotificationMode::MentionsAndReplies);
         modes.insert(owner_c_vk, NotificationMode::Muted);
 
@@ -2153,6 +2151,35 @@ mod tests {
             count_unread_excluding_room(&map, &modes, Some(&owner_c_vk)),
             3
         );
+    }
+
+    #[test]
+    fn a_room_with_no_entry_counts_only_mentions_and_replies() {
+        let (self_sk, self_vk) = keypair();
+        let self_id: MemberId = (&self_vk).into();
+        let (owner_sk, owner_vk) = keypair();
+        let r = room(
+            self_sk,
+            owner_vk,
+            vec![
+                msg(&owner_sk, &owner_vk, 1),
+                mention_msg(&owner_sk, &owner_vk, 2, self_id),
+                msg(&owner_sk, &owner_vk, 3),
+            ],
+            None,
+        );
+        let map = HashMap::from([(owner_vk, r)]);
+
+        // No entry: only the mention counts.
+        let mut modes = HashMap::new();
+        assert_eq!(count_unread_in_room(&map, &modes, &owner_vk), 1);
+        assert_eq!(count_unread_excluding_room(&map, &modes, None), 1);
+        // An explicit All still counts everything.
+        modes.insert(owner_vk, NotificationMode::All);
+        assert_eq!(count_unread_in_room(&map, &modes, &owner_vk), 3);
+        // Muted counts nothing.
+        modes.insert(owner_vk, NotificationMode::Muted);
+        assert_eq!(count_unread_in_room(&map, &modes, &owner_vk), 0);
     }
 
     /// Build a direct message. The counters never verify signatures, so

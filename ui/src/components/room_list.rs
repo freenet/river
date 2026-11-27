@@ -355,11 +355,7 @@ pub fn RoomList() -> Element {
                 // `count_unread_in_room_data_with_mode`, which is what keeps
                 // this memo affordable on every ROOMS write — see that
                 // function's docs before removing the memo.
-                let mode = rooms
-                    .notification_modes
-                    .get(&room_key)
-                    .copied()
-                    .unwrap_or_default();
+                let mode = rooms.notification_mode(&room_key);
                 // The open room's Latest button offers its unread messages
                 // while the chat shows, so its row badges none.
                 let unread = if is_current && !chat_hidden {

@@ -534,6 +534,9 @@ fn node_rooms(edit: impl FnOnce(&mut Vec<super::Room>)) -> Runtime<RiverApp> {
     s.chat.set_window_front(true);
     let mut rooms = super::example::data().rooms;
     edit(&mut rooms);
+    // Explicit `All`: a room with no entry is mentions and replies only, and these tests
+    // look at unread badges and counts of every message.
+    s.chat.notify_all_in(&rooms);
     s.chat
         .show_node_rooms(rooms, None, super::LinkStatus::Live, 29_000_000);
     render(s, WINDOW_SIZE)
@@ -2327,7 +2330,7 @@ fn the_bell_opens_the_dialog_with_the_three_modes_and_the_current_one_checked() 
         &rt,
         "Applies to this room and syncs across your devices."
     ));
-    // The default is checked: exactly the first radio.
+    // The default, mentions and replies only, is checked: exactly the second radio.
     let checked: Vec<bool> = (0..3)
         .map(|i| {
             rt.elements()
@@ -2337,7 +2340,7 @@ fn the_bell_opens_the_dialog_with_the_three_modes_and_the_current_one_checked() 
                 .expect("a radio row")
         })
         .collect();
-    assert_eq!(checked, [true, false, false]);
+    assert_eq!(checked, [false, true, false]);
 }
 
 #[test]
