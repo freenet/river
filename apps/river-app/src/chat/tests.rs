@@ -6037,6 +6037,121 @@ fn the_room_details_buttons_stay_inside_the_window_when_the_footer_grows() {
     }
 }
 
+/// The window sizes every dialog must fit: the scene window, the narrow layout and the app's
+/// minimum size (`min_size` in `lib.rs`).
+const DIALOG_FIT_SIZES: [(f32, f32); 3] = [WINDOW_SIZE, NARROW_SCENE_SIZE, (640.0, 480.0)];
+
+fn button_spans_outside(
+    rt: &Runtime<RiverApp>,
+    what: &str,
+    size: (f32, f32),
+    keys: &[&str],
+    bad: &mut Vec<String>,
+) {
+    for key in keys {
+        let [_, y, _, h] = rect_of(rt, key);
+        if !(y >= 0.0 && y + h <= size.1) {
+            bad.push(format!("{what} at {size:?}: {key} spans {y}..{}", y + h));
+        }
+    }
+}
+
+/// The footer buttons of the dialogs whose scenes are listed in `FIT_SCENE_PREFIXES`.
+const FIT_BUTTON_KEYS: &[&str] = &[
+    "ns-close",
+    "ns-copy",
+    "node-cancel",
+    "node-back",
+    "node-connect",
+    "node-confirm",
+    "member-ban-cancel",
+    "member-ban-confirm-yes",
+    "member-deputy-cancel",
+    "member-deputy-confirm",
+    "dm-purge-cancel",
+    "dm-purge-confirm",
+    "dm-invite-cancel",
+    "dm-invite-send",
+];
+
+/// Scenes (by name prefix) showing dialogs that hold variable-length content.
+const FIT_SCENE_PREFIXES: &[&str] = &[
+    "chat-node-status",
+    "chat-node-change",
+    "chat-dm-purge",
+    "chat-dm-invite-picker",
+    "chat-ban",
+    "chat-deputy",
+    "chat-revoke-deputy",
+    "chat-member-modal",
+    "not-installed-node",
+];
+
+/// Rune bounds a dialog by the window, so a dialog whose variable-length part is not in a
+/// shrinking scroll view loses its footer buttons off the bottom. Every scaffold dialog's
+/// buttons stay inside the window at the three sizes.
+#[test]
+fn every_scaffold_dialog_keeps_its_buttons_inside_the_window() {
+    let mut bad = Vec::new();
+    let mut checked = 0;
+    let scenes = SCENES
+        .iter()
+        .filter(|(name, _)| FIT_SCENE_PREFIXES.iter().any(|p| name.starts_with(p)));
+    for (scene, apply) in scenes {
+        for size in DIALOG_FIT_SIZES {
+            let mut state = RiverApp::detached();
+            apply(&mut state);
+            let rt = render(state, size);
+            let present: Vec<&str> = FIT_BUTTON_KEYS
+                .iter()
+                .copied()
+                .filter(|k| {
+                    rt.elements()
+                        .iter()
+                        .any(|e| e.key.as_deref() == Some(k) && !e.exiting)
+                })
+                .collect();
+            checked += present.len();
+            button_spans_outside(&rt, scene, size, &present, &mut bad);
+        }
+    }
+    assert!(checked > 100, "only {checked} buttons found");
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// The invite picker lists one row per candidate room; with 20 of them the note field and the
+/// buttons must still be inside the window.
+#[test]
+fn the_dm_picker_with_many_rooms_keeps_its_buttons_inside_the_window() {
+    let mut bad = Vec::new();
+    for size in DIALOG_FIT_SIZES {
+        let (_, apply) = SCENES
+            .iter()
+            .find(|(name, _)| *name == "chat-dm-invite-picker")
+            .expect("scene");
+        let mut state = RiverApp::detached();
+        apply(&mut state);
+        state.chat.edit_rooms(|rooms| {
+            let template = rooms[0].clone();
+            for i in 0..20 {
+                let mut r = template.clone();
+                r.key = format!("extra-room-{i}");
+                r.name = format!("Extra room number {i}");
+                rooms.push(r);
+            }
+        });
+        let rt = render(state, size);
+        button_spans_outside(
+            &rt,
+            "dm picker with 20 rooms",
+            size,
+            &["dm-invite-cancel", "dm-invite-send"],
+            &mut bad,
+        );
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
 fn focused_key(rt: &Runtime<RiverApp>) -> Option<String> {
     rt.elements()
         .into_iter()

@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 
 use rune::{El, col, el, icon, row};
-use rune_kit::{Button, ButtonVariant, Kit, TextInput};
+use rune_kit::{Button, ButtonVariant, Kit, ScrollBar, TextInput};
 
 use super::conversation::avatar;
 use super::dialog_kit::{self as dk, DialogSpec, NoticeKind, copy_field, notice};
@@ -891,6 +891,7 @@ pub(super) fn member_modal(chat: &Chat, room: &Room, uid: &str, k: &Kit, layer: 
             .key("member-dm-ambiguous"),
         );
     }
+    let mut pinned: Vec<El> = Vec::new();
     if !is_me && !shared {
         match room.ban_offers.get(uid) {
             // As the web UI's `ban-withheld-reason`: owed to one who would otherwise have had Ban.
@@ -903,20 +904,31 @@ pub(super) fn member_modal(chat: &Chat, room: &Room, uid: &str, k: &Kit, layer: 
                 );
             }
             Some(BanOffer::Allowed) if chat.ban_confirm.as_deref() == Some(uid) => {
-                body = body.child(ban_confirmation(chat, room, m, &by_id, &p, k));
+                pinned.push(ban_confirmation(chat, room, m, &by_id, &p, k));
             }
             _ => {}
         }
     }
     if let Some((offer, why_not)) = chat.deputy_offer().filter(|_| !is_me && !shared) {
-        body = body.child(deputy_block(chat, room, m, offer, why_not, &p, k));
+        pinned.push(deputy_block(chat, room, m, offer, why_not, &p, k));
     }
 
+    // The member's details scroll when the window is short. The ban confirmation and the deputy
+    // block have the buttons that act on them, so they stay below the scroll, in view.
+    let details = body
+        .scroll(rune::ScrollSpec {
+            stick_bottom: false,
+        })
+        .shrink()
+        .min_h(0.0)
+        .scroll_edge_fade(24.0)
+        .scroll_bar(k);
     DialogSpec::new("member-info", "Member info", |s: &mut RiverApp| {
         s.chat.close_member()
     })
     .body_key("member-info-body")
     .width(440.0)
-    .child(body)
+    .child(details)
+    .children(pinned)
     .build(k, layer);
 }
