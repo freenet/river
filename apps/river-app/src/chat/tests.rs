@@ -5991,6 +5991,43 @@ fn scene_runtime(scene: &str) -> Runtime<RiverApp> {
     render(state, scene_size(scene))
 }
 
+/// Rune bounds a dialog by the window (less a 16 pt margin). A room-details footer that grows
+/// (the owner's leave warning, the warning before lowering a limit) takes its height from the
+/// scrolling fields, so the buttons stay inside the window instead of being cut off at its
+/// bottom edge.
+#[test]
+fn the_room_details_buttons_stay_inside_the_window_when_the_footer_grows() {
+    for (scene, keys) in [
+        (
+            "chat-room-leave-owner",
+            ["details-leave-cancel", "details-leave-confirm"],
+        ),
+        (
+            "chat-room-leave-member",
+            ["details-leave-cancel", "details-leave-confirm"],
+        ),
+        (
+            "chat-room-details-confirm",
+            ["details-back", "details-confirm-save"],
+        ),
+        (
+            "chat-room-details-editing",
+            ["details-cancel", "details-save"],
+        ),
+    ] {
+        let rt = scene_runtime(scene);
+        let (_, win_h) = scene_size(scene);
+        for key in keys {
+            let [_, y, _, h] = rect_of(&rt, key);
+            assert!(
+                y >= 0.0 && y + h <= win_h,
+                "{scene}: {key} spans {y}..{} in a window {win_h} high",
+                y + h
+            );
+        }
+    }
+}
+
 fn focused_key(rt: &Runtime<RiverApp>) -> Option<String> {
     rt.elements()
         .into_iter()
