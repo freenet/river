@@ -14,6 +14,15 @@ fn connected() -> RiverApp {
     s
 }
 
+/// `connected`, with every example room an explicit `All`, for tests that count every unread
+/// message (a room with no entry is mentions and replies only).
+fn connected_all() -> RiverApp {
+    let mut s = connected();
+    let rooms = s.chat.rooms().to_vec();
+    s.chat.notify_all_in(&rooms);
+    s
+}
+
 fn render(state: RiverApp, size: (f32, f32)) -> Runtime<RiverApp> {
     let env = Env {
         system_dark: true,
@@ -141,7 +150,7 @@ fn selecting_a_room_opens_its_conversation() {
 
 #[test]
 fn only_the_open_room_loses_its_unread_badge() {
-    let mut rt = render(connected(), WINDOW_SIZE);
+    let mut rt = render(connected_all(), WINDOW_SIZE);
     let badge = |room: &str| format!("room-{room}/unread");
     assert!(rt.find(&badge(PRIVATE_ROOM)).is_some());
     assert!(rt.find(&badge("rust-help")).is_some());
@@ -2439,7 +2448,7 @@ fn the_dialog_has_no_master_switch_note() {
 
 #[test]
 fn a_muted_room_shows_no_unread_count_in_the_list() {
-    let mut rt = render(connected(), WINDOW_SIZE);
+    let mut rt = render(connected_all(), WINDOW_SIZE);
     // Design Crew and Rust Help each have two unread.
     assert!(rt.find("room-rust-help").is_some());
     let badges = |rt: &Runtime<RiverApp>| {
@@ -2481,14 +2490,14 @@ fn a_mode_picked_here_survives_an_older_update_until_the_node_echoes_it() {
 fn a_failed_or_dismissed_save_reverts_the_display_and_a_stored_one_follows_the_store() {
     let room = "rust-help".to_owned();
     let settled = [room.clone()];
-    // Failed: the node settles it with the mode the store still holds (none: All).
+    // Failed: the node settles it with the mode the store still holds (none: the default).
     let mut s = node_chat();
     s.chat.set_mode(&room, NotificationMode::Muted);
     s.chat.apply_modes(Default::default(), &settled);
-    assert_eq!(s.chat.mode_of(&room), NotificationMode::All);
+    assert_eq!(s.chat.mode_of(&room), NotificationMode::default());
     // It does not come back with a later update either.
     s.chat.apply_modes(Default::default(), &[]);
-    assert_eq!(s.chat.mode_of(&room), NotificationMode::All);
+    assert_eq!(s.chat.mode_of(&room), NotificationMode::default());
 
     // Stored, then a web tab reverts the store: the display follows the store.
     s.chat.set_mode(&room, NotificationMode::Muted);
@@ -2496,12 +2505,12 @@ fn a_failed_or_dismissed_save_reverts_the_display_and_a_stored_one_follows_the_s
         .apply_modes([(room.clone(), NotificationMode::Muted)].into(), &settled);
     assert_eq!(s.chat.mode_of(&room), NotificationMode::Muted);
     s.chat.apply_modes(Default::default(), &[]);
-    assert_eq!(s.chat.mode_of(&room), NotificationMode::All);
+    assert_eq!(s.chat.mode_of(&room), NotificationMode::default());
 
     // Stored, and the update that settles it still carries the old mode: the node's word wins.
     s.chat.set_mode(&room, NotificationMode::Muted);
     s.chat.apply_modes(Default::default(), &settled);
-    assert_eq!(s.chat.mode_of(&room), NotificationMode::All);
+    assert_eq!(s.chat.mode_of(&room), NotificationMode::default());
 }
 
 // The room details dialog ----------------------------------------------------------------------

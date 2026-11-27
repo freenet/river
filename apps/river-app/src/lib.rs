@@ -6099,14 +6099,25 @@ mod tests {
                 r.messages = template;
             }
         }
+        // Every room an explicit `All` but Family, which is muted: a room with no entry is
+        // mentions and replies only, and the overview counts every unread message.
+        let modes = rooms
+            .iter()
+            .map(|r| {
+                let mode = if r.key == "family" {
+                    rooms::modes::NotificationMode::Muted
+                } else {
+                    rooms::modes::NotificationMode::All
+                };
+                (r.key.clone(), mode)
+            })
+            .collect();
         rt.update(move |s, tx| {
             s.apply_rooms(
                 RoomsUpdate::Rooms {
                     rooms,
                     open: None,
-                    modes: [("family".to_owned(), rooms::modes::NotificationMode::Muted)]
-                        .into_iter()
-                        .collect(),
+                    modes,
                     settled: Vec::new(),
                     status: chat::LinkStatus::Live,
                     now: 29_000_001,
