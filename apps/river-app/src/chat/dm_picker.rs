@@ -389,6 +389,7 @@ pub(super) fn dialog(chat: &Chat, k: &Kit, layer: &mut Vec<El>) {
             })
             .shrink()
             .min_h(0.0)
+            .scroll_edge_fade(24.0)
             .scroll_bar(k),
         );
     }

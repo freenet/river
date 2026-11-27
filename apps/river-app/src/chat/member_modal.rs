@@ -921,6 +921,7 @@ pub(super) fn member_modal(chat: &Chat, room: &Room, uid: &str, k: &Kit, layer: 
         })
         .shrink()
         .min_h(0.0)
+        .scroll_edge_fade(24.0)
         .scroll_bar(k);
     DialogSpec::new("member-info", "Member info", |s: &mut RiverApp| {
         s.chat.close_member()
