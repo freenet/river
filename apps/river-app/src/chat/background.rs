@@ -35,6 +35,17 @@ pub trait BackgroundHost: Send + Sync + 'static {
 
     /// Turn the login item on or off, for this user only.
     fn set_start_at_login(&self, on: bool) -> Result<(), String>;
+
+    /// Whether this is River's first run on this computer: the setup screen then offers to
+    /// start River at login, ticked. False for anyone who has run River before, so their login
+    /// item is never written for them.
+    fn first_run(&self) -> bool {
+        false
+    }
+
+    /// The first run's setup is over: [`first_run`](BackgroundHost::first_run) is false from
+    /// now on, in this run and the next.
+    fn first_run_done(&self) {}
 }
 
 /// The section and what it shows.
@@ -48,6 +59,9 @@ pub struct BackgroundUi {
     pub start_at_login: bool,
     /// Why the last change did not happen.
     pub error: Option<String>,
+    /// During the first run's setup, whether "Start River when I log in" is ticked on the setup
+    /// screen: `Some(true)` at first, `None` once setup is over or when it is not a first run.
+    pub first_run_login: Option<bool>,
 }
 
 impl BackgroundUi {
@@ -59,7 +73,9 @@ impl BackgroundUi {
             close_to_tray: false,
             start_at_login: false,
             error: None,
+            first_run_login: None,
         };
+        ui.first_run_login = ui.host.first_run().then_some(true);
         ui.refresh();
         ui
     }
@@ -100,6 +116,34 @@ impl super::Chat {
             b.error = b.host.set_close_to_tray(want).err();
             b.refresh();
         }
+    }
+
+    /// Flip the setup screen's "Start River when I log in" box. Writes nothing yet.
+    pub fn toggle_first_run_login(&mut self) {
+        if let Some(b) = &mut self.background
+            && let Some(on) = &mut b.first_run_login
+        {
+            *on = !*on;
+        }
+    }
+
+    /// Setup is over (the node answered): on a first run, write the login item if the box is
+    /// still ticked, and never offer it again. Does nothing when it is not a first run.
+    pub fn finish_first_run(&mut self) {
+        if let Some(b) = &mut self.background
+            && let Some(on) = b.first_run_login.take()
+        {
+            if on {
+                b.error = b.host.set_start_at_login(true).err();
+            }
+            b.host.first_run_done();
+            b.refresh();
+        }
+    }
+
+    /// Whether River starts at login, as last read; `None` without a shell that offers it.
+    pub fn start_at_login(&self) -> Option<bool> {
+        self.background.as_ref().map(|b| b.start_at_login)
     }
 
     /// Flip "Start River when I log in".

@@ -13,6 +13,8 @@ mod keys_ui_tests;
 pub mod node;
 #[cfg(test)]
 mod node_ui_tests;
+#[cfg(test)]
+mod tray_menu_tests;
 pub mod notify;
 mod notify_actions;
 pub mod rooms;
@@ -91,6 +93,8 @@ pub struct RiverApp {
     reported_unread: Option<usize>,
     /// The connection state last given to the notifier, so it hears only changes.
     reported_connection: Option<chat::node_status::Connection>,
+    /// The tray menu's contents last given to the notifier, so it hears only changes.
+    reported_menu: Option<notify::TrayMenu>,
     /// The number of the node in use ([`rooms::Link::generation`]). What a node the app has left
     /// still delivers carries an older number and is dropped.
     node_generation: u64,
@@ -216,6 +220,7 @@ impl RiverApp {
             missed: Default::default(),
             reported_unread: None,
             reported_connection: None,
+            reported_menu: None,
             limiter: Default::default(),
             dnd_persist: false,
             pending_notice: None,
@@ -301,6 +306,7 @@ impl RiverApp {
             missed: Default::default(),
             reported_unread: None,
             reported_connection: None,
+            reported_menu: None,
             limiter: Default::default(),
             dnd_persist: true,
             pending_notice: None,
@@ -749,6 +755,7 @@ impl RiverApp {
             self.reported_connection = Some(connection);
             self.notifier.set_connection(connection);
         }
+        self.sync_tray_menu();
         if !matches!(self.chat.source, chat::Source::Node(_)) {
             return;
         }
@@ -763,6 +770,51 @@ impl RiverApp {
             self.reported_unread = Some(unread);
             self.notifier.set_unread(unread);
         }
+    }
+
+    /// What the tray menu lists besides the connection and the total.
+    pub fn tray_menu(&self) -> notify::TrayMenu {
+        let listed = matches!(self.chat.source, chat::Source::Node(_));
+        notify::TrayMenu {
+            unread_rooms: if listed {
+                self.chat.unread_rooms(notify::TRAY_UNREAD_ROOMS)
+            } else {
+                Vec::new()
+            },
+            dnd: self.chat.dnd.active(),
+            update_ready: self.chat.update.ready().is_some(),
+            start_at_login: self.chat.start_at_login(),
+        }
+    }
+
+    /// Tell the notifier the tray menu's contents when they changed.
+    fn sync_tray_menu(&mut self) {
+        let menu = self.tray_menu();
+        if self.reported_menu.as_ref() != Some(&menu) {
+            self.reported_menu = Some(menu.clone());
+            self.notifier.set_menu(menu);
+        }
+    }
+
+    /// The tray's "Mark all as read": the rooms the tray lists (those that count), as the
+    /// overview's button does.
+    pub fn tray_mark_all_read(&mut self) {
+        self.mark_everything_read();
+    }
+
+    /// The tray's "Do not disturb": flips the switch Settings has. When only the daily
+    /// schedule has it on, flipping the switch would change nothing visible, so this opens the
+    /// settings where the schedule can be changed and returns true: the caller shows the window.
+    pub fn tray_toggle_dnd(&mut self) -> bool {
+        self.refresh_dnd_clock();
+        let to_settings = !self.chat.dnd.settings.manual && self.chat.dnd.active();
+        self.chat.quick_dnd();
+        to_settings
+    }
+
+    /// The tray's "Start River when I log in": the Settings switch.
+    pub fn tray_toggle_start_at_login(&mut self) {
+        self.chat.toggle_start_at_login();
     }
 
     /// Keep the node status dialog current while it is open. Does nothing, and schedules
@@ -834,6 +886,10 @@ impl RiverApp {
             u.host().confirm_started();
         }
         self.setup = setup;
+        if connected {
+            // Setup is over: a first run's ticked box writes the login item now.
+            self.chat.finish_first_run();
+        }
         // The node answered as Freenet: now the address is worth remembering.
         if connected
             && let Some(choice) = self.pending_save.take()
@@ -1064,6 +1120,7 @@ impl RiverApp {
         self.limiter = Default::default();
         self.reported_unread = None;
         self.reported_connection = None;
+        self.reported_menu = None;
         if let Some(ctl) = &self.ctl {
             ctl.check();
         }
@@ -3333,8 +3390,14 @@ fn screen(s: &RiverApp, cx: &mut Cx<RiverApp>) -> El {
     // Before the rooms show, the node status says why River is not connected yet.
     let mut layer = Vec::new();
     chat::node_status::dialog(&s.chat, &k, &mut layer);
+    // A first run offers to start River at login, ticked; the box writes nothing until setup ends.
+    let root = root.child(body);
+    let root = match s.chat.background.as_ref().and_then(|b| b.first_run_login) {
+        Some(on) => root.child(first_run_login_box(on, &k)),
+        None => root,
+    };
     rune_kit::root(
-        root.child(body).child(
+        root.child(
             Button::new("Node status")
                 .variant(ButtonVariant::Ghost)
                 .on_press(|s: &mut RiverApp| s.chat.status.open())
@@ -3342,6 +3405,18 @@ fn screen(s: &RiverApp, cx: &mut Cx<RiverApp>) -> El {
                 .key("node-status-open"),
         ),
         layer,
+    )
+}
+
+/// The first run's "Start River when I log in", under the setup card.
+fn first_run_login_box(on: bool, k: &Kit) -> El {
+    row().key("first-run-login-row").w(PANEL_W + 64.0).child(
+        rune_kit::Checkbox::new(on)
+            .label("Start River when I log in")
+            .description("Applied when setup finishes. You can change it in Settings.")
+            .on_toggle(|s: &mut RiverApp| s.chat.toggle_first_run_login())
+            .build(k)
+            .key("first-run-login"),
     )
 }
 
