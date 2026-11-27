@@ -193,9 +193,8 @@ fn note_first_run(dir: &Path) {
         Err(e) => e.kind() == std::io::ErrorKind::NotFound,
     };
     if new
-        && let Err(e) = std::fs::create_dir_all(dir).and_then(|()| {
-            std::fs::write(dir.join(FIRST_RUN_FILE), "setup has not finished\n")
-        })
+        && let Err(e) = std::fs::create_dir_all(dir)
+            .and_then(|()| std::fs::write(dir.join(FIRST_RUN_FILE), "setup has not finished\n"))
     {
         // Not a first run then, as far as anyone can tell: nothing is written for the person.
         river_app::diag!("river: couldn't note the first run: {e}");

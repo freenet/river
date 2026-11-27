@@ -135,7 +135,9 @@ pub fn menu_model(view: &View) -> Vec<Entry> {
     };
     let m = &view.menu;
     let mut out = vec![Entry::Status(
-        view.connection.map_or("Connecting", Connection::text).to_owned(),
+        view.connection
+            .map_or("Connecting", Connection::text)
+            .to_owned(),
     )];
     if !m.unread_rooms.is_empty() {
         for r in &m.unread_rooms {
@@ -1127,11 +1129,23 @@ mod tests {
         let l = labels(&v);
         assert_eq!(
             l[..5],
-            ["status:Connected", "Alpha (3)", "Beta (12)", "Mark all as read", "---"]
+            [
+                "status:Connected",
+                "Alpha (3)",
+                "Beta (12)",
+                "Mark all as read",
+                "---"
+            ]
         );
         let m = menu_model(&v);
         assert!(matches!(&m[1], Entry::Item { action: Action::OpenRoom(k), .. } if k == "a"));
-        assert!(matches!(&m[3], Entry::Item { action: Action::MarkAllRead, .. }));
+        assert!(matches!(
+            &m[3],
+            Entry::Item {
+                action: Action::MarkAllRead,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1180,7 +1194,10 @@ mod tests {
             let mut v = live();
             v.connection = Some(c);
             assert_eq!(labels(&v)[0], format!("status:{}", c.text()));
-            assert!(tooltip(&v).contains(c.text()), "same wording as the tooltip");
+            assert!(
+                tooltip(&v).contains(c.text()),
+                "same wording as the tooltip"
+            );
         }
         let mut v = live();
         v.connection = None;

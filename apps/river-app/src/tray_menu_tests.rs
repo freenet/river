@@ -176,7 +176,11 @@ fn the_notifier_hears_the_menu_only_when_it_changes() {
     let mut s = app_with(rooms(2, 1)).with_notifier(Box::new(rec.clone()));
     s.sync_tray_menu();
     s.sync_tray_menu();
-    assert_eq!(rec.menus.borrow().len(), 1, "an unchanged menu is not resent");
+    assert_eq!(
+        rec.menus.borrow().len(),
+        1,
+        "an unchanged menu is not resent"
+    );
     s.tray_mark_all_read();
     s.sync_tray_menu();
     s.sync_tray_menu();
@@ -241,8 +245,14 @@ fn connected(s: &mut RiverApp) {
 fn a_first_run_is_ticked_and_completing_setup_turns_the_login_item_on() {
     let host = Host::new(true);
     let mut s = RiverApp::detached().with_background(host.clone());
-    assert_eq!(s.chat.background.as_ref().unwrap().first_run_login, Some(true));
-    assert!(host.calls().is_empty(), "nothing is written before setup ends");
+    assert_eq!(
+        s.chat.background.as_ref().unwrap().first_run_login,
+        Some(true)
+    );
+    assert!(
+        host.calls().is_empty(),
+        "nothing is written before setup ends"
+    );
     connected(&mut s);
     assert_eq!(host.calls(), ["login true", "done"]);
     assert_eq!(s.chat.background.as_ref().unwrap().first_run_login, None);
@@ -257,9 +267,16 @@ fn unticking_on_the_setup_screen_writes_nothing() {
     let host = Host::new(true);
     let mut s = RiverApp::detached().with_background(host.clone());
     s.chat.toggle_first_run_login();
-    assert_eq!(s.chat.background.as_ref().unwrap().first_run_login, Some(false));
+    assert_eq!(
+        s.chat.background.as_ref().unwrap().first_run_login,
+        Some(false)
+    );
     connected(&mut s);
-    assert_eq!(host.calls(), ["done"], "no login item, and not offered again");
+    assert_eq!(
+        host.calls(),
+        ["done"],
+        "no login item, and not offered again"
+    );
     assert_eq!(s.tray_menu().start_at_login, Some(false));
 }
 

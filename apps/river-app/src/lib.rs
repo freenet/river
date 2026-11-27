@@ -13,13 +13,13 @@ mod keys_ui_tests;
 pub mod node;
 #[cfg(test)]
 mod node_ui_tests;
-#[cfg(test)]
-mod tray_menu_tests;
 pub mod notify;
 mod notify_actions;
 pub mod rooms;
 pub mod setup;
 pub mod signed_time;
+#[cfg(test)]
+mod tray_menu_tests;
 pub mod update;
 
 /// Where the web UI's code, copied verbatim into `chat/visual_fold.rs`, finds its neighbours.
@@ -1332,6 +1332,30 @@ impl chat::BackgroundHost for PreviewBackground {
     }
 }
 
+/// A shell on a first run: the setup screen offers "Start River when I log in", ticked.
+struct PreviewFirstRun;
+
+impl chat::BackgroundHost for PreviewFirstRun {
+    fn tray_available(&self) -> bool {
+        true
+    }
+    fn close_to_tray(&self) -> bool {
+        true
+    }
+    fn set_close_to_tray(&self, _: bool) -> Result<(), String> {
+        Ok(())
+    }
+    fn start_at_login(&self) -> bool {
+        false
+    }
+    fn set_start_at_login(&self, _: bool) -> Result<(), String> {
+        Ok(())
+    }
+    fn first_run(&self) -> bool {
+        true
+    }
+}
+
 /// The chat screen with "Node status" open, the link in `link`, after `edit` set what the node
 /// answered and what went wrong.
 fn node_status_scene(
@@ -1590,6 +1614,12 @@ pub type Scene = (&'static str, fn(&mut RiverApp));
 pub const SCENES: &[Scene] = &[
     ("checking", |s| s.setup = Setup::Checking),
     ("not-installed", |s| s.setup = Setup::NotInstalled),
+    ("not-installed-first-run", |s| {
+        s.setup = Setup::NotInstalled;
+        s.chat.background = Some(chat::BackgroundUi::new(std::sync::Arc::new(
+            PreviewFirstRun,
+        )));
+    }),
     ("finding-release", |s| {
         s.setup = Setup::Installing(InstallStep::FindingRelease)
     }),
