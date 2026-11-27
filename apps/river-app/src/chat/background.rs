@@ -181,10 +181,19 @@ pub(super) fn first_run_card(chat: &super::Chat, p: &Palette, k: &Kit) -> Option
             .child(
                 rune_kit::Checkbox::new(on)
                     .label("Start River when I log in")
-                    .description("River starts in the tray. You can change this in Settings.")
                     .on_toggle(|s: &mut RiverApp| s.chat.toggle_first_run_login())
                     .build(k)
                     .key("first-run-login"),
+            )
+            .child(
+                label(
+                    "River starts in the tray. You can change this in Settings.",
+                    st::SMALL,
+                    p.text_muted,
+                )
+                .wrap()
+                .w_full()
+                .key("first-run-note"),
             )
             .child(
                 rune::row().child(

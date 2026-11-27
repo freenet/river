@@ -1638,13 +1638,13 @@ pub type Scene = (&'static str, fn(&mut RiverApp));
 /// One scene per screen. CI renders every one of them.
 pub const SCENES: &[Scene] = &[
     ("checking", |s| s.setup = Setup::Checking),
-    ("not-installed", |s| s.setup = Setup::NotInstalled),
-    ("not-installed-first-run", |s| {
-        s.setup = Setup::NotInstalled;
+    ("chat-first-run", |s| {
+        connect(s);
         s.chat.background = Some(chat::BackgroundUi::new(std::sync::Arc::new(
             PreviewFirstRun,
         )));
     }),
+    ("not-installed", |s| s.setup = Setup::NotInstalled),
     ("finding-release", |s| {
         s.setup = Setup::Installing(InstallStep::FindingRelease)
     }),

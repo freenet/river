@@ -227,6 +227,11 @@ pub fn menu_model(view: &View) -> Vec<Entry> {
 /// choice may not have taken (a login item that could not be written).
 static REDRAW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Whether a menu update draws: when something it shows changed, or a check item was chosen.
+fn redraws(changed: bool, forced: bool) -> bool {
+    changed || forced
+}
+
 /// Do what a chosen item says. Never blocks: the app's work runs on its UI thread.
 fn run(handle: &AppHandle<RiverApp>, action: Action) {
     if action.is_check() {
@@ -457,11 +462,12 @@ impl Tracker {
 
     /// What the menu lists, from `Notifier::set_menu` on the UI thread.
     pub fn set_menu(&self, menu: TrayMenu) {
-        let redraw = REDRAW.swap(false, std::sync::atomic::Ordering::AcqRel);
-        match self.change(|v| v.menu = menu) {
-            Some(view) => refresh(view),
-            None if redraw => refresh(self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()),
-            None => {}
+        let forced = REDRAW.swap(false, std::sync::atomic::Ordering::AcqRel);
+        let changed = self.change(|v| v.menu = menu);
+        if redraws(changed.is_some(), forced) {
+            let view =
+                changed.unwrap_or_else(|| self.0.lock().unwrap_or_else(|e| e.into_inner()).clone());
+            refresh(view);
         }
     }
 
@@ -1401,7 +1407,8 @@ mod tests {
         use std::sync::atomic::Ordering;
         assert!(Action::ToggleDnd.is_check() && Action::ToggleLogin.is_check());
         assert!(!Action::MarkAllRead.is_check() && !Action::Open.is_check());
-        // The tracker alone says nothing changed; the flag is what asks for the redraw.
+        assert!(redraws(false, true) && redraws(true, false));
+        assert!(!redraws(false, false), "nothing changed, nothing chosen");
         let t = Tracker::default();
         assert_eq!(t.change(|v| v.menu = TrayMenu::default()), None);
         REDRAW.store(true, Ordering::Release);
