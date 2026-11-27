@@ -70,11 +70,11 @@ use self::history_scroll::{
 };
 use self::history_scroll::{remember_reading_position, resolve_rendered_range, ReaderPosition};
 use self::history_window::{grown_window, BACKFILL_LEAD_PX, INITIAL_WINDOW_ITEMS};
-pub(crate) use self::markdown::message_to_html;
 use self::markdown::{
     clean_reply_preview, description_to_html, member_names_fingerprint, prune_message_html_cache,
     render_message_html_cached, running_behind_freenet_gateway,
 };
+pub(crate) use self::markdown::{message_to_html, room_description_to_html};
 use self::mobile_message_actions::{MobileActionsEntry, RowTarget};
 use self::mobile_message_sheet::{MobileAction, MobileMessageSheet};
 use self::mobile_surface::MobileSurfaceGuard;
@@ -1217,7 +1217,7 @@ fn NoRoomFooter() -> Element {
 /// font size and fits. Expanded wraps and scrolls
 /// so a long description stays in the header instead of pushing the messages
 /// off the screen (freenet/river#718).
-fn room_description_class(expanded: bool, interactive: bool) -> &'static str {
+pub(crate) fn room_description_class(expanded: bool, interactive: bool) -> &'static str {
     match (expanded, interactive) {
         (true, _) => {
             "prose prose-sm dark:prose-invert max-w-none text-xs text-text-muted [&>p]:m-0 break-words cursor-pointer max-h-48 overflow-y-auto"
@@ -1240,7 +1240,7 @@ fn header_description_element() -> Option<web_sys::Element> {
         .get_element_by_id("room-header-description")
 }
 
-fn header_column_element() -> Option<web_sys::Element> {
+pub(crate) fn header_column_element() -> Option<web_sys::Element> {
     web_sys::window()?
         .document()?
         .get_element_by_id("room-header-column")
@@ -1394,7 +1394,7 @@ fn mark_description_click(armed: u64, outcome: Option<&str>) {
     }
 }
 
-fn note_description_overflow(description_overflows: &mut Signal<bool>) {
+pub(crate) fn note_description_overflow(description_overflows: &mut Signal<bool>) {
     if header_description_is_expanded() {
         return;
     }
