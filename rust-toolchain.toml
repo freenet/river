@@ -1,18 +1,15 @@
 [toolchain]
-# Pinned to keep chat_delegate.wasm and room_contract.wasm builds deterministic.
+# No `channel`: rustup uses its default toolchain (stable). The committed
+# chat_delegate.wasm and room_contract.wasm, not the compiler, fix the delegate
+# and room contract keys (key = BLAKE3 of the WASM, plus parameters). Nothing
+# rebuilds them to match a committed key; CI only checks that the committed
+# files agree with each other, the migration lists and the pointer records.
 #
-# Why this matters: the delegate key is BLAKE3(BLAKE3(wasm) || params). A
-# different rustc version produces different WASM bytes and therefore a
-# different delegate key. Users store their rooms_data under the current
-# delegate's key — changing the key without a migration entry in
-# legacy_delegates.toml silently orphans every user's data.
+# A compiler change therefore cannot re-key anything. An intentional rebuild
+# goes through `cargo make add-migration`, `cargo make sync-wasm` and
+# `cargo make sign-pointer-records`, in one PR with the new WASMs. That rebuild
+# re-keys whatever compiler it uses, and the migration entry covers it.
 #
-# When updating this pin:
-#   1. Run `cargo make sync-wasm` to regenerate the committed WASMs
-#   2. Run `cargo make add-migration` BEFORE changing the pin so the old
-#      delegate key is recorded for legacy migration
-#   3. Bump channel, commit the new WASMs + legacy_delegates.toml entry
-#      together in a single PR
-channel = "1.94.1"
+# The apps/ workspace has its own rust-toolchain.toml (Rune needs a newer rustc).
 components = ["rustfmt", "clippy"]
 targets = ["wasm32-unknown-unknown"]
