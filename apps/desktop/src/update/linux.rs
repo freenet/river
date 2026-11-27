@@ -1,6 +1,6 @@
 //! The Linux installer: an in-place swap of River's own binary.
 //!
-//! This is for the layout River's install script and tarball produce: one `river` file in a
+//! This is for the layout the release tarball's README describes: one `river` file in a
 //! directory the user owns (`~/.local/bin`, or wherever they put it). The swap is a rename, which
 //! is atomic and leaves the running process on the old inode, so the old binary goes on
 //! running until it is told to restart and nothing can see half a file.
