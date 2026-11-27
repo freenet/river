@@ -9,7 +9,8 @@
 //! Per platform: Linux speaks the freedesktop notification protocol over D-Bus (`xdg`),
 //! Windows shows toasts (`toast`), macOS uses `UNUserNotificationCenter` and only inside the
 //! signed `.app` bundle (`macos`). The unread count is shown in the window title by the UI on
-//! every platform; a dock badge or taskbar overlay is not done.
+//! every platform, and as a badge (`Badge`): on the Dock icon on macOS and over the taskbar
+//! button on Windows. Linux has no badge: rune's call does nothing there.
 
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -214,10 +215,63 @@ impl Waiters {
 pub struct DesktopNotifier {
     jobs: mpsc::SyncSender<Notification>,
     dropped: AtomicBool,
+    badge: Badge,
+}
+
+/// The unread count on the Dock icon (macOS) or the taskbar button (Windows), the same number
+/// the window title shows. Both sides run on the UI thread: the app reports a change from its
+/// frame, and rune calls `attach` when the native window is created.
+///
+/// A start in the tray has no window, and rune can show a badge only on one. The count is kept
+/// and put on the window when it is created (and again each time it is recreated), so it is
+/// right as soon as the window exists. Until then there is no badge.
+#[derive(Clone, Default)]
+pub struct Badge(Arc<Mutex<BadgeState>>);
+
+#[derive(Default)]
+struct BadgeState {
+    total: usize,
+    window: Option<rune::WindowHandle>,
+}
+
+/// The count rune is given: it caps what a taskbar can hold, never wraps.
+fn badge_count(total: usize) -> u32 {
+    u32::try_from(total).unwrap_or(u32::MAX)
+}
+
+/// What a screen reader says for the badge.
+fn badge_description(total: usize) -> String {
+    match total {
+        0 => String::new(),
+        1 => "1 unread message".to_owned(),
+        n => format!("{n} unread messages"),
+    }
+}
+
+fn taskbar_for(total: usize) -> rune::Taskbar {
+    rune::Taskbar::new().badge(badge_count(total), badge_description(total))
+}
+
+impl Badge {
+    /// The window rune made (or made again): give it the current count.
+    pub fn attach(&self, window: &rune::WindowHandle) {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        state.window = Some(window.clone());
+        window.set_taskbar(taskbar_for(state.total));
+    }
+
+    /// The count changed.
+    fn set(&self, total: usize) {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        state.total = total;
+        if let Some(window) = &state.window {
+            window.set_taskbar(taskbar_for(total));
+        }
+    }
 }
 
 impl DesktopNotifier {
-    pub fn new(handle: AppHandle<RiverApp>) -> Self {
+    pub fn new(handle: AppHandle<RiverApp>, badge: Badge) -> Self {
         let (jobs, rx) = mpsc::sync_channel(QUEUE);
         let spawned = std::thread::Builder::new()
             .name("river-notify".into())
@@ -229,6 +283,7 @@ impl DesktopNotifier {
         DesktopNotifier {
             jobs,
             dropped: AtomicBool::new(false),
+            badge,
         }
     }
 }
@@ -249,9 +304,10 @@ impl Notifier for DesktopNotifier {
         }
     }
 
-    /// The count is in the window title. A dock badge or taskbar overlay needs main-thread
-    /// platform calls this does not make.
-    fn set_unread(&self, _total: usize) {}
+    /// Called on the UI thread, which is where rune wants `set_taskbar`.
+    fn set_unread(&self, total: usize) {
+        self.badge.set(total);
+    }
 }
 
 fn worker(rx: mpsc::Receiver<Notification>, handle: AppHandle<RiverApp>) {
@@ -347,6 +403,30 @@ fn escape_markup(text: &str) -> String {
 mod tests {
     use super::*;
     use notify_rust::CloseReason;
+
+    #[test]
+    fn the_badge_says_the_count_and_zero_clears_it() {
+        assert_eq!(taskbar_for(0).count(), 0);
+        assert_eq!(badge_description(0), "");
+        assert_eq!(taskbar_for(1).count(), 1);
+        assert_eq!(badge_description(1), "1 unread message");
+        assert_eq!(taskbar_for(3).count(), 3);
+        assert_eq!(badge_description(3), "3 unread messages");
+        assert_eq!(taskbar_for(1_000).count(), 1_000);
+    }
+
+    #[test]
+    fn an_absurd_count_saturates_instead_of_wrapping() {
+        assert_eq!(badge_count(usize::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn a_count_set_before_any_window_exists_is_kept_for_the_window() {
+        let badge = Badge::default();
+        badge.set(4);
+        assert_eq!(badge.0.lock().unwrap().total, 4);
+        assert!(badge.0.lock().unwrap().window.is_none());
+    }
 
     #[test]
     fn each_response_asks_for_one_thing() {

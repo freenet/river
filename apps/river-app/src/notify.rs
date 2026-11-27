@@ -1422,6 +1422,97 @@ mod tests {
         );
     }
 
+    /// One frame, as the window runs it; what the notifier last heard.
+    fn frame_of(rt: &mut Runtime<RiverApp>, rec: &Recorder) -> Option<usize> {
+        rt.frame(1.0 / 60.0);
+        rec.unread.borrow().last().copied()
+    }
+
+    /// The badge is told the number the title shows, and only when it changes.
+    #[test]
+    fn the_badge_count_is_the_title_count_through_every_change() {
+        let rec = Recorder::default();
+        let mut s = RiverApp::detached().with_notifier(Box::new(rec.clone()));
+        s.chat.source = crate::chat::Source::Node(LinkStatus::Live);
+        s.chat
+            .edit_rooms(|r| r.iter_mut().for_each(|r| r.unread = 0));
+        let mut rt = Runtime::new(
+            s,
+            view,
+            (900.0, 700.0),
+            Env {
+                system_dark: true,
+                scale: 1.0,
+            },
+        );
+        rt.poll = crate::spec().poll;
+        rt.frame(0.0);
+        // Nothing unread: the first frame still tells the badge, so a stale one is cleared.
+        assert_eq!(frame_of(&mut rt, &rec), Some(0));
+        let heard = rec.unread.borrow().len();
+        frame_of(&mut rt, &rec);
+        assert_eq!(
+            rec.unread.borrow().len(),
+            heard,
+            "an unchanged count sends nothing"
+        );
+
+        // New messages in a room that is not open.
+        let open = rt.state.chat.room().unwrap().key.clone();
+        let other = rt
+            .state
+            .chat
+            .rooms()
+            .iter()
+            .find(|r| r.key != open)
+            .unwrap()
+            .key
+            .clone();
+        rt.state.chat.edit_rooms(|r| {
+            r.iter_mut().find(|r| r.key == other).unwrap().unread = 3;
+        });
+        assert_eq!(frame_of(&mut rt, &rec), Some(3));
+        assert_eq!(rt.state.unread(), 3, "the title counts the same");
+
+        // Messages missed in the open room while the window is not focused.
+        rt.state.missed = (open.clone(), 2);
+        assert_eq!(frame_of(&mut rt, &rec), Some(5));
+        assert_eq!(rt.state.unread(), 5);
+
+        // Opening the other room clears its count; the missed ones stay until the person returns.
+        rt.state.open_room(&other);
+        assert_eq!(frame_of(&mut rt, &rec), Some(rt.state.unread()));
+        rt.state.missed = Default::default();
+        assert_eq!(frame_of(&mut rt, &rec), Some(0));
+        assert_eq!(rt.state.unread(), 0);
+    }
+
+    /// Resetting the reported count (as a node switch does) makes the badge hear it again.
+    #[test]
+    fn resetting_the_reported_count_makes_the_badge_hear_it_again() {
+        let rec = Recorder::default();
+        let mut s = RiverApp::detached().with_notifier(Box::new(rec.clone()));
+        s.chat.source = crate::chat::Source::Node(LinkStatus::Live);
+        s.chat
+            .edit_rooms(|r| r.iter_mut().for_each(|r| r.unread = 0));
+        let mut rt = Runtime::new(
+            s,
+            view,
+            (900.0, 700.0),
+            Env {
+                system_dark: true,
+                scale: 1.0,
+            },
+        );
+        rt.poll = crate::spec().poll;
+        rt.frame(0.0);
+        assert_eq!(frame_of(&mut rt, &rec), Some(0));
+        rt.state.reported_unread = None;
+        let heard = rec.unread.borrow().len();
+        frame_of(&mut rt, &rec);
+        assert_eq!(rec.unread.borrow().len(), heard + 1);
+    }
+
     #[test]
     fn clicking_a_notification_opens_its_room() {
         let (mut s, _, rooms) = live();
