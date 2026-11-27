@@ -130,11 +130,6 @@ impl Action {
             other => Action::OpenRoom(other.strip_prefix("room:")?.to_owned()),
         })
     }
-
-    /// Whether choosing it flips a tick the menu draws.
-    fn is_check(&self) -> bool {
-        matches!(self, Action::ToggleDnd | Action::ToggleLogin)
-    }
 }
 
 /// One line of the tray menu.
@@ -1406,8 +1401,6 @@ mod tests {
 
     #[test]
     fn a_forced_menu_update_draws_even_if_nothing_changed_and_a_plain_one_does_not() {
-        assert!(Action::ToggleDnd.is_check() && Action::ToggleLogin.is_check());
-        assert!(!Action::MarkAllRead.is_check() && !Action::Open.is_check());
         let t = Tracker::default();
         let menu = TrayMenu {
             dnd: true,
