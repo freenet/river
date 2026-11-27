@@ -1217,7 +1217,7 @@ fn NoRoomFooter() -> Element {
 /// font size and fits. Expanded wraps and scrolls
 /// so a long description stays in the header instead of pushing the messages
 /// off the screen (freenet/river#718).
-fn room_description_class(expanded: bool, interactive: bool) -> &'static str {
+pub(crate) fn room_description_class(expanded: bool, interactive: bool) -> &'static str {
     match (expanded, interactive) {
         (true, _) => {
             "prose prose-sm dark:prose-invert max-w-none text-xs text-text-muted [&>p]:m-0 break-words cursor-pointer max-h-48 overflow-y-auto"
@@ -1394,7 +1394,7 @@ fn mark_description_click(armed: u64, outcome: Option<&str>) {
     }
 }
 
-fn note_description_overflow(description_overflows: &mut Signal<bool>) {
+pub(crate) fn note_description_overflow(description_overflows: &mut Signal<bool>) {
     if header_description_is_expanded() {
         return;
     }
