@@ -266,6 +266,15 @@ pub fn create_example_rooms() -> Rooms {
         map.insert(room.owner_vk, room.room_data);
     }
 
+    // Every other example room is an explicit All: a room with no entry is
+    // MentionsAndReplies, and the unread-badge / title / hamburger specs count
+    // every unread message in these rooms.
+    for vk in map.keys() {
+        notification_modes
+            .entry(*vk)
+            .or_insert(crate::room_data::NotificationMode::All);
+    }
+
     Rooms {
         map,
         current_room_key: None,

@@ -413,7 +413,7 @@ pub struct Chat {
     /// one while reconnecting.
     full_list: bool,
     /// Each room's notification mode by room key, shared with the web UI; a room not named is
-    /// [`NotificationMode::All`].
+    /// [`NotificationMode::default`] (`MentionsAndReplies`).
     modes: HashMap<String, NotificationMode>,
     /// Modes picked here that the node's updates have not echoed yet, so an update sent before
     /// the pick was taken does not put the old mode back on screen.
@@ -859,6 +859,16 @@ impl Chat {
 
     pub fn rooms(&self) -> &[Room] {
         &self.rooms
+    }
+
+    /// Give every room in `rooms` an explicit `All` mode, as if the user had picked it, so a
+    /// fixture that counts every message still does now that a room with no entry is
+    /// [`NotificationMode::MentionsAndReplies`]. Nothing is sent to be stored.
+    #[cfg(test)]
+    pub fn notify_all_in(&mut self, rooms: &[Room]) {
+        for r in rooms {
+            self.modes.insert(r.key.clone(), NotificationMode::All);
+        }
     }
 
     /// Replace the rooms. The open room stays open if it is still there. Otherwise the room

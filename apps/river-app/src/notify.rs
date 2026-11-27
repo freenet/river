@@ -759,9 +759,18 @@ mod tests {
 
     /// An app on the example rooms with the web UI's two rooms shown live, and a recorder.
     fn live() -> (RiverApp, Recorder, Vec<Room>) {
+        live_with(true)
+    }
+
+    /// `live`, with every room an explicit `All` when `all`. Most of these tests are about
+    /// every message notifying, and a room with no entry is mentions and replies only.
+    fn live_with(all: bool) -> (RiverApp, Recorder, Vec<Room>) {
         let rec = Recorder::default();
         let mut s = RiverApp::detached().with_notifier(Box::new(rec.clone()));
         let rooms = example::data().rooms;
+        if all {
+            s.chat.notify_all_in(&rooms);
+        }
         s.chat
             .show_node_rooms(rooms.clone(), None, LinkStatus::Live, 1000);
         // A second live update, so the next is compared with something live.
@@ -1395,6 +1404,8 @@ mod tests {
         let rec = Recorder::default();
         let mut s = RiverApp::detached().with_notifier(Box::new(rec.clone()));
         s.chat.source = crate::chat::Source::Node(LinkStatus::Live);
+        let all = example::data().rooms;
+        s.chat.notify_all_in(&all);
         s.chat.edit_rooms(|rooms| rooms[1].unread = 4);
         let mut rt = Runtime::new(
             s,
@@ -1429,6 +1440,9 @@ mod tests {
         let rec = Recorder::default();
         let mut s = RiverApp::detached().with_notifier(Box::new(rec.clone()));
         s.chat.source = crate::chat::Source::Node(LinkStatus::Live);
+        // Explicit `All`: these tests count every unread message.
+        let all = s.chat.rooms().to_vec();
+        s.chat.notify_all_in(&all);
         s.chat
             .edit_rooms(|r| r.iter_mut().for_each(|r| r.unread = 0));
         let mut rt = Runtime::new(
@@ -1488,6 +1502,9 @@ mod tests {
         let rec = Recorder::default();
         let mut s = RiverApp::detached().with_notifier(Box::new(rec.clone()));
         s.chat.source = crate::chat::Source::Node(LinkStatus::Live);
+        // Explicit `All`: these tests count every unread message.
+        let all = s.chat.rooms().to_vec();
+        s.chat.notify_all_in(&all);
         s.chat
             .edit_rooms(|r| r.iter_mut().for_each(|r| r.unread = 0));
         let mut rt = Runtime::new(
@@ -1779,6 +1796,7 @@ mod tests {
         at(&mut s, vec![], LinkStatus::Loading, 0);
         at(&mut s, vec![], LinkStatus::Live, 1);
         let base = example::data().rooms[0].clone();
+        s.chat.notify_all_in(std::slice::from_ref(&base));
         let mut joined = base.clone();
         joined.messages.clear();
         at(&mut s, vec![joined.clone()], LinkStatus::Live, 2);
@@ -2053,6 +2071,69 @@ mod tests {
         let n = shown(&rec);
         assert_eq!(n.len(), 1);
         assert_eq!(n[0].room_key, rooms[1].key);
+    }
+
+    /// A room nobody configured notifies only for what mentions or replies to you; an
+    /// explicit `All` notifies for everything.
+    #[test]
+    fn a_room_with_no_entry_notifies_only_for_mentions_and_replies() {
+        let (mut s, rec, rooms) = live_with(false);
+        deliver(
+            &mut s,
+            with(&rooms, 0, vec![from_other(&rooms[0], "p", "plain")]),
+        );
+        assert!(shown(&rec).is_empty(), "a plain message must not notify");
+        deliver(
+            &mut s,
+            with(
+                &rooms,
+                0,
+                vec![
+                    from_other(&rooms[0], "p", "plain"),
+                    mention_of_you(&rooms[0], "m"),
+                ],
+            ),
+        );
+        assert_eq!(shown(&rec).len(), 1, "the mention notifies");
+        set_mode(&mut s, &rooms[0], NotificationMode::All);
+        deliver(
+            &mut s,
+            with(
+                &rooms,
+                0,
+                vec![
+                    from_other(&rooms[0], "p", "plain"),
+                    mention_of_you(&rooms[0], "m"),
+                    from_other(&rooms[0], "q", "plain again"),
+                ],
+            ),
+        );
+        assert!(
+            shown(&rec).len() > 1,
+            "an explicit All notifies for plain messages"
+        );
+    }
+
+    /// The title count of a room with no entry counts only mentions and replies.
+    #[test]
+    fn the_unread_count_of_a_room_with_no_entry_is_mentions_and_replies() {
+        let (mut s, _rec, rooms) = live_with(false);
+        let room = &rooms[1];
+        let mut next = rooms.clone();
+        next[1].messages.extend([
+            from_other(room, "a", "noise"),
+            mention_of_you(room, "b"),
+            reply_to(room, "c", room.me),
+        ]);
+        next[1].unread = 3;
+        s.chat.select(&rooms[0].key);
+        s.chat.edit_rooms(|r| *r = next.clone());
+        let count = |s: &RiverApp| s.chat.unread_of(&s.chat.rooms()[1]);
+        assert_eq!(count(&s), 2);
+        set_mode(&mut s, room, NotificationMode::All);
+        assert_eq!(count(&s), 3);
+        set_mode(&mut s, room, NotificationMode::Muted);
+        assert_eq!(count(&s), 0);
     }
 
     #[test]

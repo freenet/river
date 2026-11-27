@@ -4539,6 +4539,18 @@ mod tests {
         assert_eq!(plan_load_from_keys(&[]), LoadPlan::ProbeLegacy);
     }
 
+    /// The sweep marker is stored in the current delegate: a delegate holding
+    /// only it is still an empty one (freenet/river#972).
+    #[test]
+    fn plan_probes_legacy_when_only_the_sweep_marker_is_stored() {
+        assert_eq!(
+            plan_load_from_keys(&[dk(
+                crate::components::app::legacy_sweep_marker::LEGACY_SWEEP_MARKER_KEY.to_vec()
+            )]),
+            LoadPlan::ProbeLegacy
+        );
+    }
+
     /// Reconstruct routes `Present` → `map`, `Tombstone` → `removed_rooms`, and
     /// `apply_meta` layers the view prefs (dropping left rooms from
     /// `room_order`, keeping a not-loaded one, freenet/river#802). This is the
