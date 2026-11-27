@@ -50,8 +50,7 @@ install it.
 New users do not need River in the browser first: this preview sets up River's
 storage on your Freenet node itself. The first time, the app asks Freenet for
 permission: press the button in the app to open a page in your browser, on your
-Freenet node's own address (not River), and choose Allow there. Not in the app yet: moderation, changing your nickname,
-and room upgrades; use River in your web browser for those.
+Freenet node's own address (not River), and choose Allow there.
 If you already used River in your web browser, rooms from an earlier version show
 up here after you open River in the browser once.
 
