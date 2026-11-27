@@ -209,12 +209,14 @@ impl Chat {
     /// Mark read the rooms the overview lists, as opening each of them would, and no others: a
     /// muted room, or unread messages a mentions-only room does not count, stay as they are.
     ///
-    /// Read marks live in memory only, as with a click on a room: this resets on restart and
-    /// does not sync to the node or other devices.
+    /// Each room marked is also reported to the node as read up to its newest message, as
+    /// opening it would, so the web UI and other devices agree and a refresh does not bring the
+    /// count back.
     pub fn mark_all_read(&mut self) {
         let keys: Vec<String> = self.overview_rows().into_iter().map(|r| r.key).collect();
         for key in keys {
             self.mark_read(&key);
+            self.report_room_read(&key);
         }
     }
 
@@ -264,11 +266,18 @@ impl Chat {
 }
 
 impl RiverApp {
-    /// Mark the listed rooms read, and reset the count of what the window missed while away in
+    /// Mark the listed rooms and the counted direct messages read, and reset the count of what the window missed while away in
     /// the open room. `missed.0` (which room that count is for) is kept on purpose: the next
     /// arrival in the same room keeps counting from zero, and one in another room replaces it.
     pub(crate) fn mark_everything_read(&mut self) {
         self.chat.mark_all_read();
+        self.chat.mark_all_dms_seen();
+        // The open room has nothing unread of its own (it is being read), but what the window
+        // missed while away is on the badge: it is read now, here and on the node.
+        if self.missed.1 > 0 {
+            let room = self.missed.0.clone();
+            self.chat.report_room_read(&room);
+        }
         self.missed.1 = 0;
     }
 }

@@ -91,7 +91,7 @@ impl RiverApp {
 
     /// Open the direct-message thread `(room, peer)`. False if the room is gone, or the peer has
     /// no messages and is no longer a member.
-    fn open_dm_thread(&mut self, room: &str, peer: &str) -> bool {
+    pub(crate) fn open_dm_thread(&mut self, room: &str, peer: &str) -> bool {
         let opened = self.chat.open_dm(room, peer);
         if opened {
             self.limiter

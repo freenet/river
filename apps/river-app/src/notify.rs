@@ -87,6 +87,38 @@ pub struct Notification {
     pub reply: bool,
 }
 
+/// A room that counts toward the unread total, as the tray menu lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnreadRoom {
+    pub key: String,
+    pub name: String,
+    /// What [`crate::chat::Chat::unread_of`] says: follows the room's notification mode.
+    pub count: usize,
+}
+
+/// What a tray menu shows besides the connection and the total: it is reported to the
+/// notifier whenever any of it changes ([`Notifier::set_menu`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TrayMenu {
+    /// Up to [`TRAY_UNREAD_ROOMS`] rooms with unread messages that count, the one with the
+    /// newest message first.
+    pub unread_rooms: Vec<UnreadRoom>,
+    /// Whether do not disturb is on now (the switch or the schedule).
+    pub dnd: bool,
+    /// Whether the switch is on (the item can be unticked); with `dnd` and no switch, only the
+    /// daily schedule has it on.
+    pub dnd_switch: bool,
+    /// Unread direct messages (the part of the badge the rooms do not account for).
+    pub dm_unread: usize,
+    /// Whether a downloaded update is waiting for a restart.
+    pub update_ready: bool,
+    /// Whether River starts at login; `None` where the shell has no such setting.
+    pub start_at_login: Option<bool>,
+}
+
+/// The most rooms the tray menu lists.
+pub const TRAY_UNREAD_ROOMS: usize = 5;
+
 /// How a shell shows notifications and the unread count. Called on the UI thread: an
 /// implementation must not block, so it hands the work to a thread of its own.
 pub trait Notifier {
@@ -99,6 +131,13 @@ pub trait Notifier {
     fn set_unread(&self, total: usize);
     /// How the connection to the node stands, for a tray tooltip. Called when it changes.
     fn set_connection(&self, _: crate::chat::node_status::Connection) {}
+    /// What the tray menu lists besides those. Called when it changes.
+    fn set_menu(&self, _: TrayMenu) {}
+    /// [`Notifier::set_menu`] for a menu that must be drawn again even if it is the one already
+    /// shown: a check item was chosen, and the menu may have flipped its own tick.
+    fn set_menu_forced(&self, menu: TrayMenu) {
+        self.set_menu(menu);
+    }
 }
 
 /// The notifier of a headless run or a shell without one: shows nothing.

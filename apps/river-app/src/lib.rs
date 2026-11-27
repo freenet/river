@@ -18,6 +18,8 @@ mod notify_actions;
 pub mod rooms;
 pub mod setup;
 pub mod signed_time;
+#[cfg(test)]
+mod tray_menu_tests;
 pub mod update;
 
 /// Where the web UI's code, copied verbatim into `chat/visual_fold.rs`, finds its neighbours.
@@ -91,6 +93,8 @@ pub struct RiverApp {
     reported_unread: Option<usize>,
     /// The connection state last given to the notifier, so it hears only changes.
     reported_connection: Option<chat::node_status::Connection>,
+    /// The tray menu's contents last given to the notifier, so it hears only changes.
+    reported_menu: Option<notify::TrayMenu>,
     /// The number of the node in use ([`rooms::Link::generation`]). What a node the app has left
     /// still delivers carries an older number and is dropped.
     node_generation: u64,
@@ -216,6 +220,7 @@ impl RiverApp {
             missed: Default::default(),
             reported_unread: None,
             reported_connection: None,
+            reported_menu: None,
             limiter: Default::default(),
             dnd_persist: false,
             pending_notice: None,
@@ -301,6 +306,7 @@ impl RiverApp {
             missed: Default::default(),
             reported_unread: None,
             reported_connection: None,
+            reported_menu: None,
             limiter: Default::default(),
             dnd_persist: true,
             pending_notice: None,
@@ -749,6 +755,7 @@ impl RiverApp {
             self.reported_connection = Some(connection);
             self.notifier.set_connection(connection);
         }
+        self.sync_tray_menu();
         if !matches!(self.chat.source, chat::Source::Node(_)) {
             return;
         }
@@ -762,6 +769,97 @@ impl RiverApp {
         if self.reported_unread != Some(unread) {
             self.reported_unread = Some(unread);
             self.notifier.set_unread(unread);
+        }
+    }
+
+    /// What the tray menu lists besides the connection and the total: rows that add up to the
+    /// badge (the open room's missed messages on its row, direct messages on theirs), up to the
+    /// cap on rooms.
+    pub fn tray_menu(&self) -> notify::TrayMenu {
+        let listed = matches!(self.chat.source, chat::Source::Node(_));
+        notify::TrayMenu {
+            unread_rooms: if listed {
+                self.chat.unread_rooms(
+                    notify::TRAY_UNREAD_ROOMS,
+                    (self.missed.0.as_str(), self.missed.1),
+                )
+            } else {
+                Vec::new()
+            },
+            dnd: self.chat.dnd.active(),
+            dnd_switch: self.chat.dnd.settings.manual,
+            dm_unread: if listed {
+                self.chat.dm_unread_counted()
+            } else {
+                0
+            },
+            update_ready: self.chat.update.ready().is_some(),
+            start_at_login: self.chat.start_at_login(),
+        }
+    }
+
+    /// Tell the notifier the tray menu's contents when they changed.
+    fn sync_tray_menu(&mut self) {
+        let menu = self.tray_menu();
+        if self.reported_menu.as_ref() != Some(&menu) {
+            self.reported_menu = Some(menu.clone());
+            self.notifier.set_menu(menu);
+        }
+    }
+
+    /// Tell the notifier the tray menu's contents again even if they did not change: after a
+    /// check item was chosen, so a menu that flipped its own tick shows the real state.
+    pub fn resend_tray_menu(&mut self) {
+        let menu = self.tray_menu();
+        self.reported_menu = Some(menu.clone());
+        self.notifier.set_menu_forced(menu);
+    }
+
+    /// The tray's "Mark all as read": the rooms the tray lists (those that count) are marked
+    /// and reported to the node, and so are the direct messages.
+    pub fn tray_mark_all_read(&mut self) {
+        self.mark_everything_read();
+    }
+
+    /// The tray's "Do Not Disturb": flips the switch Settings has.
+    pub fn tray_toggle_dnd(&mut self) {
+        self.chat.toggle_dnd();
+    }
+
+    /// The tray's "Direct messages": open the first thread with unread messages. False if there
+    /// is none (read since the menu was drawn).
+    pub fn tray_open_direct_messages(&mut self) -> bool {
+        match self.chat.first_unread_dm() {
+            Some((room, peer)) => self.open_dm_thread(&room, &peer),
+            None => false,
+        }
+    }
+
+    /// The tray's "Update available - restart": what the update block's Restart does.
+    pub fn tray_restart_to_update(&mut self) {
+        self.restart_to_update();
+    }
+
+    /// The tray's "Start River when I log in": the Settings switch. A failure has no Settings
+    /// page open to show it on, so it is said as a notification.
+    pub fn tray_toggle_start_at_login(&mut self) {
+        self.chat.toggle_start_at_login();
+        self.say_login_error();
+    }
+
+    /// The first-run card's OK. A login item that could not be written is said on the card and
+    /// as a notification (the window may be on another desktop).
+    pub fn confirm_first_run(&mut self) {
+        self.chat.confirm_first_run();
+        self.say_login_error();
+    }
+
+    fn say_login_error(&mut self) {
+        if let Some(why) = self.chat.start_at_login_error().map(str::to_owned) {
+            self.send_notice(
+                "Couldn't change Start at login".into(),
+                format!("Couldn't change Start at login: {why}"),
+            );
         }
     }
 
@@ -1064,6 +1162,7 @@ impl RiverApp {
         self.limiter = Default::default();
         self.reported_unread = None;
         self.reported_connection = None;
+        self.reported_menu = None;
         if let Some(ctl) = &self.ctl {
             ctl.check();
         }
@@ -1267,6 +1366,30 @@ impl chat::BackgroundHost for PreviewBackground {
     }
     fn set_start_at_login(&self, _: bool) -> Result<(), String> {
         Ok(())
+    }
+}
+
+/// A shell on a first run: the setup screen offers "Start River when I log in", ticked.
+struct PreviewFirstRun;
+
+impl chat::BackgroundHost for PreviewFirstRun {
+    fn tray_available(&self) -> bool {
+        true
+    }
+    fn close_to_tray(&self) -> bool {
+        true
+    }
+    fn set_close_to_tray(&self, _: bool) -> Result<(), String> {
+        Ok(())
+    }
+    fn start_at_login(&self) -> bool {
+        false
+    }
+    fn set_start_at_login(&self, _: bool) -> Result<(), String> {
+        Ok(())
+    }
+    fn first_run(&self) -> bool {
+        true
     }
 }
 
@@ -1527,6 +1650,12 @@ pub type Scene = (&'static str, fn(&mut RiverApp));
 /// One scene per screen. CI renders every one of them.
 pub const SCENES: &[Scene] = &[
     ("checking", |s| s.setup = Setup::Checking),
+    ("chat-first-run", |s| {
+        connect(s);
+        s.chat.background = Some(chat::BackgroundUi::new(std::sync::Arc::new(
+            PreviewFirstRun,
+        )));
+    }),
     ("not-installed", |s| s.setup = Setup::NotInstalled),
     ("finding-release", |s| {
         s.setup = Setup::Installing(InstallStep::FindingRelease)

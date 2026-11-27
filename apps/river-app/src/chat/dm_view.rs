@@ -408,6 +408,47 @@ impl DmUi {
             .sum()
     }
 
+    /// The thread to open to see what [`DmUi::counted_unread`] counts: the first on the rail with
+    /// unread messages in a room `muted` does not name, as `(room, peer)`.
+    pub fn first_unread_thread(&self, muted: impl Fn(&str) -> bool) -> Option<(String, String)> {
+        self.rows
+            .iter()
+            .find(|r| r.unread > 0 && !muted(&r.room))
+            .map(|r| (r.room.clone(), r.peer_key.clone()))
+    }
+
+    /// Mark every thread [`DmUi::counted_unread`] counts as seen, without opening any. True if
+    /// that moved a read position. Direct-message read positions live in memory only, as a click
+    /// on a thread leaves them.
+    pub fn mark_all_seen(&mut self, muted: impl Fn(&str) -> bool) -> bool {
+        let threads: Vec<(String, String)> = self
+            .rows
+            .iter()
+            .filter(|r| r.unread > 0 && !muted(&r.room))
+            .map(|r| (r.room.clone(), r.peer_key.clone()))
+            .collect();
+        let mut moved = false;
+        for (room, peer) in threads {
+            let Some(keys) = self.thread(&room, &peer).map(|t| {
+                t.messages
+                    .iter()
+                    .filter(|m| !m.outgoing)
+                    .map(|m| m.key.clone())
+                    .collect::<Vec<_>>()
+            }) else {
+                continue;
+            };
+            let seen = self.seen.entry((room, peer)).or_default();
+            let before = seen.len();
+            seen.extend(keys);
+            moved |= seen.len() != before;
+        }
+        if moved {
+            self.rebuild();
+        }
+        moved
+    }
+
     /// Mark the thread `(room, peer)` read up to the message with purge token `token`, without
     /// opening it: what a notification showed was seen and what is newer was not. Nothing for a
     /// message the thread no longer holds. True if the read position moved.
@@ -679,7 +720,24 @@ impl Chat {
         self.dm_settle();
     }
 
-    /// The thread's unread count counted by the title and the tray: not those of a muted room.
+    /// The thread "Direct messages" in the tray opens: the first with unread messages that count.
+    pub fn first_unread_dm(&self) -> Option<(String, String)> {
+        self.dm
+            .first_unread_thread(|room| self.mode_of(room) == NotificationMode::Muted)
+    }
+
+    /// Mark every counted thread seen, as the tray's "Mark all as read" does.
+    pub fn mark_all_dms_seen(&mut self) -> bool {
+        let muted: std::collections::HashSet<String> = self
+            .rooms
+            .iter()
+            .filter(|r| self.mode_of(&r.key) == NotificationMode::Muted)
+            .map(|r| r.key.clone())
+            .collect();
+        self.dm.mark_all_seen(|room| muted.contains(room))
+    }
+
+    /// The unread direct messages counted by the title and the tray: not those of a muted room.
     pub fn dm_unread_counted(&self) -> usize {
         self.dm
             .counted_unread(|room| self.mode_of(room) == NotificationMode::Muted)

@@ -1311,3 +1311,43 @@ fn targets_round_trip_and_ordinary_keys_are_not_targets() {
         assert_eq!(parse_dm_target(bad), None, "{bad}");
     }
 }
+
+// The tray menu ---------------------------------------------------------------------------------
+
+#[test]
+fn the_tray_menu_rows_add_up_to_the_badge_and_mark_all_read_clears_direct_messages_too() {
+    let mut w = world();
+    let (room, peer) = (w.room.clone(), w.peer.clone());
+    let one = w.thread_with(&peer, vec![text("a", T0, "x")]);
+    w.give(one);
+    let two = w.thread_with(&peer, vec![text("a", T0, "x"), text("b", T0 + 5, WORDS)]);
+    w.give(two);
+    let menu = w.s.tray_menu();
+    assert!(menu.dm_unread > 0);
+    let rooms: usize = menu.unread_rooms.iter().map(|r| r.count).sum();
+    assert_eq!(
+        rooms + menu.dm_unread,
+        w.s.unread(),
+        "the rows are the badge"
+    );
+    assert_eq!(w.s.chat.first_unread_dm(), Some((room, peer)));
+    w.s.tray_mark_all_read();
+    assert_eq!(w.s.tray_menu().dm_unread, 0);
+    assert_eq!(w.s.unread(), 0);
+    assert_eq!(w.s.chat.first_unread_dm(), None);
+}
+
+#[test]
+fn the_direct_messages_row_opens_the_thread() {
+    let mut w = world();
+    let peer = w.peer.clone();
+    let one = w.thread_with(&peer, vec![text("a", T0, "x")]);
+    w.give(one);
+    let two = w.thread_with(&peer, vec![text("a", T0, "x"), text("b", T0 + 5, WORDS)]);
+    w.give(two);
+    assert!(w.s.tray_open_direct_messages());
+    assert_eq!(
+        w.s.chat.dm.open_key(),
+        Some((w.room.as_str(), peer.as_str()))
+    );
+}
