@@ -87,6 +87,8 @@ pub struct RiverApp {
     pending_notice: Option<(String, String)>,
     /// The unread count last given to the notifier, so it hears only changes.
     reported_unread: Option<usize>,
+    /// The connection state last given to the notifier, so it hears only changes.
+    reported_connection: Option<chat::node_status::Connection>,
     /// The number of the node in use ([`rooms::Link::generation`]). What a node the app has left
     /// still delivers carries an older number and is dropped.
     node_generation: u64,
@@ -210,6 +212,7 @@ impl RiverApp {
             window_shown: false,
             missed: Default::default(),
             reported_unread: None,
+            reported_connection: None,
             limiter: Default::default(),
             dnd_persist: false,
             pending_notice: None,
@@ -293,6 +296,7 @@ impl RiverApp {
             window_shown: false,
             missed: Default::default(),
             reported_unread: None,
+            reported_connection: None,
             limiter: Default::default(),
             dnd_persist: true,
             pending_notice: None,
@@ -602,7 +606,7 @@ impl RiverApp {
     /// says so. Before any focus event, a window that was shown at start counts as in front (a
     /// platform may never report focus when a window first appears); a windowless start (at
     /// login, into the tray) has none, so what arrives still notifies.
-    fn window_in_front(&self) -> bool {
+    pub fn window_in_front(&self) -> bool {
         self.focused || (!self.focus_known && self.window_shown)
     }
 
@@ -711,6 +715,12 @@ impl RiverApp {
         if self.reported_unread != Some(unread) {
             self.reported_unread = Some(unread);
             self.notifier.set_unread(unread);
+        }
+        let connection =
+            chat::node_status::connection_of(&self.setup, &self.access, self.chat.source);
+        if self.reported_connection != Some(connection) {
+            self.reported_connection = Some(connection);
+            self.notifier.set_connection(connection);
         }
     }
 
@@ -1012,6 +1022,7 @@ impl RiverApp {
         self.missed = Default::default();
         self.limiter = Default::default();
         self.reported_unread = None;
+        self.reported_connection = None;
         if let Some(ctl) = &self.ctl {
             ctl.check();
         }

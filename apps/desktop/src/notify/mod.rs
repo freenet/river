@@ -225,8 +225,11 @@ pub struct DesktopNotifier {
 /// A start in the tray has no window, and rune can show a badge only on one. The count is kept
 /// and put on the window when it is created (and again each time it is recreated), so it is
 /// right as soon as the window exists. Until then there is no badge.
+///
+/// The tray icon gets the same number from the same call ([`Badge::set`]), and the connection
+/// state for its tooltip ([`Badge::set_connection`]).
 #[derive(Clone, Default)]
-pub struct Badge(Arc<Mutex<BadgeState>>);
+pub struct Badge(Arc<Mutex<BadgeState>>, crate::tray::Tracker);
 
 #[derive(Default)]
 struct BadgeState {
@@ -260,8 +263,14 @@ impl Badge {
         window.set_taskbar(taskbar_for(state.total));
     }
 
+    /// The connection to the node changed: the tray's tooltip says so.
+    fn set_connection(&self, connection: river_app::chat::node_status::Connection) {
+        self.1.set_connection(connection);
+    }
+
     /// The count changed.
     fn set(&self, total: usize) {
+        self.1.set_unread(total);
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         state.total = total;
         if let Some(window) = &state.window {
@@ -307,6 +316,10 @@ impl Notifier for DesktopNotifier {
     /// Called on the UI thread, which is where rune wants `set_taskbar`.
     fn set_unread(&self, total: usize) {
         self.badge.set(total);
+    }
+
+    fn set_connection(&self, connection: river_app::chat::node_status::Connection) {
+        self.badge.set_connection(connection);
     }
 }
 
@@ -413,6 +426,22 @@ mod tests {
         assert_eq!(taskbar_for(3).count(), 3);
         assert_eq!(badge_description(3), "3 unread messages");
         assert_eq!(taskbar_for(1_000).count(), 1_000);
+    }
+
+    #[test]
+    fn set_unread_reaches_the_tray_and_an_unchanged_count_is_not_passed_on() {
+        use river_app::chat::node_status::Connection;
+        let n = DesktopNotifier {
+            jobs: mpsc::sync_channel(1).0,
+            dropped: AtomicBool::new(false),
+            badge: Badge::default(),
+        };
+        n.set_unread(3);
+        assert_eq!(n.badge.1.view().unread, 3);
+        n.set_connection(Connection::Unreachable);
+        assert_eq!(n.badge.1.view().connection, Some(Connection::Unreachable));
+        n.set_unread(0);
+        assert_eq!(n.badge.1.view().unread, 0);
     }
 
     #[test]

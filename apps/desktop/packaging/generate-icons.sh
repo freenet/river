@@ -4,7 +4,7 @@
 #   apps/desktop/packaging/generate-icons.sh
 #
 # Writes, under apps/desktop/packaging/icons/:
-#   river.png   512x512, shipped in the Linux tarball next to river.desktop
+#   river.png   512x512, shipped in the Linux tarball next to org.freenet.River.desktop
 #   river.ico   16-256 px, compiled into river.exe by apps/desktop/build.rs
 #   River.icns  16-1024 px, copied into River.app/Contents/Resources
 #
