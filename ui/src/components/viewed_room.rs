@@ -522,7 +522,8 @@ fn PublicRoomView(
         .description
         .as_ref()
         .map(|d| d.to_string_lossy())
-        .filter(|d| !d.is_empty());
+        .filter(|d| !d.is_empty())
+        .map(|d| crate::components::conversation::room_description_to_html(&d));
     let note = composer_note(&state);
     let rows = lines(&state);
     let can_join = offers_join(&state);
@@ -599,7 +600,13 @@ fn PublicRoomView(
                         "{name}"
                     }
                     if let Some(description) = description {
-                        p { class: "text-sm text-text-secondary break-words", "{description}" }
+                        // Markdown like the member header's description; images
+                        // are shown as text (`render_gfm`).
+                        div {
+                            "data-testid": "viewed-room-description",
+                            class: "prose prose-sm dark:prose-invert max-w-none text-xs text-text-muted [&>p]:m-0 break-words max-h-48 overflow-y-auto",
+                            dangerous_inner_html: "{description}",
+                        }
                     }
                 }
                 button {
@@ -1372,6 +1379,26 @@ mod load_state_tests {
         assert!(
             load_settled(RoomsLoadState::LoadFailed),
             "a failed load must not hold a visitor's answer forever"
+        );
+    }
+}
+
+#[cfg(test)]
+mod description_tests {
+    /// freenet/river#1077: the viewer header showed the description as plain
+    /// text, so markdown links appeared as `[label](url)`. The header must
+    /// render it with the same renderer as the member header, as HTML.
+    #[test]
+    fn public_viewer_renders_the_description_as_markdown() {
+        let src = include_str!("viewed_room.rs");
+        let start = src.find("fn PublicRoomView(").expect("PublicRoomView");
+        let body = &src[start..];
+        let body = &body[..body.find("\n#[cfg(test)]").unwrap_or(body.len())];
+        assert!(body.contains("room_description_to_html("));
+        assert!(body.contains("dangerous_inner_html: \"{description}\""));
+        assert!(
+            !body.contains("\"{description}\" }"),
+            "description shown as text"
         );
     }
 }

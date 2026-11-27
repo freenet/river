@@ -70,11 +70,11 @@ use self::history_scroll::{
 };
 use self::history_scroll::{remember_reading_position, resolve_rendered_range, ReaderPosition};
 use self::history_window::{grown_window, BACKFILL_LEAD_PX, INITIAL_WINDOW_ITEMS};
-pub(crate) use self::markdown::message_to_html;
 use self::markdown::{
     clean_reply_preview, description_to_html, member_names_fingerprint, prune_message_html_cache,
     render_message_html_cached, running_behind_freenet_gateway,
 };
+pub(crate) use self::markdown::{message_to_html, room_description_to_html};
 use self::mobile_message_actions::{MobileActionsEntry, RowTarget};
 use self::mobile_message_sheet::{MobileAction, MobileMessageSheet};
 use self::mobile_surface::MobileSurfaceGuard;
