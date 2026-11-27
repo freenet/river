@@ -862,12 +862,9 @@ mod tests {
         let swap = body
             .find("LEGACY_MIGRATION_ATTEMPTED.swap(")
             .expect("guard swap");
-        let epoch = body
-            .find("SWEEP_EPOCH.fetch_add(")
-            .expect("the sweep's epoch");
         assert!(
-            swap < skip && skip < epoch,
-            "the marker is read when a sweep would start, before it does"
+            skip < swap,
+            "the marker is read before the session guard is touched"
         );
         assert!(body.contains("legacy_sweep_marker::begin_sweep("));
         assert_eq!(
@@ -915,10 +912,12 @@ mod tests {
         assert!(write > failed, "not on the failure branch");
     }
 
-    /// A Retry or reconnect that begins a new attempt while the marker read is
-    /// pending must not let the old call start or supersede a sweep.
+    /// A reconnect that begins a new attempt while the marker read is pending:
+    /// the old call must change nothing, so the NEWER attempt finds the session
+    /// guard clear, passes `sweep_start` and sweeps.
     #[test]
-    fn a_new_attempt_during_the_marker_read_stops_the_old_call() {
+    fn a_new_attempt_during_the_marker_read_still_sweeps() {
+        use super::super::chat_delegate::{sweep_start, SweepStart};
         let body = fn_body(
             include_str!("chat_delegate.rs"),
             "pub(crate) async fn fire_legacy_migration_request() -> bool {",
@@ -932,17 +931,27 @@ mod tests {
         let recheck = body
             .find("if !load_attempt_is_current(attempt_at_read) {")
             .expect("the attempt is rechecked after the read");
-        let epoch = body.find("SWEEP_EPOCH.fetch_add(").expect("sweep start");
-        assert!(capture < read && read < recheck && recheck < epoch);
-        let stale = &body[recheck..epoch];
+        let swap = body
+            .find("LEGACY_MIGRATION_ATTEMPTED.swap(")
+            .expect("the session guard");
+        let start = body.find("sweep_start(").expect("sweep_start");
         assert!(
-            stale.contains("return false;"),
-            "a stale call starts nothing"
+            capture < read && read < recheck && recheck < swap && swap < start,
+            "read and recheck come before the guard and sweep_start"
         );
-        // The session guard this call took is handed back, but only when no
-        // sweep started meanwhile.
-        assert!(stale.contains("!already && SWEEP_EPOCH.load(Ordering::Relaxed) == epoch_at_read"));
-        assert!(stale.contains("LEGACY_MIGRATION_ATTEMPTED.store(false"));
+        // Nothing between the capture and the end of the stale branch touches
+        // the guard or the sweep state; there is no handback.
+        let before_guard = &body[capture..swap];
+        for touched in [
+            "LEGACY_MIGRATION_ATTEMPTED",
+            "SWEEP_EPOCH",
+            "SWEEP_RUNNING_FOR",
+            "take_sweep_rearm",
+        ] {
+            assert!(!before_guard.contains(touched), "{touched}");
+        }
+        // The consequence for the newer attempt: guard clear, nothing running.
+        assert_eq!(sweep_start(false, 0, 5), SweepStart::Fresh);
     }
 
     /// `note_legacy_absent` may be reached only from the typed "delegate
