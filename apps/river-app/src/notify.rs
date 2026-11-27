@@ -1568,6 +1568,15 @@ mod tests {
             !s.recently_in_front(Instant::now(), grace),
             "hiding clears it"
         );
+        // With no focus event ever, hiding still leaves the next show on the fallback.
+        let mut s = RiverApp::detached();
+        s.shown_by_tray();
+        s.hidden_by_tray();
+        assert!(!s.window_in_front());
+        s.shown_by_tray();
+        assert!(s.window_in_front(), "focus_known was not set by the hide");
+        s.hidden_by_tray();
+        assert!(!s.window_in_front());
     }
 
     #[test]
