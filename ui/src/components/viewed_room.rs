@@ -5,7 +5,9 @@ use crate::components::app::chat_delegate::{RoomsLoadState, ROOMS_LOAD_STATE};
 use crate::components::app::freenet_api::freenet_synchronizer::SynchronizerStatus;
 use crate::components::app::{MobileView, MOBILE_VIEW, ROOMS, SYNC_STATUS};
 use crate::components::back_to_chat::BackToChatButton;
-use crate::components::icons::{line_icon, MENU_ICON_PATH};
+use crate::components::icons::{
+    line_icon, CHEVRON_DOWN_ICON_PATH, CHEVRON_UP_ICON_PATH, MENU_ICON_PATH,
+};
 use crate::components::room_list::receive_invitation_modal::invitation_accept_disabled;
 use crate::public_join::{self, offers_join, JoinPhase, JOIN};
 use crate::public_room::{
@@ -510,6 +512,110 @@ pub fn ViewedRailRow() -> Element {
     }
 }
 
+/// The viewer header's description: markdown, one line collapsed, with the
+/// member header's chevron when it does not fit (same classes, same overflow
+/// check, same renderer; freenet/river#1077). Images are shown as text.
+#[component]
+fn ViewedRoomDescription(text: String) -> Element {
+    use crate::components::conversation::{note_description_overflow, room_description_class};
+    let html = use_memo(use_reactive!(|text| {
+        crate::components::conversation::room_description_to_html(&text)
+    }));
+    let mut expanded = use_signal(|| false);
+    let overflows = use_signal(|| false);
+    // The overflow check reads the DOM, so it runs after the render that
+    // changed the text or the expansion.
+    use_effect(move || {
+        let _ = html.read();
+        let _ = expanded.read();
+        let mut overflows = overflows;
+        crate::util::defer(move || note_description_overflow(&mut overflows));
+    });
+    // Width changes do not change the text, so watch the column (as the
+    // member header does) and remeasure.
+    #[cfg(target_arch = "wasm32")]
+    {
+        use std::{cell::RefCell, rc::Rc};
+        use wasm_bindgen::prelude::*;
+        type Watch = (
+            web_sys::Element,
+            web_sys::ResizeObserver,
+            Closure<dyn FnMut(js_sys::Array)>,
+        );
+        let watch = use_hook(|| Rc::new(RefCell::new(None::<Watch>)));
+        {
+            let watch = watch.clone();
+            use_drop(move || {
+                if let Some((_, observer, _)) = watch.borrow_mut().take() {
+                    observer.disconnect();
+                }
+            });
+        }
+        use_effect(move || {
+            let _ = html.read();
+            let Some(column) = crate::components::conversation::header_column_element() else {
+                return;
+            };
+            if watch
+                .borrow()
+                .as_ref()
+                .is_some_and(|(attached, _, _)| attached == &column)
+            {
+                return;
+            }
+            if let Some((_, observer, _)) = watch.borrow_mut().take() {
+                observer.disconnect();
+            }
+            let cb = Closure::wrap(Box::new(move |_: js_sys::Array| {
+                crate::util::defer(move || note_description_overflow(&mut { overflows }));
+            }) as Box<dyn FnMut(js_sys::Array)>);
+            if let Ok(observer) = web_sys::ResizeObserver::new(cb.as_ref().unchecked_ref()) {
+                observer.observe(&column);
+                *watch.borrow_mut() = Some((column, observer, cb));
+            }
+        });
+    }
+    let is_expanded = *expanded.read();
+    let can_toggle = is_expanded || *overflows.read();
+    let label = if is_expanded {
+        "Hide room description"
+    } else {
+        "Show room description"
+    };
+    rsx! {
+        div { class: "flex items-start gap-1 min-w-0",
+            div {
+                // The ids the shared overflow check looks up; the member
+                // header is not on screen while the viewer is.
+                id: "room-header-description",
+                "data-testid": "viewed-room-description",
+                "data-expanded": if is_expanded { "true" } else { "false" },
+                class: room_description_class(is_expanded, can_toggle),
+                dangerous_inner_html: "{html}",
+            }
+            if can_toggle {
+                button {
+                    r#type: "button",
+                    "data-testid": "viewed-room-description-toggle",
+                    class: "flex-shrink-0 inline-flex items-center justify-center w-6 h-6 -my-1.5 rounded-lg text-text-muted hover:text-accent hover:bg-surface transition-colors",
+                    "aria-expanded": if is_expanded { "true" } else { "false" },
+                    "aria-label": label,
+                    title: label,
+                    onclick: move |_| {
+                        let next = !*expanded.peek();
+                        crate::util::defer(move || expanded.set(next));
+                    },
+                    if is_expanded {
+                        {line_icon(CHEVRON_UP_ICON_PATH, 14)}
+                    } else {
+                        {line_icon(CHEVRON_DOWN_ICON_PATH, 14)}
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[component]
 fn PublicRoomView(
     owner_vk: Option<ed25519_dalek::VerifyingKey>,
@@ -592,14 +698,14 @@ fn PublicRoomView(
                     onclick: move |_| crate::util::defer(move || *MOBILE_VIEW.write() = MobileView::Rooms),
                     {line_icon(MENU_ICON_PATH, 20)}
                 }
-                div { class: "min-w-0 flex-1",
+                div { id: "room-header-column", class: "min-w-0 flex-1",
                     h2 {
                         class: "text-[16px] leading-6 font-semibold text-text truncate",
                         "data-testid": "viewed-room-name",
                         "{name}"
                     }
                     if let Some(description) = description {
-                        p { class: "text-sm text-text-secondary break-words", "{description}" }
+                        ViewedRoomDescription { text: description }
                     }
                 }
                 button {
@@ -1372,6 +1478,35 @@ mod load_state_tests {
         assert!(
             load_settled(RoomsLoadState::LoadFailed),
             "a failed load must not hold a visitor's answer forever"
+        );
+    }
+}
+
+#[cfg(test)]
+mod description_tests {
+    /// freenet/river#1077: the viewer header showed the description as plain
+    /// text, so markdown links appeared as `[label](url)`. The header must
+    /// render it with the same renderer as the member header, as HTML.
+    #[test]
+    fn public_viewer_renders_the_description_as_markdown() {
+        let src = include_str!("viewed_room.rs");
+        let start = src.find("fn ViewedRoomDescription(").expect("component");
+        let end = src.find("fn PublicRoomView(").expect("PublicRoomView");
+        let comp = &src[start..end];
+        assert!(comp.contains("room_description_to_html("));
+        assert!(comp.contains("dangerous_inner_html: \"{html}\""));
+        // The member header's one-line clamp and chevron, not a private copy
+        // of its classes.
+        assert!(comp.contains("room_description_class(is_expanded, can_toggle)"));
+        assert!(comp.contains("note_description_overflow("));
+        assert!(comp.contains("viewed-room-description-toggle"));
+        assert!(comp.contains("ResizeObserver::new"));
+        let view = &src[end..];
+        let view = &view[..view.find("\n#[cfg(test)]").unwrap_or(view.len())];
+        assert!(view.contains("ViewedRoomDescription { text: description }"));
+        assert!(
+            !view.contains("\"{description}\" }"),
+            "description shown as text"
         );
     }
 }

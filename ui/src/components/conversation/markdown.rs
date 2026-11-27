@@ -226,6 +226,12 @@ pub(super) fn description_to_html(text: &str, behind_gateway: bool) -> String {
     }
 }
 
+/// [`description_to_html`] for a reader's own gateway state. Used by the
+/// public-room viewer, which has no `ROOMS` entry to share the header's memo.
+pub(crate) fn room_description_to_html(text: &str) -> String {
+    description_to_html(text, running_behind_freenet_gateway())
+}
+
 /// Text not rendered as markdown: escaped, with each line break kept.
 fn plain_text_to_html(text: &str) -> String {
     let text = text.replace("\r\n", "\n").replace('\r', "\n");
@@ -3928,5 +3934,30 @@ mod tests {
             html.contains("river-mention-self"),
             "legacy self-mention must get the self class: {html}"
         );
+    }
+}
+
+#[cfg(test)]
+mod description_header_tests {
+    use super::*;
+
+    /// The Freenet Official room's description (freenet/river#1077).
+    const OFFICIAL_DESCRIPTION: &str = "[Dashboard](/ \"Local node dashboard\") · [Network](https://telemetry.freenet.org/ \"Global network telemetry\") · [FAQ](https://freenet.org/faq \"Freenet FAQ\") · [Explore with Atlas](http://127.0.0.1:7509/v1/contract/web/771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEH9/ \"Atlas search engine\") · [Blog](http://127.0.0.1:7509/v1/contract/web/CaK7kGohya2cLhoXQTLgBsrjDVLZKszD6ktexjRSaXCf/ \"Freenet blog\") · [Report a Bug](https://freenet.org/bug/) · [🌦️](https://freenet.org/open#H95nuEskNdZkteREY4fVRVQyj3cjiG5iNJcQM64pFK8p/) | *Rage, rage against the dying of the light*";
+
+    #[test]
+    fn official_description_renders_links() {
+        for gateway in [false, true] {
+            let html = description_to_html(OFFICIAL_DESCRIPTION, gateway);
+            assert!(
+                !html.contains("]("),
+                "raw markdown (gateway={gateway}): {html}"
+            );
+            assert!(html.contains(">Dashboard</a>"), "{html}");
+            assert!(html.contains(">Report a Bug</a>"), "{html}");
+            assert!(
+                html.contains("<em>Rage, rage against the dying of the light</em>"),
+                "{html}"
+            );
+        }
     }
 }
