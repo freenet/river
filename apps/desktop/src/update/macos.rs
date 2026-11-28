@@ -683,7 +683,7 @@ pub(crate) mod tests {
     fn a_release_check_accepts_a_notarized_app_of_the_same_team() {
         let chrome = Path::new("/Applications/Google Chrome.app");
         if !chrome.exists() {
-            eprintln!("skipped: no notarized third-party app on this machine");
+            println!("skipped: no notarized third-party app on this machine");
             return;
         }
         let team = team_of(chrome).expect("Chrome is Developer ID signed");
