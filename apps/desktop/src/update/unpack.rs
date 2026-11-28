@@ -22,7 +22,8 @@ use crate::release::Version;
 #[cfg(windows)]
 pub const MAX_UNPACKED: u64 = 512 * 1024 * 1024;
 /// How long the new binary gets to answer `--version` before the swap.
-const PREFLIGHT_DEADLINE: Duration = Duration::from_secs(20);
+/// Long, because the first run of a freshly written binary can wait on an antivirus scan.
+const PREFLIGHT_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Run `binary --version` and require `river <version>`.
 pub fn preflight(binary: &Path, version: Version) -> Result<(), String> {
@@ -95,8 +96,14 @@ pub fn output_within(
     );
     let end = Instant::now() + deadline;
     let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e);
+            }
         }
         if Instant::now() >= end {
             let _ = child.kill();

@@ -188,6 +188,11 @@ fn sign(args: Vec<String>) {
                     "--artifact {platform}: {named} is not a {ext} file"
                 ));
             }
+            if file.contains("UNSIGNED") {
+                die(&format!(
+                    "--artifact {platform}: {named} is an unsigned build; sign the release asset"
+                ));
+            }
             if let Some(other) = PLATFORMS
                 .iter()
                 .find(|p| **p != platform && file.contains(**p))

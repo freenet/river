@@ -19,6 +19,10 @@
 //! randomized read-only copy (App Translocation, for an app opened from Downloads without
 //! moving it), from a disk image, from a folder the user cannot write to, a bundle owned by
 //! another user, and an unsigned build (nothing to require of the new one).
+//!
+//! On a filesystem without `RENAME_SWAP` (HFS+) the exchange is two renames, and a crash
+//! between them leaves no bundle at the install path: the old one is beside it as
+//! `.river-update-aside-*.app`, and a copy is in River's data folder under `update/previous/`.
 
 use std::ffi::{CString, OsStr, OsString};
 use std::fs;
@@ -146,8 +150,11 @@ pub fn signer_of(bundle: &Path) -> Result<Option<Signer>, String> {
     cmd.args(["--display", "--verbose=2"]).arg(bundle);
     let out = output_within(cmd, TOOL_DEADLINE).map_err(|e| format!("codesign: {e}"))?;
     if !out.status.success() {
-        // Not signed at all ("code object is not signed at all").
-        return Ok(None);
+        // Only a definite answer is an answer; any other failure says nothing about the bundle.
+        if String::from_utf8_lossy(&out.stderr).contains("not signed at all") {
+            return Ok(None);
+        }
+        return Err(format!("codesign: {}", first_line(&out.stderr)));
     }
     let text =
         String::from_utf8_lossy(&out.stderr).into_owned() + &String::from_utf8_lossy(&out.stdout);
@@ -355,8 +362,15 @@ const MAX_ENTRIES: usize = 100_000;
 
 /// Refuse a zip that could write outside the folder `ditto` unpacks it into, or fill the disk,
 /// before `ditto` sees it: an absolute or `..` name, a top level that is not one `.app` folder,
-/// a symlink pointing out of the bundle (a later entry could be written through it), or more
-/// than [`MAX_BUNDLE_BYTES`] unpacked. A genuine release never trips these; they matter only
+/// a symlink pointing out of the bundle, an entry beneath a symlink (it would be written
+/// through the link), or more than [`MAX_BUNDLE_BYTES`] declared unpacked.
+///
+/// Link targets may climb (`..`) only at their start, so each link is judged from a real
+/// folder: with no entry beneath a link, every link's folder is a real one, and a target that
+/// stays inside the bundle from there cannot leave it by passing through other links (each of
+/// which stays inside too, and nothing climbs after them). This is a check of the zip's own
+/// directory; `ditto` has its own reader, and the sizes are as declared, so the signature check
+/// that follows stays the guard on what the bundle holds. A genuine release never trips these; they matter only
 /// if the update key signed something it should not have, which the signature check that
 /// follows exists to catch, and that check must not run on files already written elsewhere.
 fn scan_zip(file: &fs::File) -> Result<(), String> {
@@ -367,9 +381,12 @@ fn scan_zip(file: &fs::File) -> Result<(), String> {
     }
     let mut top: Option<std::ffi::OsString> = None;
     let mut total = 0u64;
+    let mut links: Vec<PathBuf> = Vec::new();
+    let mut names: Vec<PathBuf> = Vec::new();
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).map_err(|e| bad(&e.to_string()))?;
         let name = entry.enclosed_name().ok_or_else(|| bad("an unsafe name"))?;
+        names.push(name.clone());
         let mut parts = name.components();
         let first = parts
             .next()
@@ -400,10 +417,17 @@ fn scan_zip(file: &fs::File) -> Result<(), String> {
             // Depth below the top folder of the folder holding the link, then walk the target.
             let mut depth = name.components().count() as i64 - 2;
             let target = Path::new(OsStr::from_bytes(&target));
+            let mut descended = false;
             for c in target.components() {
                 match c {
-                    std::path::Component::Normal(_) => depth += 1,
+                    std::path::Component::Normal(_) => {
+                        depth += 1;
+                        descended = true;
+                    }
                     std::path::Component::CurDir => {}
+                    std::path::Component::ParentDir if descended => {
+                        return Err(bad("a link that climbs after descending"));
+                    }
                     std::path::Component::ParentDir => depth -= 1,
                     _ => return Err(bad("a link to an absolute path")),
                 }
@@ -411,7 +435,15 @@ fn scan_zip(file: &fs::File) -> Result<(), String> {
                     return Err(bad("a link out of the app"));
                 }
             }
+            links.push(name.clone());
         }
+    }
+    // After every link is known, whatever order the zip lists them in.
+    if names
+        .iter()
+        .any(|n| links.iter().any(|l| n.starts_with(l) && n != l))
+    {
+        return Err(bad("an entry beneath a link"));
     }
     if top.is_none() {
         return Err("the download holds no River.app".into());
@@ -494,12 +526,12 @@ impl MacInstaller {
     /// `Ok(None)`: the running bundle is not signed by a developer, so nothing can be required
     /// of a new one. `Err`: `codesign` did not answer.
     fn check(&self, bundle: &Path) -> Result<Option<Check>, String> {
-        let mut known = self.check.lock().unwrap();
-        if let Some(check) = known.as_ref() {
+        if let Some(check) = self.check.lock().unwrap().as_ref() {
             return Ok(check.clone());
         }
+        // Not under the lock: codesign can take a while, and `support()` is asked from the UI.
         let check = signer_of(bundle)?.map(Check::SameSigner);
-        *known = Some(check.clone());
+        *self.check.lock().unwrap() = Some(check.clone());
         Ok(check)
     }
 }
@@ -1128,6 +1160,27 @@ pub(crate) mod tests {
                     w.add_symlink("River.app/Contents/out", "../../..", opts)
                         .unwrap();
                     file(w, "River.app/Contents/out/evil");
+                }),
+            ),
+            (
+                "a link that climbs after descending",
+                hostile(&|w| {
+                    w.add_symlink("River.app/x", ".", opts).unwrap();
+                    w.add_symlink("River.app/y", "x/..", opts).unwrap();
+                }),
+            ),
+            (
+                "an entry beneath a link",
+                hostile(&|w| {
+                    w.add_symlink("River.app/x", "Contents", opts).unwrap();
+                    file(w, "River.app/x/evil");
+                }),
+            ),
+            (
+                "an entry beneath a link",
+                hostile(&|w| {
+                    file(w, "River.app/x/evil");
+                    w.add_symlink("River.app/x", "Contents", opts).unwrap();
                 }),
             ),
             (

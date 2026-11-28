@@ -667,7 +667,22 @@ impl Updater {
             // A swap that was never confirmed. If this River is the one that was replaced (the
             // launch failed and so did the rollback), try the rollback again now; otherwise
             // the swapped-in binary is still on probation and nothing more is applied.
-            if p.from == self.cfg.running.to_string() {
+            // A record written just before a swap that never happened (River was killed in
+            // between, or the record could not be cleared afterwards): the install is still
+            // what this River started as and there is no copy. Nothing to roll back.
+            let never_swapped = p.from == self.cfg.running.to_string()
+                && fs::symlink_metadata(&p.previous).is_err()
+                && p.install_path == install_path
+                && self.installer.fingerprint(&install_path).ok().as_deref()
+                    == Some(p.previous_sha256.as_str());
+            if never_swapped {
+                state::modify(&self.cfg.data_dir, |s| {
+                    if s.probation.as_ref() == Some(&p) {
+                        s.probation = None;
+                    }
+                })?;
+                st = state::try_load(&self.cfg.data_dir)?;
+            } else if p.from == self.cfg.running.to_string() {
                 let (message, restored) =
                     self.restore_probation(&p, "the earlier restore did not finish");
                 if !restored {
@@ -734,11 +749,18 @@ impl Updater {
             .map_err(|e| io("couldn't read the downloaded update", e))?;
         let prepared = self.installer.prepare(file, offer.version, install_path)?;
         let previous_dir = self.dir().join("previous");
-        // `.exe` on Windows, so the copy a failed rollback points the user at can be run.
+        // `.exe` on Windows and `.app` on macOS, so the copy a failed rollback points the user
+        // at can be opened.
         let previous = previous_dir.join(format!(
             "river-{}{}",
             self.cfg.running,
-            if cfg!(windows) { ".exe" } else { "" }
+            if cfg!(windows) {
+                ".exe"
+            } else if cfg!(target_os = "macos") {
+                ".app"
+            } else {
+                ""
+            }
         ));
         let _ = fs::remove_dir_all(&previous_dir);
         let Some(expected) = self.install_sha.lock().unwrap().clone() else {

@@ -1056,6 +1056,34 @@ fn a_failed_swap_that_left_nothing_installed_keeps_the_copy_and_says_where() {
     }
 }
 
+/// A record left by a River killed after writing it but before the swap: nothing was replaced
+/// and there is no copy, so the next apply clears it quietly and goes ahead.
+#[test]
+fn a_record_of_a_swap_that_never_happened_is_cleared_without_a_notice() {
+    let ports = Ports::lock();
+    let server = ports.serve(vec![]);
+    Release::new("0.2.0", 10, healthy("0.2.0")).publish(&server);
+    let rig = Rig::new();
+    let u = rig.updater("0.1.0", &server.url("/manifest.json"), 1);
+    offer(u.check(&KeyRecord::Unavailable).unwrap());
+    u.download(&mut |_, _| {}).unwrap();
+    state::modify(rig.data.path(), |s| {
+        s.probation = Some(state::Probation {
+            from: "0.1.0".into(),
+            to: "0.2.0".into(),
+            install_path: rig.install.canonicalize().unwrap(),
+            previous: rig.data.path().join("update/previous/river-0.1.0"),
+            previous_sha256: hex::encode(Sha256::digest(OLD)),
+            starts: 0,
+        });
+    })
+    .unwrap();
+    let applied = u.apply().unwrap();
+    assert_eq!(rig.installed(), healthy("0.2.0"));
+    assert_eq!(fs::read(&applied.probation.previous).unwrap(), OLD);
+    assert_eq!(u.take_notice(), None, "no rollback was reported");
+}
+
 #[test]
 fn the_apply_lock_is_held_until_the_launch_is_over() {
     let ports = Ports::lock();

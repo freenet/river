@@ -76,8 +76,17 @@ fn folded(p: &Path) -> String {
 /// `\\?\C:\x` -> `C:\x`, for messages and comparisons. `canonicalize` returns the long form.
 fn plain(p: &Path) -> PathBuf {
     let s = p.to_string_lossy();
+    // Only a drive path (`\\?\C:\...`): a UNC or volume-GUID path keeps its prefix, which
+    // stripping would turn into a relative path.
     match s.strip_prefix(r"\\?\") {
-        Some(rest) if !rest.starts_with("UNC\\") => PathBuf::from(rest),
+        Some(rest)
+            if rest.len() >= 3
+                && rest.as_bytes()[0].is_ascii_alphabetic()
+                && rest.as_bytes()[1] == b':'
+                && rest.as_bytes()[2] == b'\\' =>
+        {
+            PathBuf::from(rest)
+        }
         _ => p.to_path_buf(),
     }
 }
