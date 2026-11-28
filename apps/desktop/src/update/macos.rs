@@ -421,7 +421,7 @@ fn extract_zip(file: fs::File, dest: &Path) -> Result<(), String> {
             return Err(bad("too deep"));
         }
         // Resource forks and extended attributes, which a signed bundle does not need (and
-        // `codesign --strict` refuses), whether set aside under `__MACOSX/` or stored inline as
+        // would break the bundle's seal), whether set aside under `__MACOSX/` or stored inline as
         // AppleDouble `._name` files.
         if parts[0] == b"__MACOSX" || parts[parts.len() - 1].starts_with(b"._") {
             continue;

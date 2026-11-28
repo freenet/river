@@ -105,13 +105,21 @@ rm -f "$OUT_ZIP"
 # self-update unpacks the zip itself (apps/desktop/src/update/macos.rs, `extract_zip`), which
 # skips them. Checked below, with the compression methods that reader supports.
 ditto -c -k --norsrc --noextattr --keepParent "$APP" "$OUT_ZIP"
-if zipinfo -1 "$OUT_ZIP" | grep -Eq '(^|/)(__MACOSX|\._)'; then
+# Listings captured first, so a zipinfo that fails stops the script (set -e) instead of
+# reading as "nothing wrong".
+names="$(zipinfo -1 "$OUT_ZIP")"
+listing="$(zipinfo "$OUT_ZIP")"
+if grep -Eq '(^|/)(__MACOSX|\._)' <<<"$names"; then
     echo "sign-macos.sh: $OUT_ZIP holds resource forks or AppleDouble files" >&2
     exit 1
 fi
-# zipinfo's sixth column is the method: "stor" or "defX"/"defN"/"defF"/"defS" (deflate).
-if zipinfo "$OUT_ZIP" | awk 'NF >= 9 && $1 ~ /^[-dl]/ && $6 !~ /^(stor|def)/ { bad = 1 } END { exit !bad }'; then
-    echo "sign-macos.sh: $OUT_ZIP uses a compression method River's updater cannot read" >&2
+# zipinfo's sixth column is the method. The updater's reader takes stored and plain deflate
+# only (defN/defX/defF/defS), not Deflate64 or anything else. Every entry must be counted, so a
+# changed listing format fails instead of passing.
+entries="$(grep -c . <<<"$names")"
+good="$(awk 'NF >= 9 && $1 ~ /^[-dl]/ && $6 ~ /^(stor|def[NXFS])$/ { n++ } END { print n + 0 }' <<<"$listing")"
+if [[ "$entries" -eq 0 || "$good" -ne "$entries" ]]; then
+    echo "sign-macos.sh: $OUT_ZIP: $good of $entries entries use a compression method River's updater can read" >&2
     exit 1
 fi
 
