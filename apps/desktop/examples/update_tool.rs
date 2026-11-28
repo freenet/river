@@ -188,7 +188,7 @@ fn sign(args: Vec<String>) {
                     "--artifact {platform}: {named} is not a {ext} file"
                 ));
             }
-            if file.contains("UNSIGNED") {
+            if file.to_ascii_lowercase().contains("unsigned") {
                 die(&format!(
                     "--artifact {platform}: {named} is an unsigned build; sign the release asset"
                 ));

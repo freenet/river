@@ -26,7 +26,7 @@
 
 use std::ffi::{CString, OsStr, OsString};
 use std::fs;
-use std::io::{Read, Seek};
+use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -355,58 +355,86 @@ fn sync_tree(root: &Path) -> std::io::Result<()> {
     }
 }
 
-/// The most a release zip may unpack to. River.app is about 50 MiB.
+/// The most a release zip may unpack to (bytes written). River.app is about 50 MiB.
 const MAX_BUNDLE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// The most entries a release zip may hold.
 const MAX_ENTRIES: usize = 100_000;
 
-/// Refuse a zip that could write outside the folder `ditto` unpacks it into, or fill the disk,
-/// before `ditto` sees it: an absolute or `..` name, a top level that is not one `.app` folder,
-/// a symlink pointing out of the bundle, an entry beneath a symlink (it would be written
-/// through the link), or more than [`MAX_BUNDLE_BYTES`] declared unpacked.
+/// Unpack the release zip `file` into the new folder `dest`, writing nothing anywhere else.
 ///
-/// Link targets may climb (`..`) only at their start, so each link is judged from a real
-/// folder: with no entry beneath a link, every link's folder is a real one, and a target that
-/// stays inside the bundle from there cannot leave it by passing through other links (each of
-/// which stays inside too, and nothing climbs after them). This is a check of the zip's own
-/// directory; `ditto` has its own reader, and the sizes are as declared, so the signature check
-/// that follows stays the guard on what the bundle holds. A genuine release never trips these; they matter only
-/// if the update key signed something it should not have, which the signature check that
-/// follows exists to catch, and that check must not run on files already written elsewhere.
-fn scan_zip(file: &fs::File) -> Result<(), String> {
+/// River does this itself rather than with `ditto -x`, so the names it checks are the names it
+/// writes (two zip readers can disagree about a name, and the default macOS volume treats `X`
+/// and `x` as one). Names are read as POSIX paths and refused if absolute or holding `..`,
+/// `.`, an empty part or a backslash; the top level must be one `.app` folder (resource forks
+/// under `__MACOSX/` are skipped, a signed bundle does not need them). Every parent folder is
+/// checked on disk, so with the volume's own case and Unicode rules, and an entry whose parent
+/// is a link (or a file) is refused: nothing is written through a link. Files are created new,
+/// never opened over something already there. A link's target may climb (`..`) only at its
+/// start and never above the bundle. Bytes actually written are capped at [`MAX_BUNDLE_BYTES`].
+/// File modes keep their permission bits only (no setuid). A genuine release never trips any
+/// of this; it matters if the update key signed something it should not have, before the
+/// signature check that follows can look at it.
+fn extract_zip(file: fs::File, dest: &Path) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
     let bad = |why: &str| format!("the download is not a River release archive ({why})");
+    let io = |e: std::io::Error| format!("couldn't unpack the new River: {e}");
     let mut archive = zip::ZipArchive::new(file).map_err(|e| bad(&e.to_string()))?;
     if archive.len() > MAX_ENTRIES {
         return Err(bad("too many entries"));
     }
-    let mut top: Option<std::ffi::OsString> = None;
-    let mut total = 0u64;
-    let mut links: Vec<PathBuf> = Vec::new();
-    let mut names: Vec<PathBuf> = Vec::new();
+    fs::create_dir(dest).map_err(io)?;
+    let mut top: Option<Vec<u8>> = None;
+    let mut written = 0u64;
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).map_err(|e| bad(&e.to_string()))?;
-        let name = entry.enclosed_name().ok_or_else(|| bad("an unsafe name"))?;
-        names.push(name.clone());
-        let mut parts = name.components();
-        let first = parts
-            .next()
-            .ok_or_else(|| bad("an empty name"))?
-            .as_os_str()
-            .to_owned();
-        // ditto keeps resource forks and extended attributes under `__MACOSX/`.
-        if first != "__MACOSX" {
-            if !Path::new(&first).extension().is_some_and(|x| x == "app") {
-                return Err(bad("something other than an app"));
-            }
-            match &top {
-                None => top = Some(first.clone()),
-                Some(t) if *t == first => {}
-                Some(_) => return Err(bad("more than one app")),
+        let raw = entry.name_raw().to_vec();
+        let is_dir = raw.ends_with(b"/");
+        let trimmed = raw.strip_suffix(b"/").unwrap_or(&raw);
+        if trimmed.is_empty()
+            || trimmed.starts_with(b"/")
+            || trimmed.contains(&b'\\')
+            || trimmed.contains(&0)
+        {
+            return Err(bad("an unsafe name"));
+        }
+        let parts: Vec<&[u8]> = trimmed.split(|b| *b == b'/').collect();
+        if parts
+            .iter()
+            .any(|p| p.is_empty() || *p == b"." || *p == b"..")
+        {
+            return Err(bad("an unsafe name"));
+        }
+        if parts[0] == b"__MACOSX" {
+            continue;
+        }
+        if !parts[0].to_ascii_lowercase().ends_with(b".app") {
+            return Err(bad("something other than an app"));
+        }
+        match &top {
+            None => top = Some(parts[0].to_ascii_lowercase()),
+            Some(t) if *t == parts[0].to_ascii_lowercase() => {}
+            Some(_) => return Err(bad("more than one app")),
+        }
+        let mut path = dest.to_path_buf();
+        for part in &parts[..parts.len() - 1] {
+            path.push(OsStr::from_bytes(part));
+            match fs::symlink_metadata(&path) {
+                Ok(m) if m.file_type().is_dir() => {}
+                Ok(_) => return Err(bad("an entry beneath a link")),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    fs::create_dir(&path).map_err(io)?
+                }
+                Err(e) => return Err(io(e)),
             }
         }
-        total = total.saturating_add(entry.size());
-        if total > MAX_BUNDLE_BYTES {
-            return Err(bad("too large"));
+        path.push(OsStr::from_bytes(parts[parts.len() - 1]));
+        if is_dir {
+            match fs::symlink_metadata(&path) {
+                Ok(m) if m.file_type().is_dir() => {}
+                Ok(_) => return Err(bad("a folder where something else is")),
+                Err(_) => fs::create_dir(&path).map_err(io)?,
+            }
+            continue;
         }
         if entry.is_symlink() {
             let mut target = Vec::new();
@@ -415,7 +443,7 @@ fn scan_zip(file: &fs::File) -> Result<(), String> {
                 .read_to_end(&mut target)
                 .map_err(|e| bad(&e.to_string()))?;
             // Depth below the top folder of the folder holding the link, then walk the target.
-            let mut depth = name.components().count() as i64 - 2;
+            let mut depth = parts.len() as i64 - 2;
             let target = Path::new(OsStr::from_bytes(&target));
             let mut descended = false;
             for c in target.components() {
@@ -435,15 +463,32 @@ fn scan_zip(file: &fs::File) -> Result<(), String> {
                     return Err(bad("a link out of the app"));
                 }
             }
-            links.push(name.clone());
+            // Fails if anything is already there.
+            std::os::unix::fs::symlink(target, &path).map_err(io)?;
+            continue;
         }
-    }
-    // After every link is known, whatever order the zip lists them in.
-    if names
-        .iter()
-        .any(|n| links.iter().any(|l| n.starts_with(l) && n != l))
-    {
-        return Err(bad("an entry beneath a link"));
+        let mode = entry.unix_mode().unwrap_or(0o644) & 0o777;
+        let mut out = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&path)
+            .map_err(io)?;
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = entry.read(&mut buf).map_err(|e| bad(&e.to_string()))?;
+            if n == 0 {
+                break;
+            }
+            written += n as u64;
+            if written > MAX_BUNDLE_BYTES {
+                return Err(bad("too large"));
+            }
+            out.write_all(&buf[..n]).map_err(io)?;
+        }
+        // The umask may have taken bits `mode` asked for (the execute bits a bundle needs).
+        out.set_permissions(fs::Permissions::from_mode(mode))
+            .map_err(io)?;
     }
     if top.is_none() {
         return Err("the download holds no River.app".into());
@@ -570,20 +615,13 @@ impl Installer for MacInstaller {
 
     fn prepare(
         &self,
-        mut artifact: fs::File,
+        artifact: fs::File,
         version: Version,
         install_path: &Path,
     ) -> Result<PathBuf, String> {
         let check = self
             .check(install_path)?
             .ok_or("this copy of River is not signed, so it can't check an update")?;
-        let scanned = artifact
-            .try_clone()
-            .map_err(|e| format!("couldn't read the downloaded update: {e}"))?;
-        scan_zip(&scanned)?;
-        artifact
-            .seek(std::io::SeekFrom::Start(0))
-            .map_err(|e| format!("couldn't read the downloaded update: {e}"))?;
         let dir = install_path
             .parent()
             .ok_or("the install path has no directory")?;
@@ -591,21 +629,8 @@ impl Installer for MacInstaller {
             .prefix(".river-update-")
             .tempdir_in(dir)
             .map_err(|e| format!("couldn't write beside the installed River: {e}"))?;
-        // ditto needs a path. This copy is of the file the caller already hashed.
-        let zip = work.path().join("artifact.zip");
-        {
-            let mut out = fs::File::create(&zip).map_err(|e| e.to_string())?;
-            std::io::copy(&mut artifact, &mut out)
-                .map_err(|e| format!("couldn't read the downloaded update: {e}"))?;
-        }
         let unpacked = work.path().join("x");
-        ditto(&[
-            OsStr::new("-x"),
-            OsStr::new("-k"),
-            zip.as_os_str(),
-            unpacked.as_os_str(),
-        ])
-        .map_err(|e| format!("the download is not a valid archive: {e}"))?;
+        extract_zip(artifact, &unpacked)?;
         let mut apps = Vec::new();
         for e in fs::read_dir(&unpacked)
             .map_err(|e| e.to_string())?
@@ -1115,14 +1140,31 @@ pub(crate) mod tests {
     }
 
     /// A zip that could write outside the folder it is unpacked into, or is not one app, is
-    /// refused before `ditto` runs; a real `ditto` zip of a bundle with links passes.
+    /// refused, and nothing lands outside that folder; a real `ditto` zip of a signed bundle
+    /// with links unpacks with its signature intact.
     #[test]
-    fn a_hostile_zip_is_refused_before_it_is_unpacked() {
+    fn a_hostile_zip_is_refused_and_writes_nothing_outside() {
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
         let good = dir.path().join("good.zip");
-        zip_of(&bundle(dir.path(), "River.app", "0.2.0"), &good);
-        scan_zip(&fs::File::open(&good).unwrap()).unwrap();
+        let build = dir.path().join("build");
+        fs::create_dir(&build).unwrap();
+        zip_of(&bundle(&build, "River.app", "0.2.0"), &good);
+        let out = dir.path().join("good-out");
+        extract_zip(fs::File::open(&good).unwrap(), &out).unwrap();
+        let app = out.join("River.app");
+        verify(&app, &Check::IntactOnly).unwrap();
+        assert_eq!(version_of(&app), "river 0.2.0");
+        assert!(
+            fs::symlink_metadata(app.join("Contents/Resources/link.txt"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        let n = std::cell::Cell::new(0);
+        let outside = dir.path().join("outside");
+        fs::create_dir(&outside).unwrap();
 
         let opts = zip::write::SimpleFileOptions::default();
         type Writer = zip::ZipWriter<std::io::Cursor<Vec<u8>>>;
@@ -1131,7 +1173,11 @@ pub(crate) mod tests {
             build(&mut w);
             let path = dir.path().join("hostile.zip");
             fs::write(&path, w.finish().unwrap().into_inner()).unwrap();
-            scan_zip(&fs::File::open(&path).unwrap())
+            n.set(n.get() + 1);
+            // Unpacked two levels inside `outside`, so a write that escapes lands in it.
+            let dest = outside.join(format!("a{}", n.get())).join("x");
+            fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            extract_zip(fs::File::open(&path).unwrap(), &dest)
         };
         let file = |w: &mut Writer, name: &str| {
             w.start_file(name, opts).unwrap();
@@ -1142,7 +1188,8 @@ pub(crate) mod tests {
                 "an unsafe name",
                 hostile(&|w| file(w, "River.app/../../evil")),
             ),
-            ("an unsafe name", hostile(&|w| file(w, "/tmp/evil"))),
+            // The zip writer may strip the leading slash; refused either way.
+            ("River release archive", hostile(&|w| file(w, "/tmp/evil"))),
             (
                 "something other than an app",
                 hostile(&|w| file(w, "evil.sh")),
@@ -1177,11 +1224,15 @@ pub(crate) mod tests {
                 }),
             ),
             (
-                "an entry beneath a link",
+                "a link that climbs after descending",
                 hostile(&|w| {
                     file(w, "River.app/x/evil");
-                    w.add_symlink("River.app/x", "Contents", opts).unwrap();
+                    w.add_symlink("River.app/x", "Contents/..", opts).unwrap();
                 }),
+            ),
+            (
+                "an unsafe name",
+                hostile(&|w| file(w, "River.app\\..\\..\\evil")),
             ),
             (
                 "a link to an absolute path",
@@ -1194,7 +1245,31 @@ pub(crate) mod tests {
             let err = result.unwrap_err();
             assert!(err.contains(want), "{want}: {err}");
         }
-        // Resource forks under `__MACOSX/` beside the app are allowed.
+        // The default macOS volume ignores case, so `X` is the link `x`: refused there. On a
+        // case-sensitive volume `X` is a real folder and the link stays inside the app.
+        let probe = dir.path().join("CaseProbe");
+        fs::write(&probe, b"").unwrap();
+        let ignores_case = dir.path().join("caseprobe").exists();
+        let folded = hostile(&|w| {
+            w.add_symlink("River.app/x", ".", opts).unwrap();
+            w.add_symlink("River.app/X/X/X/l", "../../..", opts)
+                .unwrap();
+            file(w, "River.app/L/evil");
+        });
+        if ignores_case {
+            let err = folded.unwrap_err();
+            assert!(err.contains("an entry beneath a link"), "{err}");
+        } else {
+            folded.unwrap();
+        }
+        // Nothing was written outside the folders unpacked into.
+        for e in fs::read_dir(&outside).unwrap().flatten() {
+            assert!(e.file_name().to_string_lossy().starts_with('a'), "{e:?}");
+            for f in fs::read_dir(e.path()).unwrap().flatten() {
+                assert_eq!(f.file_name(), "x", "{f:?}");
+            }
+        }
+        // Resource forks under `__MACOSX/` beside the app are skipped.
         hostile(&|w| {
             file(w, "River.app/Contents/Info.plist");
             file(w, "__MACOSX/River.app/._Info.plist");

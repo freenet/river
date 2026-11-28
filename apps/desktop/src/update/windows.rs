@@ -307,7 +307,14 @@ impl Installer for WindowsInstaller {
             // there instead, so a River is installed whatever happens to this process.
             if fs::symlink_metadata(install_path).is_err() {
                 return match copy_hashing(previous, install_path) {
-                    Ok(_) => Err(format!("{e}; the copy kept beforehand was put back")),
+                    Ok(put) if put == sha => {
+                        Err(format!("{e}; the copy kept beforehand was put back"))
+                    }
+                    Ok(_) => Err(format!(
+                        "{e}; the copy put back does not match what was installed, so check \
+                         {} before running it",
+                        install_path.display()
+                    )),
                     Err(c) => Err(format!("{e}; and the kept copy could not be put back: {c}")),
                 };
             }
