@@ -66,6 +66,10 @@ notify-rust = { version = "4.19", default-features = false, features = ["preview
 notify-rust = { version = "4.19", default-features = false }
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Registry", "Win32_UI_Shell"] }
 
+# Reads river.exe out of the release zip for a self-update (src/update/windows.rs). Deflate
+# through flate2, which the Linux tarball path already uses; no other codecs.
+zip = { version = "8.6", default-features = false, features = ["deflate-flate2"] }
+
 # Icon and version resource for river.exe (build.rs). Windows only, so Linux and macOS builds
 # never compile it.
 [target.'cfg(windows)'.build-dependencies]

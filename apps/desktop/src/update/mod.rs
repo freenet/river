@@ -109,12 +109,20 @@ pub mod host;
 pub mod keyrecord;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
 pub mod manifest;
 mod net;
 mod platform;
 mod state;
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
+// The Windows and macOS end to end tests use a part of it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod testserver;
+#[cfg(any(windows, target_os = "macos"))]
+mod unpack;
+#[cfg(windows)]
+mod windows;
 
 use std::ffi::OsString;
 use std::fs;
@@ -250,10 +258,9 @@ fn remember(slot: &Mutex<Option<String>>, installer: &dyn Installer) {
     let mut sha = slot.lock().unwrap();
     if sha.is_none()
         && let Support::Replaceable { install_path } = installer.support()
-        && let Ok(file) = fs::File::open(install_path)
-        && let Ok((sum, _)) = hash_file(file)
+        && let Ok(fingerprint) = installer.fingerprint(&install_path)
     {
-        *sha = Some(hex::encode(sum));
+        *sha = Some(fingerprint);
     }
 }
 
@@ -381,7 +388,8 @@ impl Updater {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
                 if prefixes.iter().any(|p| name.starts_with(p)) && old(&entry.path()) {
-                    let _ = fs::remove_file(entry.path());
+                    // A staged macOS bundle is a directory; never follows a link.
+                    platform::remove_any(&entry.path());
                 }
             }
         };
@@ -409,6 +417,9 @@ impl Updater {
                     ".river-restore-",
                     ".river-copy-",
                     ".river-write-test-",
+                    // Windows: the exe a swap renamed aside, which could not be deleted while
+                    // it was running.
+                    ".river-old-",
                 ],
             );
         }
@@ -723,10 +734,15 @@ impl Updater {
             .map_err(|e| io("couldn't read the downloaded update", e))?;
         let prepared = self.installer.prepare(file, offer.version, install_path)?;
         let previous_dir = self.dir().join("previous");
-        let previous = previous_dir.join(format!("river-{}", self.cfg.running));
+        // `.exe` on Windows, so the copy a failed rollback points the user at can be run.
+        let previous = previous_dir.join(format!(
+            "river-{}{}",
+            self.cfg.running,
+            if cfg!(windows) { ".exe" } else { "" }
+        ));
         let _ = fs::remove_dir_all(&previous_dir);
         let Some(expected) = self.install_sha.lock().unwrap().clone() else {
-            let _ = fs::remove_file(&prepared);
+            platform::remove_any(&prepared);
             return Err(
                 "River has not finished noting what is installed; try again in a moment".into(),
             );
@@ -738,7 +754,7 @@ impl Updater {
             {
                 Ok(sha) => sha,
                 Err(e) => {
-                    let _ = fs::remove_file(&prepared);
+                    platform::remove_any(&prepared);
                     let _ = fs::remove_dir_all(&previous_dir);
                     return Err(e);
                 }
@@ -885,7 +901,7 @@ impl Updater {
         if starts > MAX_UNCONFIRMED_STARTS {
             let (message, restored) = self.restore_probation(&p, "it kept failing to start");
             if restored {
-                return Some(p.install_path);
+                return Some(self.installer.executable(&p.install_path));
             }
             river_app::diag!("River: {message}");
             return None;
@@ -1027,3 +1043,7 @@ impl Drop for Lock {
 // The end-to-end tests run real shell scripts through the Linux installer.
 #[cfg(all(test, target_os = "linux"))]
 mod tests;
+
+// The same end to end on Windows and macOS, through their real installers and a real program.
+#[cfg(all(test, any(windows, target_os = "macos")))]
+mod tests_native;

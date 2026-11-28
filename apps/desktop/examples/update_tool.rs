@@ -9,6 +9,8 @@
 //!
 //! update_tool sign --key <private-key-file> --version 0.2.0 --out <dir> \
 //!       --artifact linux-x86_64=https://host/River-0.2.0-linux-x86_64.tar.gz=./River-0.2.0-linux-x86_64.tar.gz \
+//!       --artifact windows-x86_64=https://host/River-0.2.0-windows-x86_64.zip=./River-0.2.0-windows-x86_64.zip \
+//!       --artifact macos-universal=https://host/River-0.2.0-macos-universal.zip=./River-0.2.0-macos-universal.zip \
 //!       [--artifact ...] [--sequence N] [--released-at UNIX] [--expires-in-days 30] \
 //!       [--min-supported 0.0.0] [--channel stable] [--notes TEXT]
 //!     Hash each artifact, write <dir>/manifest.json and <dir>/manifest.json.sig.
@@ -161,6 +163,40 @@ fn sign(args: Vec<String>) {
         let [platform, url, path] = parts[..] else {
             die("--artifact is PLATFORM=URL=PATH")
         };
+        // Each platform key takes its own kind of archive, and a release asset named for another
+        // platform (`River-<v>-<key>.<ext>`) is refused: a typo in the key, or the Windows and
+        // macOS zips given the wrong way round, would otherwise ship to every install of that
+        // platform.
+        const PLATFORMS: [&str; 4] = [
+            "linux-x86_64",
+            "linux-aarch64",
+            "windows-x86_64",
+            "macos-universal",
+        ];
+        let ext = match platform {
+            "linux-x86_64" | "linux-aarch64" => ".tar.gz",
+            "windows-x86_64" | "macos-universal" => ".zip",
+            other => die(&format!(
+                "unknown platform {other}: River installs ask for {}",
+                PLATFORMS.join(", ")
+            )),
+        };
+        for named in [url, path] {
+            let file = named.rsplit(['/', '\\']).next().unwrap_or(named);
+            if !file.ends_with(ext) {
+                die(&format!(
+                    "--artifact {platform}: {named} is not a {ext} file"
+                ));
+            }
+            if let Some(other) = PLATFORMS
+                .iter()
+                .find(|p| **p != platform && file.contains(**p))
+            {
+                die(&format!(
+                    "--artifact {platform}: {named} is the {other} build"
+                ));
+            }
+        }
         let bytes = fs::read(path).unwrap_or_else(|e| die(&format!("couldn't read {path}: {e}")));
         map.insert(
             platform.to_string(),

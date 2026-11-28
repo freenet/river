@@ -1,12 +1,17 @@
 //! The platform-specific half of an update: where the running binary is, whether River may
 //! replace it, and how to swap it and put it back.
 //!
-//! Only Linux (any Unix path layout, in fact) has a real implementation, [`super::linux`].
-//! macOS and Windows get [`Unsupported`], which says so. Their swaps need a different
-//! mechanism (a signed, notarized app bundle that cannot be patched in place; an exe that
-//! cannot be replaced while it runs) that cannot be written responsibly without a machine of
-//! that kind to test it on. The orchestrator in [`super`] only talks to this trait, so adding
-//! them does not touch the verification or rollback logic.
+//! Linux: [`super::linux`], an in-place rename of the one `river` file. Windows:
+//! [`super::windows`], which renames the running `river.exe` aside (a running exe cannot be
+//! overwritten but can be renamed) and moves the new one into its place. macOS:
+//! [`super::macos`], which replaces the whole signed `River.app` bundle with an atomic exchange
+//! and checks the new bundle's code signature first. Anything else gets [`Unsupported`], which
+//! says so. The orchestrator in [`super`] only talks to this trait, so none of them touches the
+//! verification or rollback logic.
+//!
+//! The "install" is a file on Linux and Windows and a directory (the bundle) on macOS, so the
+//! orchestrator never opens it itself: it asks for a [`Installer::fingerprint`] and removes
+//! leftovers with [`remove_any`].
 
 use std::ffi::OsString;
 use std::fs::File;
@@ -17,7 +22,10 @@ use crate::release::Version;
 
 /// Whether this running copy of River can be updated by River.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", windows)),
+    allow(dead_code)
+)]
 pub enum Support {
     /// River installed itself here and may replace this file.
     Replaceable { install_path: PathBuf },
@@ -60,6 +68,21 @@ pub trait Installer: Send + Sync {
     /// Put the copy at `previous` (which must hash to `sha256`) back at `install_path`.
     fn restore(&self, previous: &Path, sha256: &str, install_path: &Path) -> Result<(), String>;
 
+    /// What identifies the install at `install_path`: the SHA-256 (hex) of the file, or, for an
+    /// install that is a directory, of its contents. [`Installer::swap`] returns the same
+    /// measure of the copy it keeps, and [`Installer::restore`] checks it.
+    fn fingerprint(&self, install_path: &Path) -> Result<String, String> {
+        let file = std::fs::File::open(install_path).map_err(|e| e.to_string())?;
+        super::hash_file(file)
+            .map(|(sum, _)| hex::encode(sum))
+            .map_err(|e| e.to_string())
+    }
+
+    /// The program to run for the install at `install_path` (the bundle's executable on macOS).
+    fn executable(&self, install_path: &Path) -> PathBuf {
+        install_path.to_path_buf()
+    }
+
     /// Start the binary at `install_path`.
     fn spawn(
         &self,
@@ -69,13 +92,29 @@ pub trait Installer: Send + Sync {
     ) -> std::io::Result<Child>;
 }
 
-/// The platforms River cannot update itself on yet.
-#[cfg(not(target_os = "linux"))]
+/// Delete `path`, a file or a whole directory; a symlink is removed, never followed. Best
+/// effort: what cannot be deleted now (a Windows exe that is still running) is left for
+/// [`super::Updater::sweep`].
+pub fn remove_any(path: &Path) {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() => {
+            let _ = std::fs::remove_dir_all(path);
+        }
+        Ok(_) => {
+            let _ = std::fs::remove_file(path);
+        }
+        Err(_) => {}
+    }
+}
+
+/// The platforms River cannot update itself on. This is what 0.1.0 used on Windows and macOS,
+/// and the tests keep it to show such a build is told plainly, not given an error.
+#[cfg(any(test, not(any(target_os = "linux", target_os = "macos", windows))))]
 pub struct Unsupported {
     pub os: &'static str,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(test, not(any(target_os = "linux", target_os = "macos", windows))))]
 impl Installer for Unsupported {
     fn platform_key(&self) -> Option<&'static str> {
         None
@@ -105,5 +144,74 @@ impl Installer for Unsupported {
         Err(std::io::Error::other(
             "self-update is not supported on this platform yet",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::update::manifest::tests::{NOW, manifest, pubkey, signed};
+    use crate::update::manifest::{Artifact, Trust, Verdict, evaluate, verify_and_parse};
+
+    /// The keys a release manifest lists since Windows and macOS update themselves.
+    const KEYS: [&str; 3] = ["linux-x86_64", "windows-x86_64", "macos-universal"];
+
+    fn three_platform_manifest() -> (Vec<u8>, Vec<u8>) {
+        let mut m = manifest("0.2.0", 5);
+        for key in KEYS {
+            m.artifacts.insert(
+                key.to_string(),
+                Artifact {
+                    url: format!("https://example.org/River-0.2.0-{key}"),
+                    sha256: "cd".repeat(32),
+                    size: 1000,
+                },
+            );
+        }
+        signed(&m)
+    }
+
+    #[test]
+    fn a_manifest_for_three_platforms_offers_each_its_own_build() {
+        let (bytes, sig) = three_platform_manifest();
+        let parsed = verify_and_parse(&bytes, &sig, &pubkey(1)).unwrap();
+        for key in KEYS {
+            let verdict = evaluate(
+                &parsed,
+                crate::release::Version(0, 1, 0),
+                "stable",
+                key,
+                NOW,
+                Trust::default(),
+            )
+            .unwrap();
+            let Verdict::Available(offer) = verdict else {
+                panic!("{key}: {verdict:?}")
+            };
+            assert!(offer.artifact.url.ends_with(key), "{key}");
+        }
+    }
+
+    /// What River 0.1.0 does on Windows and macOS with such a manifest: it has no platform key,
+    /// so it says plainly that it can't update itself, and every action refuses with words,
+    /// never touching a file.
+    #[test]
+    fn a_build_without_a_platform_installer_is_told_plainly() {
+        let old = Unsupported { os: "windows" };
+        assert_eq!(old.platform_key(), None);
+        assert!(matches!(old.support(), Support::Unsupported(m) if m.contains("Download")));
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("f");
+        std::fs::write(&f, b"x").unwrap();
+        assert!(
+            old.prepare(
+                std::fs::File::open(&f).unwrap(),
+                crate::release::Version(0, 2, 0),
+                &f
+            )
+            .is_err()
+        );
+        assert!(old.swap(&f, &f, &f, None).is_err());
+        assert_eq!(std::fs::read(&f).unwrap(), b"x");
     }
 }
