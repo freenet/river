@@ -101,7 +101,19 @@ fi
 echo ">> $OUT_ZIP"
 mkdir -p "$(dirname "$OUT_ZIP")"
 rm -f "$OUT_ZIP"
-ditto -c -k --keepParent "$APP" "$OUT_ZIP"
+# No resource forks or extended attributes: a signed bundle needs neither, and River's
+# self-update unpacks the zip itself (apps/desktop/src/update/macos.rs, `extract_zip`), which
+# skips them. Checked below, with the compression methods that reader supports.
+ditto -c -k --norsrc --noextattr --keepParent "$APP" "$OUT_ZIP"
+if zipinfo -1 "$OUT_ZIP" | grep -Eq '(^|/)(__MACOSX|\._)'; then
+    echo "sign-macos.sh: $OUT_ZIP holds resource forks or AppleDouble files" >&2
+    exit 1
+fi
+# zipinfo's sixth column is the method: "stor" or "defX"/"defN"/"defF"/"defS" (deflate).
+if zipinfo "$OUT_ZIP" | awk 'NF >= 9 && $1 ~ /^[-dl]/ && $6 !~ /^(stor|def)/ { bad = 1 } END { exit !bad }'; then
+    echo "sign-macos.sh: $OUT_ZIP uses a compression method River's updater cannot read" >&2
+    exit 1
+fi
 
 # Check what users will download, not only the bundle it was made from.
 ditto -x -k "$OUT_ZIP" "$WORK/unzipped"

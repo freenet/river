@@ -310,11 +310,13 @@ impl Installer for WindowsInstaller {
                     Ok(put) if put == sha => {
                         Err(format!("{e}; the copy kept beforehand was put back"))
                     }
-                    Ok(_) => Err(format!(
-                        "{e}; the copy put back does not match what was installed, so check \
-                         {} before running it",
-                        install_path.display()
-                    )),
+                    Ok(_) => {
+                        let _ = fs::remove_file(install_path);
+                        Err(format!(
+                            "{e}; the kept copy no longer matches what was installed, so it was \
+                             not put back"
+                        ))
+                    }
                     Err(c) => Err(format!("{e}; and the kept copy could not be put back: {c}")),
                 };
             }

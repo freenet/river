@@ -357,8 +357,11 @@ fn sync_tree(root: &Path) -> std::io::Result<()> {
 
 /// The most a release zip may unpack to (bytes written). River.app is about 50 MiB.
 const MAX_BUNDLE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-/// The most entries a release zip may hold.
+/// The most entries a release zip may hold, and the most folders, links and files unpacking it
+/// may create.
 const MAX_ENTRIES: usize = 100_000;
+/// The most parts a name in a release zip may have.
+const MAX_DEPTH: usize = 64;
 
 /// Unpack the release zip `file` into the new folder `dest`, writing nothing anywhere else.
 ///
@@ -385,6 +388,16 @@ fn extract_zip(file: fs::File, dest: &Path) -> Result<(), String> {
     fs::create_dir(dest).map_err(io)?;
     let mut top: Option<Vec<u8>> = None;
     let mut written = 0u64;
+    // Folders, links and files created, against one budget: an entry can create many folders.
+    let mut created = 0usize;
+    let count = |created: &mut usize| {
+        *created += 1;
+        if *created > MAX_ENTRIES {
+            Err(bad("too many entries"))
+        } else {
+            Ok(())
+        }
+    };
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).map_err(|e| bad(&e.to_string()))?;
         let raw = entry.name_raw().to_vec();
@@ -404,7 +417,13 @@ fn extract_zip(file: fs::File, dest: &Path) -> Result<(), String> {
         {
             return Err(bad("an unsafe name"));
         }
-        if parts[0] == b"__MACOSX" {
+        if parts.len() > MAX_DEPTH {
+            return Err(bad("too deep"));
+        }
+        // Resource forks and extended attributes, which a signed bundle does not need (and
+        // `codesign --strict` refuses), whether set aside under `__MACOSX/` or stored inline as
+        // AppleDouble `._name` files.
+        if parts[0] == b"__MACOSX" || parts[parts.len() - 1].starts_with(b"._") {
             continue;
         }
         if !parts[0].to_ascii_lowercase().ends_with(b".app") {
@@ -422,6 +441,7 @@ fn extract_zip(file: fs::File, dest: &Path) -> Result<(), String> {
                 Ok(m) if m.file_type().is_dir() => {}
                 Ok(_) => return Err(bad("an entry beneath a link")),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    count(&mut created)?;
                     fs::create_dir(&path).map_err(io)?
                 }
                 Err(e) => return Err(io(e)),
@@ -432,16 +452,23 @@ fn extract_zip(file: fs::File, dest: &Path) -> Result<(), String> {
             match fs::symlink_metadata(&path) {
                 Ok(m) if m.file_type().is_dir() => {}
                 Ok(_) => return Err(bad("a folder where something else is")),
-                Err(_) => fs::create_dir(&path).map_err(io)?,
+                Err(_) => {
+                    count(&mut created)?;
+                    fs::create_dir(&path).map_err(io)?
+                }
             }
             continue;
         }
+        count(&mut created)?;
         if entry.is_symlink() {
             let mut target = Vec::new();
             (&mut entry)
-                .take(4096)
+                .take(4097)
                 .read_to_end(&mut target)
                 .map_err(|e| bad(&e.to_string()))?;
+            if target.len() > 4096 || target.is_empty() || target.contains(&0) {
+                return Err(bad("a link with a bad target"));
+            }
             // Depth below the top folder of the folder holding the link, then walk the target.
             let mut depth = parts.len() as i64 - 2;
             let target = Path::new(OsStr::from_bytes(&target));
@@ -467,7 +494,8 @@ fn extract_zip(file: fs::File, dest: &Path) -> Result<(), String> {
             std::os::unix::fs::symlink(target, &path).map_err(io)?;
             continue;
         }
-        let mode = entry.unix_mode().unwrap_or(0o644) & 0o777;
+        // Never setuid, sticky, or writable by anyone but the owner.
+        let mode = entry.unix_mode().unwrap_or(0o644) & 0o755;
         let mut out = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -930,16 +958,24 @@ pub(crate) mod tests {
             println!("skipped: no notarized third-party app on this machine");
             return;
         };
+        // Zipped the way `sign-macos.sh` zips a release and unpacked the way River unpacks an
+        // update, so this is the client's path on a real notarized bundle full of framework
+        // links.
         let dir = tempfile::tempdir().unwrap();
-        let copy = dir.path().join("App.app");
+        let zip = dir.path().join("app.zip");
         ditto(&[
+            OsStr::new("-c"),
+            OsStr::new("-k"),
             OsStr::new("--norsrc"),
             OsStr::new("--noextattr"),
-            OsStr::new("--noqtn"),
+            OsStr::new("--keepParent"),
             app.as_os_str(),
-            copy.as_os_str(),
+            zip.as_os_str(),
         ])
         .unwrap();
+        let out = dir.path().join("x");
+        extract_zip(fs::File::open(&zip).unwrap(), &out).unwrap_or_else(|e| panic!("{app:?}: {e}"));
+        let copy = out.join(app.file_name().unwrap());
         verify(&copy, &Check::SameSigner(team.clone())).unwrap_or_else(|e| panic!("{app:?}: {e}"));
         // Another team, or another app of the same team, is refused.
         let other_team = if team.team == "R55ZESJCXG" {
