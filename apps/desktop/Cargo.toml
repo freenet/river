@@ -58,7 +58,7 @@ tray-icon = { version = "0.26", default-features = false }
 # Self-update: reads river.exe out of the Windows release zip (src/update/windows.rs), and on
 # macOS checks the release zip's names and links before `ditto` unpacks it (src/update/
 # macos.rs). Deflate through flate2, which the Linux tarball path already uses; no other codecs.
-zip = { version = "8.6", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9.0", default-features = false, features = ["deflate-flate2"] }
 
 # macOS uses UNUserNotificationCenter (the default NSUserNotification backend is deprecated).
 [target.'cfg(target_os = "macos")'.dependencies]
