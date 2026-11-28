@@ -11,7 +11,7 @@ use river_app::{KeyRecord, UpdateCheck, UpdateHost, UpdateInfo, UpdateSupport};
 use super::keyrecord;
 use super::manifest::Offer;
 use super::platform::Installer;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 use super::platform::Unsupported;
 use super::{CheckResult, Config, HANDSHAKE_ENV, HANDSHAKE_TIMEOUT, Support, Updater};
 use crate::release::{Version, parse_version};
@@ -34,7 +34,15 @@ fn installer() -> Arc<dyn Installer> {
     {
         Arc::new(super::linux::LinuxInstaller::for_current_exe())
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        Arc::new(super::macos::MacInstaller::for_current_exe())
+    }
+    #[cfg(windows)]
+    {
+        Arc::new(super::windows::WindowsInstaller::for_current_exe())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         Arc::new(Unsupported {
             os: std::env::consts::OS,
@@ -199,7 +207,29 @@ fn restart_into(path: &std::path::Path) {
         );
     }
     #[cfg(not(unix))]
-    let _ = path;
+    {
+        // No exec on Windows: start the previous build, then leave. Null standard handles: a
+        // release build has none to pass on, and inheriting invalid ones makes the spawn fail
+        // (see bug-prevention-patterns, `Command::spawn` after `FreeConsole`). The new River
+        // sets up its own log.
+        use std::process::{Command, Stdio};
+        let started = hand_over_instance(|| {
+            Command::new(path)
+                .args(std::env::args_os().skip(1))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|e| e.to_string())
+        });
+        match started {
+            Ok(_) => std::process::exit(0),
+            Err(err) => river_app::diag!(
+                "River: couldn't start the previous version {}: {err}",
+                path.display()
+            ),
+        }
+    }
 }
 
 /// The arguments to start the new version with: this run's, without `--background`, so a River
