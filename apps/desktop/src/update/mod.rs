@@ -747,39 +747,54 @@ impl Updater {
                 "River has not finished noting what is installed; try again in a moment".into(),
             );
         };
-        let previous_sha256 =
-            match self
-                .installer
-                .swap(&prepared, install_path, &previous, Some(&expected))
-            {
-                Ok(sha) => sha,
-                Err(e) => {
-                    platform::remove_any(&prepared);
-                    let _ = fs::remove_dir_all(&previous_dir);
-                    return Err(e);
-                }
-            };
+        // Recorded before the swap, so a River killed between the swap and the record cannot
+        // leave the new build with no rollback. The swap refuses unless the install hashes to
+        // `expected`, which is therefore what the kept copy hashes to.
         let probation = Probation {
             from: self.cfg.running.to_string(),
             to: offer.version.to_string(),
             install_path: install_path.to_path_buf(),
-            previous,
-            previous_sha256,
+            previous: previous.clone(),
+            previous_sha256: expected.clone(),
             starts: 0,
         };
-        let recorded = state::modify(&self.cfg.data_dir, |s| {
-            s.staged = None;
+        if let Err(e) = state::modify(&self.cfg.data_dir, |s| {
             s.probation = Some(probation.clone());
-        });
-        if let Err(e) = recorded {
-            // Without the record there is no rollback. Put the old binary back now.
-            let _ = self.installer.restore(
-                &probation.previous,
-                &probation.previous_sha256,
-                &probation.install_path,
-            );
+        }) {
+            platform::remove_any(&prepared);
             return Err(e);
         }
+        if let Err(e) = self
+            .installer
+            .swap(&prepared, install_path, &previous, Some(&expected))
+        {
+            platform::remove_any(&prepared);
+            // Normally the install is as it was, and the copy and the record go. If the swap
+            // left nothing at the install path (Windows: the new exe would not go in and the
+            // old one would not go back), the kept copy is what can bring River back, so the
+            // copy and the record stay and the message says where it is.
+            if fs::symlink_metadata(install_path).is_ok() {
+                let _ = fs::remove_dir_all(&previous_dir);
+                report_unrecorded(
+                    "the refused swap",
+                    state::modify(&self.cfg.data_dir, |s| {
+                        if s.probation.as_ref() == Some(&probation) {
+                            s.probation = None;
+                        }
+                    }),
+                );
+                return Err(e);
+            }
+            return Err(format!(
+                "{e}. River is no longer at {}; a copy of it is at {}",
+                install_path.display(),
+                previous.display()
+            ));
+        }
+        report_unrecorded(
+            "the finished download",
+            state::modify(&self.cfg.data_dir, |s| s.staged = None),
+        );
         let _ = fs::remove_dir_all(self.dir().join("staged"));
         Ok((offer.version, probation))
     }

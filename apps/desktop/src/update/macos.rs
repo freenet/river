@@ -22,27 +22,39 @@
 
 use std::ffi::{CString, OsStr, OsString};
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Seek};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::Mutex;
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
 use super::platform::{Installer, Support, remove_any};
-use super::unpack::preflight;
+use super::unpack::{output_within, preflight};
 use crate::release::Version;
 
 /// The executable inside the bundle (`apps/desktop/packaging/package-macos.sh`).
 const EXECUTABLE: &str = "river";
 
+/// How long `codesign`, `spctl` and `ditto` may take before the update gives up on them.
+const TOOL_DEADLINE: Duration = Duration::from_secs(300);
+
+/// Who signed a bundle: its Developer ID Team ID and its code-signing identifier.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Signer {
+    pub team: String,
+    pub identifier: String,
+}
+
 /// What the new bundle's signature must satisfy.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Check {
-    /// Signed by this Developer ID team, and accepted by Gatekeeper. What a release uses.
-    SameTeam(String),
+    /// A Developer ID Application signature from this team, for this identifier, and
+    /// accepted by Gatekeeper. What a release uses.
+    SameSigner(Signer),
     /// Any intact signature, ad-hoc included, and no Gatekeeper verdict. Tests only: an
     /// ad-hoc signature is all a test runner can make. Never constructed outside tests.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -126,46 +138,63 @@ fn dir_is_writable(dir: &Path) -> bool {
         .is_ok()
 }
 
-/// The Team ID `bundle` is signed with, or `None` for an unsigned or ad-hoc signed bundle.
-pub fn team_of(bundle: &Path) -> Option<String> {
-    let out = Command::new("/usr/bin/codesign")
-        .args(["--display", "--verbose=2"])
-        .arg(bundle)
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
+/// Who signed `bundle`. `Ok(None)` for an unsigned or ad-hoc signed bundle; `Err` when
+/// `codesign` could not answer (it did not run or took too long), which says nothing about the
+/// bundle and is not remembered.
+pub fn signer_of(bundle: &Path) -> Result<Option<Signer>, String> {
+    let mut cmd = Command::new("/usr/bin/codesign");
+    cmd.args(["--display", "--verbose=2"]).arg(bundle);
+    let out = output_within(cmd, TOOL_DEADLINE).map_err(|e| format!("codesign: {e}"))?;
     if !out.status.success() {
-        return None;
+        // Not signed at all ("code object is not signed at all").
+        return Ok(None);
     }
     let text =
         String::from_utf8_lossy(&out.stderr).into_owned() + &String::from_utf8_lossy(&out.stdout);
-    let team = text
-        .lines()
-        .find_map(|l| l.strip_prefix("TeamIdentifier="))?
-        .trim()
-        .to_string();
-    // A Team ID is ten upper-case letters and digits; anything else ("not set") is no team,
-    // and nothing else may reach the requirement text below.
-    (team.len() == 10
-        && team
-            .bytes()
-            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()))
-    .then_some(team)
+    let field = |name: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(name))
+            .map(|v| v.trim().to_string())
+    };
+    // Only these characters may reach the requirement text in `verify`. A Team ID is ten
+    // upper-case letters and digits ("not set" for ad-hoc); an identifier is a bundle id.
+    let team = field("TeamIdentifier=").filter(|t| {
+        t.len() == 10
+            && t.bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+    });
+    let identifier = field("Identifier=").filter(|i| {
+        !i.is_empty()
+            && i.len() <= 255
+            && i.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_')
+    });
+    Ok(team
+        .zip(identifier)
+        .map(|(team, identifier)| Signer { team, identifier }))
+}
+
+/// The code requirement a release bundle must satisfy: Apple's Developer ID Application
+/// certificate chain (the Developer ID CA and leaf extensions), this team, this identifier.
+fn requirement(signer: &Signer) -> String {
+    format!(
+        "=anchor apple generic and identifier \"{}\" \
+         and certificate 1[field.1.2.840.113635.100.6.2.6] exists \
+         and certificate leaf[field.1.2.840.113635.100.6.1.13] exists \
+         and certificate leaf[subject.OU] = \"{}\"",
+        signer.identifier, signer.team
+    )
 }
 
 /// Refuse `app` unless its signature is intact and satisfies `check`.
 pub fn verify(app: &Path, check: &Check) -> Result<(), String> {
     let mut codesign = Command::new("/usr/bin/codesign");
     codesign.args(["--verify", "--deep", "--strict"]);
-    if let Check::SameTeam(team) = check {
-        codesign.arg("-R").arg(format!(
-            "=anchor apple generic and certificate leaf[subject.OU] = \"{team}\""
-        ));
+    if let Check::SameSigner(signer) = check {
+        codesign.arg("-R").arg(requirement(signer));
     }
-    let out = codesign
-        .arg(app)
-        .stdin(Stdio::null())
-        .output()
+    codesign.arg(app);
+    let out = output_within(codesign, TOOL_DEADLINE)
         .map_err(|e| format!("couldn't check the new River's signature: {e}"))?;
     if !out.status.success() {
         return Err(format!(
@@ -174,12 +203,10 @@ pub fn verify(app: &Path, check: &Check) -> Result<(), String> {
             first_line(&out.stderr)
         ));
     }
-    if matches!(check, Check::SameTeam(_)) {
-        let out = Command::new("/usr/sbin/spctl")
-            .args(["--assess", "--type", "execute"])
-            .arg(app)
-            .stdin(Stdio::null())
-            .output()
+    if matches!(check, Check::SameSigner(_)) {
+        let mut spctl = Command::new("/usr/sbin/spctl");
+        spctl.args(["--assess", "--type", "execute"]).arg(app);
+        let out = output_within(spctl, TOOL_DEADLINE)
             .map_err(|e| format!("couldn't ask macOS about the new River: {e}"))?;
         if !out.status.success() {
             return Err(format!(
@@ -203,11 +230,9 @@ fn first_line(bytes: &[u8]) -> String {
 /// Copy the directory `from` to `to` (which must not exist) with `ditto`, which keeps
 /// symlinks, permissions and extended attributes, so a signed bundle stays signed.
 fn ditto(args: &[&OsStr]) -> Result<(), String> {
-    let out = Command::new("/usr/bin/ditto")
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| e.to_string())?;
+    let mut cmd = Command::new("/usr/bin/ditto");
+    cmd.args(args);
+    let out = output_within(cmd, TOOL_DEADLINE).map_err(|e| e.to_string())?;
     if out.status.success() {
         Ok(())
     } else {
@@ -222,7 +247,7 @@ fn copy_bundle(from: &Path, to: &Path) -> Result<(), String> {
     }
     ditto(&[from.as_os_str(), to.as_os_str()])?;
     touch(to);
-    Ok(())
+    sync_tree(to).map_err(|e| e.to_string())
 }
 
 /// Give a staged bundle the current time. `ditto` keeps the times it copied, so a bundle
@@ -235,33 +260,40 @@ fn touch(dir: &Path) {
     let _ = fs::File::open(dir).and_then(|f| f.set_modified(now));
 }
 
-/// A SHA-256 (hex) over a directory tree: every entry's relative path and kind, a symlink's
-/// target, a file's owner-execute bit, length and contents, in a fixed order. Two trees have
-/// the same fingerprint exactly when they hold the same files.
+/// A SHA-256 (hex) over a directory tree: every entry's relative path (as bytes) and kind, a
+/// symlink's target, a file's owner-execute bit, length and contents, in a fixed order. Two
+/// trees have the same fingerprint exactly when they hold the same files. `.DS_Store` files are
+/// left out: Finder writes them into a bundle someone merely looked inside, and they are not
+/// part of River.
 pub fn fingerprint_tree(root: &Path) -> std::io::Result<String> {
-    fn walk(dir: &Path, rel: &str, h: &mut Sha256) -> std::io::Result<()> {
+    fn walk(dir: &Path, rel: &[u8], h: &mut Sha256) -> std::io::Result<()> {
         let mut entries: Vec<_> = fs::read_dir(dir)?.collect::<Result<_, _>>()?;
         entries.sort_by_key(|e| e.file_name());
         for e in entries {
             let name = e.file_name();
-            let rel = format!("{rel}/{}", name.to_string_lossy());
+            if name == ".DS_Store" {
+                continue;
+            }
+            let mut rel = rel.to_vec();
+            rel.push(b'/');
+            rel.extend_from_slice(name.as_bytes());
             let path = e.path();
             let meta = fs::symlink_metadata(&path)?;
             let kind = meta.file_type();
             if kind.is_symlink() {
                 h.update(b"l\0");
-                h.update(rel.as_bytes());
+                h.update(&rel);
                 h.update(b"\0");
                 h.update(fs::read_link(&path)?.as_os_str().as_bytes());
                 h.update(b"\0");
             } else if kind.is_dir() {
                 h.update(b"d\0");
-                h.update(rel.as_bytes());
+                h.update(&rel);
                 h.update(b"\0");
                 walk(&path, &rel, h)?;
             } else if kind.is_file() {
                 h.update(b"f\0");
-                h.update(rel.as_bytes());
+                h.update(&rel);
                 h.update(b"\0");
                 h.update(if meta.permissions().mode() & 0o100 != 0 {
                     b"x"
@@ -295,8 +327,96 @@ pub fn fingerprint_tree(root: &Path) -> std::io::Result<String> {
     }
     let mut h = Sha256::new();
     h.update(b"river-tree-v1\0");
-    walk(root, "", &mut h)?;
+    walk(root, b"", &mut h)?;
     Ok(hex::encode(h.finalize()))
+}
+
+/// Flush every file and folder under `root` to the disk (`fsync` is `F_FULLFSYNC` on macOS in
+/// Rust's standard library), so a power cut after the exchange cannot leave a bundle of empty
+/// files in its place. `ditto` does not sync.
+fn sync_tree(root: &Path) -> std::io::Result<()> {
+    let meta = fs::symlink_metadata(root)?;
+    if meta.is_dir() {
+        for e in fs::read_dir(root)? {
+            sync_tree(&e?.path())?;
+        }
+        fs::File::open(root)?.sync_all()
+    } else if meta.is_file() {
+        fs::File::open(root)?.sync_all()
+    } else {
+        Ok(())
+    }
+}
+
+/// The most a release zip may unpack to. River.app is about 50 MiB.
+const MAX_BUNDLE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// The most entries a release zip may hold.
+const MAX_ENTRIES: usize = 100_000;
+
+/// Refuse a zip that could write outside the folder `ditto` unpacks it into, or fill the disk,
+/// before `ditto` sees it: an absolute or `..` name, a top level that is not one `.app` folder,
+/// a symlink pointing out of the bundle (a later entry could be written through it), or more
+/// than [`MAX_BUNDLE_BYTES`] unpacked. A genuine release never trips these; they matter only
+/// if the update key signed something it should not have, which the signature check that
+/// follows exists to catch, and that check must not run on files already written elsewhere.
+fn scan_zip(file: &fs::File) -> Result<(), String> {
+    let bad = |why: &str| format!("the download is not a River release archive ({why})");
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| bad(&e.to_string()))?;
+    if archive.len() > MAX_ENTRIES {
+        return Err(bad("too many entries"));
+    }
+    let mut top: Option<std::ffi::OsString> = None;
+    let mut total = 0u64;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).map_err(|e| bad(&e.to_string()))?;
+        let name = entry.enclosed_name().ok_or_else(|| bad("an unsafe name"))?;
+        let mut parts = name.components();
+        let first = parts
+            .next()
+            .ok_or_else(|| bad("an empty name"))?
+            .as_os_str()
+            .to_owned();
+        // ditto keeps resource forks and extended attributes under `__MACOSX/`.
+        if first != "__MACOSX" {
+            if !Path::new(&first).extension().is_some_and(|x| x == "app") {
+                return Err(bad("something other than an app"));
+            }
+            match &top {
+                None => top = Some(first.clone()),
+                Some(t) if *t == first => {}
+                Some(_) => return Err(bad("more than one app")),
+            }
+        }
+        total = total.saturating_add(entry.size());
+        if total > MAX_BUNDLE_BYTES {
+            return Err(bad("too large"));
+        }
+        if entry.is_symlink() {
+            let mut target = Vec::new();
+            (&mut entry)
+                .take(4096)
+                .read_to_end(&mut target)
+                .map_err(|e| bad(&e.to_string()))?;
+            // Depth below the top folder of the folder holding the link, then walk the target.
+            let mut depth = name.components().count() as i64 - 2;
+            let target = Path::new(OsStr::from_bytes(&target));
+            for c in target.components() {
+                match c {
+                    std::path::Component::Normal(_) => depth += 1,
+                    std::path::Component::CurDir => {}
+                    std::path::Component::ParentDir => depth -= 1,
+                    _ => return Err(bad("a link to an absolute path")),
+                }
+                if depth < 0 {
+                    return Err(bad("a link out of the app"));
+                }
+            }
+        }
+    }
+    if top.is_none() {
+        return Err("the download holds no River.app".into());
+    }
+    Ok(())
 }
 
 /// Exchange the directories at `a` and `b` in one step. Falls back to three renames on a
@@ -310,7 +430,7 @@ fn exchange(a: &Path, b: &Path) -> std::io::Result<()> {
     }
     let err = std::io::Error::last_os_error();
     match err.raw_os_error() {
-        Some(libc::ENOTSUP) | Some(libc::EINVAL) => exchange_by_renames(a, b),
+        Some(libc::ENOTSUP) => exchange_by_renames(a, b),
         _ => Err(err),
     }
 }
@@ -326,14 +446,30 @@ fn exchange_by_renames(a: &Path, b: &Path) -> std::io::Result<()> {
         fs::rename(&aside, b)?;
         return Err(e);
     }
-    fs::rename(&aside, a)
+    // `b` now holds what was at `a`: the exchange has taken effect. Moving the old contents to
+    // `a` is tidying; if it fails they stay at `aside`, which the sweep deletes.
+    let _ = fs::rename(&aside, a);
+    Ok(())
+}
+
+/// Say why a replace failed, in words, for the case macOS's App Management protection blocks
+/// it (macOS 13 and later can refuse to let one app change another app's bundle).
+fn replace_error(what: &str, e: &std::io::Error) -> String {
+    match e.raw_os_error() {
+        Some(libc::EPERM) | Some(libc::EACCES) => format!(
+            "{what}: macOS did not allow it ({e}). If System Settings > Privacy & Security > \
+             App Management lists River, turn it on and try again."
+        ),
+        _ => format!("{what}: {e}"),
+    }
 }
 
 pub struct MacInstaller {
     exe: PathBuf,
-    /// What a new bundle must satisfy, once it is known (it asks `codesign` about the running
-    /// bundle, which takes a moment).
-    check: OnceLock<Option<Check>>,
+    /// What a new bundle must satisfy, once known: it asks `codesign` about the running bundle,
+    /// which takes a moment. Only an answer is remembered; a `codesign` that failed to answer
+    /// is asked again next time.
+    check: Mutex<Option<Option<Check>>>,
 }
 
 impl MacInstaller {
@@ -342,22 +478,29 @@ impl MacInstaller {
         let exe = std::env::current_exe().unwrap_or_default();
         MacInstaller {
             exe: exe.canonicalize().unwrap_or(exe),
-            check: OnceLock::new(),
+            check: Mutex::new(None),
         }
     }
 
     #[cfg(test)]
     pub fn with_check(exe: PathBuf, check: Option<Check>) -> MacInstaller {
         let exe = exe.canonicalize().unwrap_or(exe);
-        let lock = OnceLock::new();
-        let _ = lock.set(check);
-        MacInstaller { exe, check: lock }
+        MacInstaller {
+            exe,
+            check: Mutex::new(Some(check)),
+        }
     }
 
-    fn check(&self, bundle: &Path) -> Option<Check> {
-        self.check
-            .get_or_init(|| team_of(bundle).map(Check::SameTeam))
-            .clone()
+    /// `Ok(None)`: the running bundle is not signed by a developer, so nothing can be required
+    /// of a new one. `Err`: `codesign` did not answer.
+    fn check(&self, bundle: &Path) -> Result<Option<Check>, String> {
+        let mut known = self.check.lock().unwrap();
+        if let Some(check) = known.as_ref() {
+            return Ok(check.clone());
+        }
+        let check = signer_of(bundle)?.map(Check::SameSigner);
+        *known = Some(check.clone());
+        Ok(check)
     }
 }
 
@@ -371,15 +514,24 @@ impl Installer for MacInstaller {
             return Support::Unsupported("River can't tell where it is installed.".into());
         }
         let support = classify(&self.exe);
-        if let Support::Replaceable { install_path } = &support
-            && self.check(install_path).is_none()
-        {
-            return Support::Unsupported(
-                "This copy of River is not signed by its developer, so River can't check that \
-                 an update comes from the same place. Download the new version from \
-                 github.com/freenet/river/releases."
-                    .into(),
-            );
+        if let Support::Replaceable { install_path } = &support {
+            match self.check(install_path) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Support::Unsupported(
+                        "This copy of River is not signed by its developer, so River can't \
+                         check that an update comes from the same place. Download the new \
+                         version from github.com/freenet/river/releases."
+                            .into(),
+                    );
+                }
+                Err(e) => {
+                    return Support::Unsupported(format!(
+                        "River couldn't check its own signature just now ({e}). It will try \
+                         again at the next update check."
+                    ));
+                }
+            }
         }
         support
     }
@@ -391,8 +543,15 @@ impl Installer for MacInstaller {
         install_path: &Path,
     ) -> Result<PathBuf, String> {
         let check = self
-            .check(install_path)
+            .check(install_path)?
             .ok_or("this copy of River is not signed, so it can't check an update")?;
+        let scanned = artifact
+            .try_clone()
+            .map_err(|e| format!("couldn't read the downloaded update: {e}"))?;
+        scan_zip(&scanned)?;
+        artifact
+            .seek(std::io::SeekFrom::Start(0))
+            .map_err(|e| format!("couldn't read the downloaded update: {e}"))?;
         let dir = install_path
             .parent()
             .ok_or("the install path has no directory")?;
@@ -448,6 +607,10 @@ impl Installer for MacInstaller {
         ));
         fs::rename(&app, &staged).map_err(|e| e.to_string())?;
         touch(&staged);
+        if let Err(e) = sync_tree(&staged) {
+            remove_any(&staged);
+            return Err(format!("couldn't save the new River: {e}"));
+        }
         Ok(staged)
     }
 
@@ -480,7 +643,7 @@ impl Installer for MacInstaller {
         }
         exchange(prepared, install_path).map_err(|e| {
             remove_any(prepared);
-            format!("couldn't replace the installed River: {e}")
+            replace_error("couldn't replace the installed River", &e)
         })?;
         // `prepared` now holds the old bundle. The running River does not need its files on
         // disk any more (macOS keeps open files alive), and the copy in `previous` is kept.
@@ -516,7 +679,7 @@ impl Installer for MacInstaller {
         };
         // Either the failed new bundle (after the exchange) or the unused copy.
         remove_any(&staged);
-        result.map_err(|e| format!("couldn't restore the previous River: {e}"))
+        result.map_err(|e| replace_error("couldn't restore the previous River", &e))
     }
 
     fn fingerprint(&self, install_path: &Path) -> Result<String, String> {
@@ -655,10 +818,10 @@ pub(crate) mod tests {
     fn an_unsigned_or_ad_hoc_river_does_not_update_itself() {
         let dir = tempfile::tempdir().unwrap();
         let app = bundle(dir.path(), "River.app", "0.1.0");
-        assert_eq!(team_of(&app), None, "ad-hoc has no team");
+        assert_eq!(signer_of(&app), Ok(None), "ad-hoc has no team");
         let installer = MacInstaller {
             exe: app.join("Contents/MacOS/river").canonicalize().unwrap(),
-            check: OnceLock::new(),
+            check: Mutex::new(None),
         };
         let s = installer.support();
         assert!(
@@ -672,7 +835,11 @@ pub(crate) mod tests {
     fn a_release_check_refuses_a_bundle_from_anyone_else() {
         let dir = tempfile::tempdir().unwrap();
         let app = bundle(dir.path(), "River.app", "0.2.0");
-        let err = verify(&app, &Check::SameTeam("R55ZESJCXG".into())).unwrap_err();
+        let release = Check::SameSigner(Signer {
+            team: "R55ZESJCXG".into(),
+            identifier: "org.freenet.River.test".into(),
+        });
+        let err = verify(&app, &release).unwrap_err();
         assert!(err.contains("not from the same developer"), "{err}");
         verify(&app, &Check::IntactOnly).unwrap();
     }
@@ -695,7 +862,7 @@ pub(crate) mod tests {
             .iter()
             .map(Path::new)
             .filter(|p| p.exists())
-            .find_map(|p| team_of(p).map(|t| (p, t)))
+            .find_map(|p| signer_of(p).ok().flatten().map(|t| (p, t)))
         else {
             println!("skipped: no notarized third-party app on this machine");
             return;
@@ -710,13 +877,28 @@ pub(crate) mod tests {
             copy.as_os_str(),
         ])
         .unwrap();
-        verify(&copy, &Check::SameTeam(team.clone())).unwrap_or_else(|e| panic!("{app:?}: {e}"));
-        let other = if team == "R55ZESJCXG" {
+        verify(&copy, &Check::SameSigner(team.clone())).unwrap_or_else(|e| panic!("{app:?}: {e}"));
+        // Another team, or another app of the same team, is refused.
+        let other_team = if team.team == "R55ZESJCXG" {
             "AAAAAAAAAA"
         } else {
             "R55ZESJCXG"
         };
-        assert!(verify(&copy, &Check::SameTeam(other.into())).is_err());
+        for wrong in [
+            Signer {
+                team: other_team.into(),
+                identifier: team.identifier.clone(),
+            },
+            Signer {
+                team: team.team.clone(),
+                identifier: "org.freenet.River".into(),
+            },
+        ] {
+            assert!(
+                verify(&copy, &Check::SameSigner(wrong.clone())).is_err(),
+                "{wrong:?}"
+            );
+        }
     }
 
     #[test]
@@ -859,6 +1041,67 @@ pub(crate) mod tests {
         assert!(err.contains("changed while"), "{err}");
         assert_eq!(version_of(&install), "river 0.1.0");
         assert!(!previous.exists() && !prepared.exists());
+    }
+
+    /// A zip that could write outside the folder it is unpacked into, or is not one app, is
+    /// refused before `ditto` runs; a real `ditto` zip of a bundle with links passes.
+    #[test]
+    fn a_hostile_zip_is_refused_before_it_is_unpacked() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.zip");
+        zip_of(&bundle(dir.path(), "River.app", "0.2.0"), &good);
+        scan_zip(&fs::File::open(&good).unwrap()).unwrap();
+
+        let opts = zip::write::SimpleFileOptions::default();
+        type Writer = zip::ZipWriter<std::io::Cursor<Vec<u8>>>;
+        let hostile = |build: &dyn Fn(&mut Writer)| {
+            let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            build(&mut w);
+            let path = dir.path().join("hostile.zip");
+            fs::write(&path, w.finish().unwrap().into_inner()).unwrap();
+            scan_zip(&fs::File::open(&path).unwrap())
+        };
+        let file = |w: &mut Writer, name: &str| {
+            w.start_file(name, opts).unwrap();
+            w.write_all(b"x").unwrap();
+        };
+        for (why, result) in [
+            ("climbs out", hostile(&|w| file(w, "River.app/../../evil"))),
+            ("absolute", hostile(&|w| file(w, "/tmp/evil"))),
+            ("not an app", hostile(&|w| file(w, "evil.sh"))),
+            (
+                "two apps",
+                hostile(&|w| {
+                    file(w, "River.app/a");
+                    file(w, "Other.app/a");
+                }),
+            ),
+            (
+                "link out",
+                hostile(&|w| {
+                    w.add_symlink("River.app/Contents/out", "../../..", opts)
+                        .unwrap();
+                    file(w, "River.app/Contents/out/evil");
+                }),
+            ),
+            (
+                "absolute link",
+                hostile(&|w| {
+                    w.add_symlink("River.app/l", "/Users", opts).unwrap();
+                }),
+            ),
+            ("empty", hostile(&|_| {})),
+        ] {
+            assert!(result.is_err(), "{why}: {result:?}");
+        }
+        // A link that stays inside the bundle is fine.
+        hostile(&|w| {
+            w.add_symlink("River.app/Contents/Frameworks/Current", "A", opts)
+                .unwrap();
+            file(w, "River.app/Contents/Info.plist");
+        })
+        .unwrap();
     }
 
     #[test]

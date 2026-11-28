@@ -916,6 +916,70 @@ fn an_install_that_changed_under_a_running_river_is_not_replaced() {
     assert!(state::load(rig.data.path()).probation.is_none());
 }
 
+/// The swap is recorded before the binary is replaced, so a River killed between the two
+/// still leaves the new binary on probation (and so with a rollback).
+#[test]
+fn the_swap_is_recorded_before_the_binary_is_replaced() {
+    struct Watching {
+        inner: LinuxInstaller,
+        data: PathBuf,
+        seen: std::sync::Mutex<Option<Option<state::Probation>>>,
+    }
+    impl Installer for Watching {
+        fn platform_key(&self) -> Option<&'static str> {
+            self.inner.platform_key()
+        }
+        fn support(&self) -> Support {
+            self.inner.support()
+        }
+        fn prepare(&self, a: fs::File, v: Version, p: &Path) -> Result<PathBuf, String> {
+            self.inner.prepare(a, v, p)
+        }
+        fn swap(&self, a: &Path, b: &Path, c: &Path, d: Option<&str>) -> Result<String, String> {
+            *self.seen.lock().unwrap() = Some(state::load(&self.data).probation);
+            self.inner.swap(a, b, c, d)
+        }
+        fn restore(&self, a: &Path, b: &str, c: &Path) -> Result<(), String> {
+            self.inner.restore(a, b, c)
+        }
+        fn spawn(
+            &self,
+            p: &Path,
+            a: &[OsString],
+            e: &[(&str, String)],
+        ) -> std::io::Result<std::process::Child> {
+            self.inner.spawn(p, a, e)
+        }
+    }
+    let ports = Ports::lock();
+    let server = ports.serve(vec![]);
+    Release::new("0.2.0", 10, healthy("0.2.0")).publish(&server);
+    let rig = Rig::new();
+    let watching = Arc::new(Watching {
+        inner: LinuxInstaller::at(rig.install.clone()),
+        data: rig.data.path().to_path_buf(),
+        seen: std::sync::Mutex::new(None),
+    });
+    let u = rig.updater_with(
+        "0.1.0",
+        &server.url("/manifest.json"),
+        1,
+        NOW,
+        watching.clone(),
+    );
+    offer(u.check(&KeyRecord::Unavailable).unwrap());
+    u.download(&mut |_, _| {}).unwrap();
+    let applied = u.apply().unwrap();
+    let seen = watching.seen.lock().unwrap().clone().expect("swap ran");
+    let seen = seen.expect("a probation record existed while the swap ran");
+    assert_eq!(seen, applied.probation);
+    assert_eq!(
+        seen.previous_sha256,
+        hex::encode(Sha256::digest(OLD)),
+        "it names the copy the swap keeps"
+    );
+}
+
 #[test]
 fn the_apply_lock_is_held_until_the_launch_is_over() {
     let ports = Ports::lock();

@@ -58,6 +58,62 @@ pub fn preflight(binary: &Path, version: Version) -> Result<(), String> {
     Ok(())
 }
 
+/// Run `cmd` (stdin closed, stdout and stderr captured) and wait for it at most `deadline`;
+/// a command still running then is killed and reported as timed out.
+#[cfg(target_os = "macos")]
+pub fn output_within(
+    mut cmd: Command,
+    deadline: Duration,
+) -> std::io::Result<std::process::Output> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    // Read both pipes on their own threads, so a chatty command cannot fill one and stall.
+    let read = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.by_ref().take(1024 * 1024).read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let out = read(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let err = read(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let end = Instant::now() + deadline;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= end {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "it did not finish in time",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: out.join().unwrap_or_default(),
+        stderr: err.join().unwrap_or_default(),
+    })
+}
+
 /// Copy the file `from` to `to` through a temporary file in `to`'s directory, so `to` is either
 /// absent, its old contents, or the whole new file. Returns the SHA-256 (hex) of what was
 /// written. (macOS copies bundles with `ditto` instead.)

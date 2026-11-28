@@ -10,6 +10,16 @@
 //! folder of their own. A copy run from inside the zip (Explorer runs it from a temporary
 //! folder) or from a folder River cannot write to (Program Files without administrator rights)
 //! is not updated, and the message says what to do instead.
+//!
+//! What this does not do:
+//! - Check the new exe's Authenticode signature. As on Linux, the trust anchor is the update
+//!   key: the exe's bytes are fixed by the SHA-256 in the signed manifest, and the exe is run
+//!   (`--version`) only after that matched. macOS adds a check of the Developer ID team because
+//!   macOS itself refuses a bundle whose signature is broken; Windows runs an exe either way.
+//! - Survive a crash in the moment between the two renames of a swap. If that happens no
+//!   `river.exe` is in the folder (the old one is the `.river-old-*.exe` beside it, and a copy is
+//!   in River's data folder under `update/previous/`), and no River is left to notice. A
+//!   failure there, rather than a crash, is handled: the swap puts the kept copy back.
 
 use std::ffi::OsString;
 use std::fs;
@@ -106,8 +116,8 @@ pub fn classify(env: &Environment<'_>) -> Support {
     if in_temp || in_zip {
         return Support::Unsupported(
             "River is running from inside the zip or from a temporary folder, so it can't \
-             update itself. Extract the zip to a folder of your own (Documents, say) and run \
-             river.exe from there."
+             update itself. Extract the zip to a folder of your own on this computer (not one \
+             that OneDrive or another service syncs) and run river.exe from there."
                 .into(),
         );
     }
@@ -274,6 +284,14 @@ impl Installer for WindowsInstaller {
         }
         if let Err(e) = replace_running(prepared, install_path) {
             let _ = fs::remove_file(prepared);
+            // The new exe would not go in and the old one would not go back: put the kept copy
+            // there instead, so a River is installed whatever happens to this process.
+            if fs::symlink_metadata(install_path).is_err() {
+                return match copy_hashing(previous, install_path) {
+                    Ok(_) => Err(format!("{e}; the copy kept beforehand was put back")),
+                    Err(c) => Err(format!("{e}; and the kept copy could not be put back: {c}")),
+                };
+            }
             return Err(e);
         }
         // The old exe is still running; the next start's sweep deletes it.
