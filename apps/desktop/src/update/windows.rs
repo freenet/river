@@ -191,14 +191,24 @@ fn aside_path(install_path: &Path) -> Result<PathBuf, String> {
     Err("couldn't find a free name to move the old River aside".into())
 }
 
+/// `fs::rename`, which a test can make fail from the `n`th call on this thread
+/// ([`tests::fail_renames_from`]), to reach the recovery paths a real filesystem rarely takes.
+fn rename(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if tests::rename_should_fail() {
+        return Err(std::io::Error::other("rename refused by the test"));
+    }
+    fs::rename(from, to)
+}
+
 /// Move `install_path` aside and `incoming` into its place. If the second rename fails, the
 /// first is undone, so `install_path` is the old file again. Returns where the old file went.
 fn replace_running(incoming: &Path, install_path: &Path) -> Result<PathBuf, String> {
     let aside = aside_path(install_path)?;
-    retry_in_use(|| fs::rename(install_path, &aside))
+    retry_in_use(|| rename(install_path, &aside))
         .map_err(|e| format!("couldn't move the running River aside: {e}"))?;
-    if let Err(e) = retry_in_use(|| fs::rename(incoming, install_path)) {
-        return match retry_in_use(|| fs::rename(&aside, install_path)) {
+    if let Err(e) = retry_in_use(|| rename(incoming, install_path)) {
+        return match retry_in_use(|| rename(&aside, install_path)) {
             Ok(()) => Err(format!("couldn't replace the installed River: {e}")),
             Err(back) => Err(format!(
                 "couldn't replace the installed River ({e}), and couldn't move it back \
@@ -408,6 +418,35 @@ mod tests {
     use super::*;
     use crate::update::unpack::testexe;
     use sha2::{Digest, Sha256};
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Renames on this thread: how many have run, and from which one on they fail.
+        static RENAMES: Cell<(u32, Option<u32>)> = const { Cell::new((0, None)) };
+    }
+
+    /// Make this thread's renames fail from the `n`th (0-based) on.
+    pub fn fail_renames_from(n: Option<u32>) {
+        RENAMES.with(|r| r.set((0, n)));
+    }
+
+    pub fn rename_should_fail() -> bool {
+        RENAMES.with(|r| {
+            let (count, from) = r.get();
+            r.set((count + 1, from));
+            from.is_some_and(|f| count >= f)
+        })
+    }
+
+    /// A child that is killed when the test ends, passing or not.
+    struct Running(Child);
+
+    impl Drop for Running {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
 
     fn zip_of(files: &[(&str, &[u8])]) -> Vec<u8> {
         let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
@@ -427,7 +466,7 @@ mod tests {
 
     /// A copy of the test program at `path`, running (it sleeps), so Windows holds it open the
     /// way it holds a running River.
-    fn run_from(path: &Path) -> Child {
+    fn run_from(path: &Path) -> Running {
         let child = Command::new(path)
             .args(["--sleep", "60"])
             .stdin(Stdio::null())
@@ -437,7 +476,7 @@ mod tests {
             .unwrap();
         // While it runs, Windows refuses to delete or overwrite it: the premise of this module.
         assert!(fs::remove_file(path).is_err(), "a running exe is locked");
-        child
+        Running(child)
     }
 
     fn install_of(dir: &Path, version: &str) -> PathBuf {
@@ -629,7 +668,7 @@ mod tests {
         assert!(!prepared.exists());
         assert_eq!(asides(&folder).len(), 1, "the running exe was moved aside");
         assert!(
-            old.try_wait().unwrap().is_none(),
+            old.0.try_wait().unwrap().is_none(),
             "the old River goes on running"
         );
 
@@ -637,11 +676,8 @@ mod tests {
         let mut new = run_from(&install);
         installer.restore(&previous, &sha, &install).unwrap();
         assert_eq!(version_of(&install), "river 0.1.0");
-        assert!(new.try_wait().unwrap().is_none());
-        for c in [&mut old, &mut new] {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
+        assert!(new.0.try_wait().unwrap().is_none());
+        drop((old, new));
         // Nothing but the install and the renamed-aside files the sweep deletes.
         let names: Vec<String> = fs::read_dir(&folder)
             .unwrap()
@@ -689,7 +725,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let install = install_of(dir.path(), "0.1.0");
         let installer = WindowsInstaller::at(install.clone());
-        let mut old = run_from(&installer.exe);
+        let old = run_from(&installer.exe);
         // The prepared file is missing: the second rename fails after the first moved the
         // running exe aside, which must be undone.
         let err = installer
@@ -703,8 +739,62 @@ mod tests {
         assert!(err.contains("couldn't replace"), "{err}");
         assert_eq!(version_of(&install), "river 0.1.0");
         assert!(asides(install.parent().unwrap()).is_empty());
-        let _ = old.kill();
-        let _ = old.wait();
+        drop(old);
+    }
+
+    /// The new exe will not go in and the old one will not go back: the swap puts the copy it
+    /// kept in their place, so a River is installed whatever happens next.
+    #[test]
+    fn a_swap_whose_undo_fails_puts_the_kept_copy_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let install = install_of(dir.path(), "0.1.0");
+        let installer = WindowsInstaller::at(install.clone());
+        let old = run_from(&installer.exe);
+        let prepared = install.with_file_name(".river-update-x.exe");
+        fs::copy(testexe::build("0.2.0"), &prepared).unwrap();
+        let previous = dir.path().join("prev/river-0.1.0.exe");
+        // The first rename (the running exe aside) works; the next two fail.
+        fail_renames_from(Some(1));
+        let err = installer
+            .swap(&prepared, &installer.exe, &previous, None)
+            .unwrap_err();
+        fail_renames_from(None);
+        assert!(err.contains("copy kept beforehand was put back"), "{err}");
+        assert_eq!(version_of(&install), "river 0.1.0");
+        assert!(!prepared.exists());
+        drop(old);
+    }
+
+    /// An exe another program holds open (an antivirus scan) cannot be renamed for a moment;
+    /// the swap waits for it rather than failing.
+    #[test]
+    fn a_rename_waits_for_a_file_held_open_for_a_moment() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("held.exe");
+        fs::write(&held, b"x").unwrap();
+        // No sharing at all, as a scanner opens a file.
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&held)
+            .unwrap();
+        assert!(
+            fs::rename(&held, dir.path().join("probe")).is_err(),
+            "it is held"
+        );
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(file);
+        });
+        let to = dir.path().join("moved.exe");
+        retry_in_use(|| fs::rename(&held, &to)).unwrap();
+        release.join().unwrap();
+        assert!(to.exists());
+        // Other errors are not waited for.
+        let start = std::time::Instant::now();
+        assert!(retry_in_use(|| fs::rename(dir.path().join("missing"), &to)).is_err());
+        assert!(start.elapsed() < Duration::from_millis(500));
     }
 
     #[test]

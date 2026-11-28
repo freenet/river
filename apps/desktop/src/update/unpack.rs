@@ -70,12 +70,13 @@ pub fn output_within(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    // Read both pipes on their own threads, so a chatty command cannot fill one and stall.
+    // Read both pipes to the end on their own threads, so a chatty command can neither fill
+    // one and stall nor be cut off (and killed by SIGPIPE) by a reader that stopped early.
     let read = |pipe: Option<Box<dyn Read + Send>>| {
         std::thread::spawn(move || {
             let mut buf = Vec::new();
             if let Some(mut p) = pipe {
-                let _ = p.by_ref().take(1024 * 1024).read_to_end(&mut buf);
+                let _ = p.read_to_end(&mut buf);
             }
             buf
         })

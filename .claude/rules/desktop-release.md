@@ -79,7 +79,7 @@ A re-keying River publish needs a new desktop release ready first. Once its poin
 | Linux | `river --version` runs |
 | macOS arm64 slice | `river --version` runs |
 | macOS x86_64 slice | Compiled and linked, never executed |
-| Windows | The exe's `ProductVersion` resource. `river.exe --version` prints nothing in a console: release builds use the GUI subsystem (diagnostics go to the log file, `desktop/src/log.rs`). It does print to a pipe, which is how the self-update checks a new exe before installing it (`desktop/src/update/unpack.rs`, tested with a GUI-subsystem program on the Windows runner) |
+| Windows | The exe's `ProductVersion` resource. `river.exe --version` prints nothing in a console: release builds use the GUI subsystem (diagnostics go to the log file, `desktop/src/log.rs`). It does print to a pipe, which is how the self-update checks a new exe before installing it (`desktop/src/update/unpack.rs`); `package-windows.ps1` checks that on the real exe, signed and unsigned |
 
 ## Packaging and signing
 

@@ -864,6 +864,12 @@ pub(crate) mod tests {
             .filter(|p| p.exists())
             .find_map(|p| signer_of(p).ok().flatten().map(|t| (p, t)))
         else {
+            // GitHub's macOS images ship these browsers; on CI a skip would hide the only
+            // positive test of the release check, so it fails instead.
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "no notarized third-party app on this CI runner"
+            );
             println!("skipped: no notarized third-party app on this machine");
             return;
         };
@@ -899,6 +905,39 @@ pub(crate) mod tests {
                 "{wrong:?}"
             );
         }
+    }
+
+    /// The requirement a release must meet, word for word: Apple's Developer ID Application
+    /// chain (CA extension 6.2.6, leaf extension 6.1.13), the team and the identifier.
+    #[test]
+    fn the_release_requirement_names_developer_id_the_team_and_the_identifier() {
+        let r = requirement(&Signer {
+            team: "R55ZESJCXG".into(),
+            identifier: "org.freenet.River".into(),
+        });
+        assert_eq!(
+            r,
+            "=anchor apple generic and identifier \"org.freenet.River\" \
+             and certificate 1[field.1.2.840.113635.100.6.2.6] exists \
+             and certificate leaf[field.1.2.840.113635.100.6.1.13] exists \
+             and certificate leaf[subject.OU] = \"R55ZESJCXG\""
+        );
+    }
+
+    #[test]
+    fn a_tool_that_hangs_is_stopped_and_a_chatty_one_is_read_whole() {
+        let mut cmd = Command::new("/bin/sleep");
+        cmd.arg("30");
+        let start = std::time::Instant::now();
+        let err = output_within(cmd, Duration::from_millis(300)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(start.elapsed() < Duration::from_secs(5));
+        // Three megabytes on stdout: read to the end, and the command succeeds.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "head -c 3000000 /dev/zero"]);
+        let out = output_within(cmd, Duration::from_secs(30)).unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout.len(), 3_000_000);
     }
 
     #[test]
@@ -1066,19 +1105,25 @@ pub(crate) mod tests {
             w.start_file(name, opts).unwrap();
             w.write_all(b"x").unwrap();
         };
-        for (why, result) in [
-            ("climbs out", hostile(&|w| file(w, "River.app/../../evil"))),
-            ("absolute", hostile(&|w| file(w, "/tmp/evil"))),
-            ("not an app", hostile(&|w| file(w, "evil.sh"))),
+        for (want, result) in [
             (
-                "two apps",
+                "an unsafe name",
+                hostile(&|w| file(w, "River.app/../../evil")),
+            ),
+            ("an unsafe name", hostile(&|w| file(w, "/tmp/evil"))),
+            (
+                "something other than an app",
+                hostile(&|w| file(w, "evil.sh")),
+            ),
+            (
+                "more than one app",
                 hostile(&|w| {
                     file(w, "River.app/a");
                     file(w, "Other.app/a");
                 }),
             ),
             (
-                "link out",
+                "a link out of the app",
                 hostile(&|w| {
                     w.add_symlink("River.app/Contents/out", "../../..", opts)
                         .unwrap();
@@ -1086,15 +1131,22 @@ pub(crate) mod tests {
                 }),
             ),
             (
-                "absolute link",
+                "a link to an absolute path",
                 hostile(&|w| {
                     w.add_symlink("River.app/l", "/Users", opts).unwrap();
                 }),
             ),
-            ("empty", hostile(&|_| {})),
+            ("no River.app", hostile(&|_| {})),
         ] {
-            assert!(result.is_err(), "{why}: {result:?}");
+            let err = result.unwrap_err();
+            assert!(err.contains(want), "{want}: {err}");
         }
+        // Resource forks under `__MACOSX/` beside the app are allowed.
+        hostile(&|w| {
+            file(w, "River.app/Contents/Info.plist");
+            file(w, "__MACOSX/River.app/._Info.plist");
+        })
+        .unwrap();
         // A link that stays inside the bundle is fine.
         hostile(&|w| {
             w.add_symlink("River.app/Contents/Frameworks/Current", "A", opts)

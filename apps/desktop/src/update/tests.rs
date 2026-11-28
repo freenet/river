@@ -980,6 +980,82 @@ fn the_swap_is_recorded_before_the_binary_is_replaced() {
     );
 }
 
+/// A swap that failed and left nothing at the install path (what a Windows swap whose undo
+/// failed, with no copy put back, would leave) keeps the copy and the record, and the message
+/// says where the copy is. A swap that failed with the install intact keeps neither.
+#[test]
+fn a_failed_swap_that_left_nothing_installed_keeps_the_copy_and_says_where() {
+    struct Breaks {
+        inner: LinuxInstaller,
+        leave_nothing: bool,
+    }
+    impl Installer for Breaks {
+        fn platform_key(&self) -> Option<&'static str> {
+            self.inner.platform_key()
+        }
+        fn support(&self) -> Support {
+            self.inner.support()
+        }
+        fn prepare(&self, a: fs::File, v: Version, p: &Path) -> Result<PathBuf, String> {
+            self.inner.prepare(a, v, p)
+        }
+        fn swap(&self, _: &Path, b: &Path, c: &Path, _: Option<&str>) -> Result<String, String> {
+            fs::create_dir_all(c.parent().unwrap()).unwrap();
+            fs::copy(b, c).unwrap();
+            if self.leave_nothing {
+                fs::remove_file(b).unwrap();
+            }
+            Err("the swap broke".into())
+        }
+        fn restore(&self, a: &Path, b: &str, c: &Path) -> Result<(), String> {
+            self.inner.restore(a, b, c)
+        }
+        fn spawn(
+            &self,
+            p: &Path,
+            a: &[OsString],
+            e: &[(&str, String)],
+        ) -> std::io::Result<std::process::Child> {
+            self.inner.spawn(p, a, e)
+        }
+    }
+    for leave_nothing in [false, true] {
+        let ports = Ports::lock();
+        let server = ports.serve(vec![]);
+        Release::new("0.2.0", 10, healthy("0.2.0")).publish(&server);
+        let rig = Rig::new();
+        let u = rig.updater_with(
+            "0.1.0",
+            &server.url("/manifest.json"),
+            1,
+            NOW,
+            Arc::new(Breaks {
+                inner: LinuxInstaller::at(rig.install.clone()),
+                leave_nothing,
+            }),
+        );
+        offer(u.check(&KeyRecord::Unavailable).unwrap());
+        u.download(&mut |_, _| {}).unwrap();
+        let err = u.apply().unwrap_err();
+        let previous = rig.data.path().join("update/previous");
+        let st = state::load(rig.data.path());
+        if leave_nothing {
+            assert!(err.contains("a copy of it is at"), "{err}");
+            let p = st.probation.expect("the record stays");
+            assert_eq!(fs::read(&p.previous).unwrap(), OLD, "and so does the copy");
+            assert!(err.contains(&p.previous.display().to_string()), "{err}");
+        } else {
+            assert_eq!(err, "the swap broke");
+            assert!(st.probation.is_none());
+            assert!(!previous.exists());
+            assert_eq!(rig.installed(), OLD);
+        }
+        // Nothing prepared is left beside the install either way.
+        let beside: Vec<_> = fs::read_dir(rig.bin.path()).unwrap().flatten().collect();
+        assert!(beside.len() <= 1, "{beside:?}");
+    }
+}
+
 #[test]
 fn the_apply_lock_is_held_until_the_launch_is_over() {
     let ports = Ports::lock();
