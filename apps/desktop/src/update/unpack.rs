@@ -4,17 +4,22 @@
 //! The Linux installer has its own copies of these ([`super::linux`]), left as they were so this
 //! change does not alter Linux behaviour.
 
+#[cfg(windows)]
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Read;
+#[cfg(windows)]
+use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
 use sha2::{Digest, Sha256};
 
 use crate::release::Version;
 
 /// The most an unpacked binary may be. A zip bomb would otherwise fill the disk.
+#[cfg(windows)]
 pub const MAX_UNPACKED: u64 = 512 * 1024 * 1024;
 /// How long the new binary gets to answer `--version` before the swap.
 const PREFLIGHT_DEADLINE: Duration = Duration::from_secs(20);
@@ -55,7 +60,8 @@ pub fn preflight(binary: &Path, version: Version) -> Result<(), String> {
 
 /// Copy the file `from` to `to` through a temporary file in `to`'s directory, so `to` is either
 /// absent, its old contents, or the whole new file. Returns the SHA-256 (hex) of what was
-/// written.
+/// written. (macOS copies bundles with `ditto` instead.)
+#[cfg(windows)]
 pub fn copy_hashing(from: &Path, to: &Path) -> std::io::Result<String> {
     let dir = to
         .parent()
@@ -104,6 +110,7 @@ pub mod testexe {
     }
 
     /// The program for `version` that confirms its start.
+    #[cfg(windows)]
     pub fn build(version: &str) -> PathBuf {
         build_as(version, Starts::Confirms)
     }
