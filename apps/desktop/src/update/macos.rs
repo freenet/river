@@ -678,17 +678,45 @@ pub(crate) mod tests {
     }
 
     /// The release check passes for a real Developer ID, notarized app, when the runner has
-    /// one (GitHub's macOS images ship Google Chrome). Skipped, and says so, otherwise.
+    /// one (GitHub's macOS images ship browsers). Skipped, and says so, otherwise.
+    ///
+    /// The app is copied without extended attributes first: an installed app often carries
+    /// some (Finder information, say), which `--strict` refuses as "detritus". River's own
+    /// update never meets that case, because it checks the bundle it unpacked from the release
+    /// zip, and `sign-macos.sh` runs the same strict check on that unpacked zip before release.
     #[test]
     fn a_release_check_accepts_a_notarized_app_of_the_same_team() {
-        let chrome = Path::new("/Applications/Google Chrome.app");
-        if !chrome.exists() {
+        let candidates = [
+            "/Applications/Firefox.app",
+            "/Applications/Google Chrome.app",
+            "/Applications/Microsoft Edge.app",
+        ];
+        let Some((app, team)) = candidates
+            .iter()
+            .map(Path::new)
+            .filter(|p| p.exists())
+            .find_map(|p| team_of(p).map(|t| (p, t)))
+        else {
             println!("skipped: no notarized third-party app on this machine");
             return;
-        }
-        let team = team_of(chrome).expect("Chrome is Developer ID signed");
-        verify(chrome, &Check::SameTeam(team)).unwrap();
-        assert!(verify(chrome, &Check::SameTeam("R55ZESJCXG".into())).is_err());
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path().join("App.app");
+        ditto(&[
+            OsStr::new("--norsrc"),
+            OsStr::new("--noextattr"),
+            OsStr::new("--noqtn"),
+            app.as_os_str(),
+            copy.as_os_str(),
+        ])
+        .unwrap();
+        verify(&copy, &Check::SameTeam(team.clone())).unwrap_or_else(|e| panic!("{app:?}: {e}"));
+        let other = if team == "R55ZESJCXG" {
+            "AAAAAAAAAA"
+        } else {
+            "R55ZESJCXG"
+        };
+        assert!(verify(&copy, &Check::SameTeam(other.into())).is_err());
     }
 
     #[test]
